@@ -489,7 +489,7 @@ impl Aggregator {
                 let before = state.book.book().state();
                 state.book.reset(at);
                 let after = state.book.book().state();
-                if before != after {
+                if !before.same_status(after) {
                     state.note_transition(before, after, at);
                 }
                 info!(%stream, ?end, "session ended; book reset and marked desynced");
@@ -497,7 +497,12 @@ impl Aggregator {
             }
         };
 
-        if before != after {
+        // `same_status` rather than `!=`: a Kraken book's `last_verified`
+        // advances on every matching checksum, and comparing whole states
+        // would read each of those as a transition — resetting the "live for"
+        // clock and logging a line per message on the one venue that verifies
+        // continuously. See `BookState::same_status`.
+        if !before.same_status(after) {
             state.note_transition(before, after, at);
             log_transition(&stream, before, after);
 
@@ -923,6 +928,61 @@ mod tests {
             v.desynced_total_ms, 5_000,
             "an in-progress desync must be included, or a book stuck forever \
              reports the same total as one that recovered"
+        );
+    }
+
+    #[test]
+    fn a_matching_checksum_is_not_a_state_transition() {
+        // Found by replaying a live tape: Kraken's `last_verified` advances on
+        // every matching checksum, so comparing whole `BookState`s read each
+        // verified message as a transition. Two symptoms, both invisible on
+        // the other two venues because neither publishes a checksum — and
+        // invisible to every fixture, because it takes a stream of *matching*
+        // checksums rather than one.
+        let clock = Arc::new(TestClock::new());
+        let stream = StreamId::new(VenueId::Kraken, symbol());
+        let metrics = Arc::new(Metrics::new([stream.clone()]));
+        let mut agg = Aggregator::new(
+            vec![spec_for(VenueId::Kraken, &symbol()).unwrap()],
+            clock.clone(),
+            &metrics,
+        );
+
+        // Checksum 0 over an empty book is the degenerate case that verifies,
+        // which is all this needs: the point is a *stream* of matching
+        // checksums, not any particular book. A snapshot would legitimately
+        // reset the clock — it re-establishes the book — so the repeats below
+        // are updates.
+        let frame = |kind: &str, clock: &TestClock| {
+            IngestMessage::Frame(RawFrame::new(
+                stream.clone(),
+                format!(
+                    r#"{{"channel":"book","type":"{kind}","data":[{{"symbol":"BTC/USD","bids":[],"asks":[],"checksum":0}}]}}"#
+                )
+                .into_bytes(),
+                clock.now(),
+            ))
+        };
+        let verified = |clock: &TestClock| frame("update", clock);
+
+        agg.apply(frame("snapshot", &clock));
+        let v = view(&agg.snapshot(empty_channel()), VenueId::Kraken);
+        assert_eq!(v.status, BookStatus::Live);
+        assert_eq!(v.integrity, Some(Integrity::Verified));
+
+        clock.advance(Duration::from_secs(30));
+        agg.apply(verified(&clock));
+        clock.advance(Duration::from_secs(30));
+
+        let v = view(&agg.snapshot(empty_channel()), VenueId::Kraken);
+        assert_eq!(
+            v.status_for_ms, 60_000,
+            "a matching checksum reset the 'live for' clock, so a book healthy \
+             for a minute reports only the time since its last message"
+        );
+        assert_eq!(
+            v.desynced_total_ms, 0,
+            "a verified book accrued untrusted time"
         );
     }
 

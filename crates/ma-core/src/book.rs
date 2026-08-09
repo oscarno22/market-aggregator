@@ -142,6 +142,56 @@ impl BookState {
     pub const fn is_live(&self) -> bool {
         matches!(self, Self::Live { .. })
     }
+
+    /// Whether two readings describe the same *status*, ignoring bookkeeping
+    /// that moves without anything having happened.
+    ///
+    /// # Why this is not `PartialEq`
+    ///
+    /// [`Self::Live::last_verified`] advances on every Kraken checksum match —
+    /// several times a second on a live book — while nothing about the book's
+    /// status has changed. A consumer that watches for transitions by
+    /// comparing whole states therefore sees a transition per message, on
+    /// exactly the venue whose guarantee is strongest.
+    ///
+    /// That is not hypothetical. Before this existed, replaying a three-minute
+    /// live tape produced 1006 "book is live" transition logs for Kraken's
+    /// 1108 messages, and the aggregator's "live for" clock reset on each one,
+    /// so a Kraken book that had been healthy for two minutes reported having
+    /// been live for however long since its last update. Coinbase and Bitstamp
+    /// publish no checksum, so neither showed it, and no fixture did either:
+    /// it takes a venue that verifies continuously.
+    ///
+    /// `PartialEq` stays exact, because "are these the same value" is a
+    /// question worth being able to ask. This is the other question.
+    pub fn same_status(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Uninitialized, Self::Uninitialized) => true,
+            (
+                Self::Live {
+                    integrity: a,
+                    since: since_a,
+                    ..
+                },
+                Self::Live {
+                    integrity: b,
+                    since: since_b,
+                    ..
+                },
+            ) => a == b && since_a == since_b,
+            (
+                Self::Desynced {
+                    since: since_a,
+                    reason: reason_a,
+                },
+                Self::Desynced {
+                    since: since_b,
+                    reason: reason_b,
+                },
+            ) => since_a == since_b && reason_a == reason_b,
+            _ => false,
+        }
+    }
 }
 
 /// Operations that a caller got wrong, as opposed to data the venue got wrong.
