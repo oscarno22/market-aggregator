@@ -1076,6 +1076,72 @@ other's.
 coordination problem here is membership, not a log, and membership by lease
 needs a clock and one writable key per node.
 
+### The registry in an object store, and what it cost
+
+v3 said the absence of a compare-and-swap in `Registry` "is the design, not an
+omission", and that the shape would port to an object store unchanged. v4
+cashed that, and the bill was three calls:
+
+| Registry operation | S3 |
+|---|---|
+| `announce` | `PutObject` — atomic per object, so no staging-and-rename as `DirRegistry` needs |
+| `members` | `ListObjectsV2` then one `GetObject` per record |
+| `withdraw` | `DeleteObject` |
+
+No conditional write, no `If-None-Match`, no DynamoDB table beside the bucket
+to hold a lock. That is cheap because of the lease argument above and not
+because of anything S3 offers: **no node ever writes a key another node
+writes**, so there is nothing to serialise. Had membership been one shared
+document, this would need a compare-and-swap and would still be leaning on the
+wrong primitive.
+
+One assumption is worth naming rather than inheriting from the filesystem. The
+settling argument turns on *B's record being durable from `t_write`, so any
+successful read after `t_write` returns B* — read-after-write and
+list-after-write consistency. S3 has provided both strongly since December
+2020. Under the older eventual-consistency model this file would have been
+**unsound rather than slow**: a joining node could be invisible to a listing
+taken after it announced, and the disjointness proof would quietly not hold.
+
+**What the first live run established (2026-08-09).** Two processes, six live
+streams, `s3://…/events/cluster`:
+
+| | Result |
+|---|---|
+| Scope probe | Bucket-root listing denied for the scoped user; startup proceeded |
+| Settling | Neither node held anything for 17s (`ttl + guard`), then both acquired |
+| Assignment | 4 / 2 split, and each node's `elsewhere` was **exactly** the other's `owned` — disjoint and complete |
+| `kill -9` on node-a | node-b took all six streams 16s later: `ttl` plus one renewal, as a hard kill must cost |
+| `SIGTERM` on node-b | Clean stop — and the withdrawal was **refused** |
+
+That last row is the finding. This project's own IAM user is scoped to
+`PutObject`, `GetObject` and `ListBucket` and **not** `DeleteObject`, so
+`withdraw` fails and the record stays behind. Nothing breaks, and that is by
+construction rather than by luck: a node that cannot delete its own record is
+indistinguishable from one that was `kill -9`'d, and the lease argument already
+has to cover that case, because no shutdown path runs on a hard kill. The
+safety property is untouched; the only thing lost is the *speed* of a clean
+handover.
+
+It is deliberately not treated as an error, because every available reaction is
+worse than waiting — retrying hammers a registry that has already said no, and
+treating it as fatal turns a permissions gap into a crash loop.
+`ma-coord/tests/cluster.rs` now pins this offline with a registry whose
+`withdraw` always fails, asserting both halves: B does **not** grab early while
+the stale record is inside its `ttl`, and does take over once it expires.
+
+Stale records do not accumulate, because a record is named after its node: a
+restarting `node-a` overwrites `node-a.json` rather than adding to it. The
+residue is one dead object per node id that never returns, and one extra
+`GetObject` per renewal for each.
+
+Two operational notes. A registry belongs in its own prefix, not inside the
+archive's; the live run used `events/cluster` only because the scoped user
+cannot reach anything outside `events/*`. And `ttl` must account for a registry
+round trip now being a network call — a value tuned for a shared directory will
+make an S3-backed cluster flap, and the flap is safe (a node that cannot reach
+the registry stands down) but pointless.
+
 ---
 
 ## 14. Where this stops
@@ -1090,10 +1156,6 @@ v1, v2 and v3 are complete. What v3 added:
 
 ### Not built yet, in the order the plan puts them
 
-- **A cluster registry backed by S3.** No longer gated: the IAM user that
-  opened §10's gate for the Parquet store opens this one too, and `Registry`
-  was designed for it — `PutObject`, `ListObjects`, `DeleteObject`, and
-  deliberately no conditional write.
 - **A cross-node view.** Each node serves its own page and its own share of the
   streams; nothing merges them. A gateway subscribing to every node's SSE and
   re-consolidating is the obvious shape, and it inherits §12's whole problem

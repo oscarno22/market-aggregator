@@ -35,8 +35,14 @@ pub mod assign;
 pub mod lease;
 pub mod registry;
 
+#[cfg(feature = "s3")]
+pub mod s3;
+
 pub use assign::{NodeId, assigned_to, owner};
 pub use lease::{
     ClusterView, Coordinator, Lease, LeaseConfig, LeaseState, Registry, RegistryError,
 };
-pub use registry::{DirRegistry, MemoryRegistry, registry_from_uri};
+pub use registry::{DirRegistry, MemoryRegistry, record_name, registry_from_uri};
+
+#[cfg(feature = "s3")]
+pub use s3::S3Registry;

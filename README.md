@@ -95,7 +95,9 @@ is therefore checked by the compiler.
 | `ma-core` | `Book`, `MarketEvent`, `Price`, `IngestTime`, the depth audit | nothing async |
 | `ma-venues` | wire formats, per-venue sync, endpoints as data | `serde` only |
 | `ma-pipeline` | channel, ingest tasks, aggregator, raw-frame tape | `tokio` |
-| `ma-persist` | Arrow schema, Parquet writer, `ObjectStore`, S3 | `arrow`, `parquet` |
+| `ma-persist` | Arrow schema, Parquet writer, `ObjectStore` | `arrow`, `parquet` |
+| `ma-coord` | rendezvous hashing, leases, the cluster registry | `tokio` |
+| `ma-aws` | the one S3 client, which proves it is confined to its prefix | the AWS SDK |
 | `ma-server` | axum SSE, `/metrics`, the page, the binaries | everything |
 
 ---
@@ -272,16 +274,21 @@ Deliberately unfinished, and stated rather than hidden:
   down — key order stopped being time order — so it now merges one cursor per
   partition. Archives written under the old layout still read.
 
-- **A cluster registry backed by S3 is not implemented.** The trait needs only
-  `PutObject`, `ListObjects` and `DeleteObject` — deliberately no conditional
-  write — so it is a small addition, and no longer a blocked one.
+- ~~A cluster registry backed by S3 is not implemented.~~ **Done**, and run
+  live: two nodes sharding six streams through `s3://…/events/cluster`, a
+  `kill -9` handover one lease later, and a disjoint assignment throughout. It
+  cost exactly `PutObject`, `ListObjects` and `DeleteObject` — the payoff for
+  `Registry` having no compare-and-swap. The live run also found that this
+  project's own IAM user cannot `DeleteObject`, so a clean withdrawal is
+  refused; that costs a lease's wait on handover and nothing else, because a
+  node that cannot withdraw is exactly a node that was `kill -9`'d.
 - **Nothing merges the nodes.** Each node serves its own page and its own share
   of the streams; `/cluster` says who has what. A gateway that re-consolidates
   across nodes inherits the whole cross-venue timing problem across a network
   hop instead of a socket, which makes it a separate piece of work rather than
   a flag.
 
-Next: v4 — a cross-node view, and an S3-backed cluster registry.
+Next: v4's last item — a gateway that merges every node's snapshot.
 
 ## Non-goals
 

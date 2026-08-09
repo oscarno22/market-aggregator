@@ -126,3 +126,30 @@ audit-probe venue="coinbase" symbol="BTC-USD" secs="20":
 # Serve, archiving to S3. Needs --features s3 and the acknowledgement above.
 archive-s3 uri venues="coinbase,kraken,bitstamp" symbols="BTC-USD":
     cargo run -p ma-server --features s3 -- --venues {{venues}} --symbols {{symbols}} --archive {{uri}}
+
+# Two nodes sharding live streams through a cluster registry in S3.
+#
+# The same run as `just cluster`, with the shared directory replaced by a
+# bucket prefix — which is what lets the nodes be on different machines rather
+# than merely different processes. `Registry` needs PutObject, ListObjects and
+# DeleteObject and no conditional write; docs/DESIGN.md §13 has the argument
+# for why that is enough.
+#
+# `ttl` is larger than the directory recipe's because a round trip is now a
+# network call. A node that cannot reach S3 stands down rather than retrying,
+# so a too-short ttl is safe and pointless.
+#
+# Give the registry its OWN prefix, not the archive's. If your IAM user is
+# scoped to the archive prefix — this project's is — nest it there and say so:
+#   just cluster-s3 s3://my-bucket/events/cluster
+cluster-s3 uri symbols="BTC-USD,ETH-USD" ttl="15000":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    trap 'kill 0' EXIT
+    cargo run --release -p ma-server --features s3 -- --node-id node-a \
+        --cluster-registry {{uri}} --cluster-ttl-ms {{ttl}} \
+        --symbols {{symbols}} --addr 127.0.0.1:8081 &
+    cargo run --release -p ma-server --features s3 -- --node-id node-b \
+        --cluster-registry {{uri}} --cluster-ttl-ms {{ttl}} \
+        --symbols {{symbols}} --addr 127.0.0.1:8082 &
+    wait

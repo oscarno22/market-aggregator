@@ -49,24 +49,34 @@ struct Args {
     windows: String,
 
     /// This node's name in the cluster. Enables sharding when set with
-    /// `--cluster-dir`.
+    /// `--cluster-registry`.
     ///
     /// Must be stable across restarts of this process and unique in the
     /// cluster: a node that renames itself on every restart looks like one
     /// node dying and another joining, which rebalances the whole cluster on
     /// every deploy. See `ma_coord::NodeId`.
-    #[arg(long, requires = "cluster_dir")]
+    #[arg(long, requires = "cluster_registry")]
     node_id: Option<String>,
 
-    /// Directory holding the cluster's lease records — one file per node.
+    /// Where the cluster's lease records live — one per node.
+    ///
+    /// A path is a shared directory, which is complete for several processes
+    /// on one host or hosts sharing a filesystem. `s3://bucket/prefix` needs
+    /// `--features s3` and lets nodes shard across machines that share
+    /// nothing; the registry needs only PutObject, ListObjects and
+    /// DeleteObject, which is what `Registry` having no compare-and-swap buys.
     ///
     /// Every node must be started with the *same* `--symbols` and `--venues`:
     /// the assignment is a pure function of the stream set, so a node
     /// configured with a different one computes a different answer and the
     /// at-most-one-owner guarantee no longer holds. Nothing can check that
     /// from inside a single process.
-    #[arg(long, requires = "node_id")]
-    cluster_dir: Option<String>,
+    ///
+    /// `--cluster-dir` is kept as an alias: it is what every existing script
+    /// and the `just cluster` recipe pass, and renaming a flag is not worth
+    /// breaking them over.
+    #[arg(long, alias = "cluster-dir", requires = "node_id")]
+    cluster_registry: Option<String>,
 
     /// Lease lifetime in milliseconds. A dead node's streams move this long
     /// after its last renewal; a joining node waits this plus the guard before
@@ -120,9 +130,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Before the aggregator, which reads the ownership channel this creates.
-    let coordinator = match (&args.node_id, &args.cluster_dir) {
-        (Some(node), Some(dir)) => {
-            let registry = ma_coord::registry_from_uri(dir)?;
+    let coordinator = match (&args.node_id, &args.cluster_registry) {
+        (Some(node), Some(uri)) => {
+            let registry = ma_coord::registry_from_uri(uri).await?;
             let ttl = Duration::from_millis(args.cluster_ttl_ms);
             let config = ma_coord::LeaseConfig {
                 ttl,
@@ -133,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             tracing::info!(
                 node,
-                dir,
+                registry = %registry.describe(),
                 ?ttl,
                 "clustered: this node will own a share of the streams. Every node must be \
                  started with the same --symbols and --venues."

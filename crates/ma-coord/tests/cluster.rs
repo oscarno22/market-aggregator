@@ -17,8 +17,8 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use ma_coord::lease::LeaseState;
-use ma_coord::{Coordinator, LeaseConfig, MemoryRegistry, NodeId, Registry};
+use ma_coord::lease::{BoxFuture, LeaseState};
+use ma_coord::{Coordinator, Lease, LeaseConfig, MemoryRegistry, NodeId, Registry, RegistryError};
 use ma_core::{Clock, StreamId, Symbol, TestClock, VenueId};
 
 /// The cluster's stream set: three venues over four symbols.
@@ -321,4 +321,106 @@ async fn every_node_agrees_about_who_owns_what() {
     for node in [&a, &b, &c] {
         assert!(!node.state.owned().is_empty(), "{} idled", node.name);
     }
+}
+
+/// A registry that can write and read but not delete.
+///
+/// Not hypothetical: this is what an S3 bucket looks like under an IAM policy
+/// granting `PutObject`, `GetObject` and `ListBucket` and nothing else — which
+/// is exactly the policy this project's own scoped user has, and which the
+/// first live S3-backed cluster run therefore exercised on 2026-08-09.
+#[derive(Clone, Debug)]
+struct NoDelete(MemoryRegistry);
+
+impl Registry for NoDelete {
+    fn describe(&self) -> String {
+        format!("{} (delete denied)", self.0.describe())
+    }
+
+    fn announce(&self, lease: &Lease) -> BoxFuture<'_, Result<(), RegistryError>> {
+        self.0.announce(lease)
+    }
+
+    fn members(&self) -> BoxFuture<'_, Result<Vec<Lease>, RegistryError>> {
+        self.0.members()
+    }
+
+    fn withdraw(&self, _node: &NodeId) -> BoxFuture<'_, Result<(), RegistryError>> {
+        Box::pin(async {
+            Err(RegistryError::Io(std::io::Error::other(
+                "AccessDenied: s3:DeleteObject",
+            )))
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_registry_that_cannot_delete_still_hands_over_by_timeout() {
+    // The degradation an object store makes easy to reach, and the reason
+    // `withdraw` is best-effort rather than load-bearing.
+    //
+    // A node that cannot delete its own record is indistinguishable, to
+    // everyone else, from a node that was `kill -9`'d — and the lease argument
+    // already has to cover that case, because a hard kill cannot run a
+    // shutdown path. So the safety property is untouched and the only thing
+    // lost is the speed of a clean handover.
+    //
+    // Worth a test rather than a comment because the tempting "fix" is to make
+    // a failed withdrawal an error the caller reacts to, and every reaction
+    // available is worse than waiting: retrying hammers a registry that has
+    // already said no, and treating it as fatal turns a permissions gap into a
+    // crash loop.
+    let clock = TestClock::new();
+    let shared = MemoryRegistry::new();
+
+    let undeletable = NoDelete(shared.handle());
+    let mut a = Node::new("a", &shared, &clock);
+    a.coord = Coordinator::new(
+        NodeId::new("a"),
+        Box::new(undeletable.clone()),
+        config(),
+        streams(),
+    );
+    let mut b = Node::new("b", &shared, &clock);
+
+    let mut elapsed = Duration::ZERO;
+    for _ in 0..14 {
+        tick(&mut [&mut a, &mut b], &clock, elapsed).await;
+        clock.advance(Duration::from_secs(3));
+        elapsed += Duration::from_secs(3);
+    }
+    let a_held = a.state.owned().clone();
+    assert!(!a_held.is_empty() && !b.state.owned().is_empty());
+
+    // A shuts down. Its withdrawal is refused, so its record stays behind with
+    // a timestamp that stops advancing — which is precisely the state a hard
+    // kill leaves.
+    assert!(
+        undeletable.withdraw(&NodeId::new("a")).await.is_err(),
+        "the harness registry was expected to refuse a delete"
+    );
+    drop(a);
+
+    // Before the lease expires, B must *not* take A's streams: the stale
+    // record is still live, and treating a failed withdrawal as a licence to
+    // grab early would be the doubly-owned stream this design exists to
+    // prevent.
+    clock.advance(Duration::from_secs(9));
+    elapsed += Duration::from_secs(9);
+    tick(&mut [&mut b], &clock, elapsed).await;
+    assert!(
+        b.state.owned().is_disjoint(&a_held),
+        "B took a stream while A's record was still within its ttl"
+    );
+
+    // After it expires, B takes everything — the same outcome a clean
+    // withdrawal produces, just one lease later.
+    clock.advance(Duration::from_secs(9));
+    elapsed += Duration::from_secs(9);
+    tick(&mut [&mut b], &clock, elapsed).await;
+    assert_eq!(
+        b.state.owned().len(),
+        streams().len(),
+        "an undeletable record left streams unowned forever"
+    );
 }

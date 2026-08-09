@@ -43,25 +43,36 @@ impl DirRegistry {
         Self { root: root.into() }
     }
 
-    /// One file per node. The name is sanitised rather than trusted: a node id
-    /// arrives from a command line, and `--node-id ../../etc/passwd` must be a
-    /// strange filename rather than a path traversal. Same argument as
-    /// `LocalStore::resolve` — checked now because the day it matters is not
-    /// the day anyone will think to add it.
     fn path_for(&self, node: &NodeId) -> PathBuf {
-        let safe: String = node
-            .as_str()
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        self.root.join(format!("{safe}.json"))
+        self.root.join(record_name(node))
     }
+}
+
+/// One record per node, named after it.
+///
+/// The name is sanitised rather than trusted: a node id arrives from a command
+/// line, and `--node-id ../../etc/passwd` must be a strange filename rather
+/// than a path traversal. Same argument as `LocalStore::resolve` — checked now
+/// because the day it matters is not the day anyone will think to add it.
+///
+/// Shared with the S3 registry rather than reimplemented there. Object keys are
+/// flat, so `..` cannot traverse anything in a bucket, but two registries that
+/// derive a node's key differently would disagree about who is a member the
+/// first time a node id contains anything unusual — and "who is a member" is
+/// the input to an assignment that must come out the same on every node.
+pub fn record_name(node: &NodeId) -> String {
+    let safe: String = node
+        .as_str()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{safe}.json")
 }
 
 impl Registry for DirRegistry {
@@ -237,18 +248,41 @@ impl Registry for MemoryRegistry {
 
 /// Build a registry from a URI-ish string, so the binary takes one flag.
 ///
-/// Only a path today. Kept as a function rather than inlined because the S3
-/// shape is the same three operations — see the module docs — and this is
-/// where that would be chosen, exactly as `ma_persist::store_from_uri` does.
-pub fn registry_from_uri(uri: &str) -> Result<Box<dyn Registry>, String> {
-    if uri.starts_with("s3://") {
-        return Err(
-            "an S3-backed cluster registry is not implemented. The trait needs only PutObject, \
-             ListObjects and DeleteObject — deliberately no conditional write — so it is a small \
-             addition, but nothing in this project writes to S3 before an IAM user scoped to one \
-             bucket prefix exists. See CLAUDE.md."
-                .to_owned(),
-        );
+/// `s3://bucket/prefix` needs the `s3` feature; anything else is a directory.
+/// The failure when the feature is off is deliberately a clear message rather
+/// than a silent fallback to a local path — an operator who asked for a shared
+/// registry and got a directory on one node would have every node believing it
+/// is alone in the cluster, and every node would then run every stream. That
+/// is the exact failure the whole crate exists to prevent, arrived at by a
+/// config typo.
+///
+/// Async because connecting to an object store validates the target — the
+/// prefix, the acknowledgement, and the credential scope — and a registry that
+/// deferred those to the first renewal would report a misconfiguration as a
+/// node mysteriously never acquiring anything.
+///
+/// # Errors
+/// If the URI names a backend this build does not have, or the backend refuses
+/// to connect.
+pub async fn registry_from_uri(uri: &str) -> Result<Box<dyn Registry>, String> {
+    if let Some(rest) = uri.strip_prefix("s3://") {
+        #[cfg(feature = "s3")]
+        {
+            return crate::s3::S3Registry::from_uri(rest)
+                .await
+                .map(|r| Box::new(r) as Box<dyn Registry>)
+                .map_err(|e| e.to_string());
+        }
+        #[cfg(not(feature = "s3"))]
+        {
+            let _ = rest;
+            return Err(format!(
+                "this build has no S3 support: {uri:?} needs `--features s3`. The registry needs \
+                 only PutObject, ListObjects and DeleteObject — deliberately no conditional \
+                 write — but nothing in this project reaches S3 unless the feature is on and an \
+                 IAM user scoped to one bucket prefix exists. See CLAUDE.md."
+            ));
+        }
     }
     Ok(Box::new(DirRegistry::new(Path::new(uri))))
 }
@@ -378,9 +412,34 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "s3"))]
+    #[tokio::test]
+    async fn an_s3_uri_without_the_feature_fails_loudly_rather_than_falling_back() {
+        // A silent fallback to a local directory would be the worst available
+        // outcome: every node would hold its own private registry, see a
+        // cluster of one, and run every stream. Two nodes on a stream is the
+        // failure this crate exists to prevent, and it would look completely
+        // healthy from each node's own page.
+        let e = registry_from_uri("s3://bucket/cluster").await.unwrap_err();
+        assert!(e.contains("--features s3"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_plain_path_is_a_directory_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        let registry = registry_from_uri(&path).await.unwrap();
+        assert!(registry.describe().starts_with("directory "));
+    }
+
     #[test]
-    fn an_s3_registry_uri_is_refused_with_the_reason() {
-        let e = registry_from_uri("s3://bucket/cluster").unwrap_err();
-        assert!(e.contains("scoped to one bucket prefix"), "{e}");
+    fn both_registries_derive_a_nodes_record_name_the_same_way() {
+        // Not cosmetic. Membership is the input to an assignment that must come
+        // out identical on every node, so two registries disagreeing about what
+        // a node's record is called is two nodes disagreeing about who exists —
+        // and the disjointness argument is over a shared membership set.
+        assert_eq!(record_name(&NodeId::new("node-a")), "node-a.json");
+        assert_eq!(record_name(&NodeId::new("a.b/c")), "a_b_c.json");
+        assert!(!record_name(&NodeId::new("../escape")).contains('/'));
     }
 }

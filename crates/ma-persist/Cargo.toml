@@ -22,9 +22,10 @@ workspace = true
 
 [features]
 default = []
-s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
+s3 = ["dep:ma-aws"]
 
 [dependencies]
+ma-aws = { path = "../ma-aws", optional = true }
 ma-core = { path = "../ma-core" }
 arrow = { version = "59", default-features = false }
 # `parquet`'s reader takes an `impl ChunkReader`; `Bytes` is the implementation
@@ -34,8 +35,6 @@ parquet = { version = "59", default-features = false, features = ["arrow", "zstd
 tokio = { version = "1", features = ["sync", "time", "rt", "macros", "fs", "io-util"] }
 tracing = "0.1"
 thiserror = "2"
-aws-config = { version = "1", optional = true, default-features = false, features = ["behavior-version-latest", "rustls"] }
-aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["rt-tokio"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

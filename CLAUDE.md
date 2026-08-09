@@ -242,9 +242,14 @@ Neither layer replaces the other.
       `EventReader` now merges one cursor per partition on the wall clock —
       the only column comparable across writer runs. Old-layout archives still
       read
-- An S3-backed cluster registry — unblocked by the IAM user that opened the
-  Parquet store's gate, and the payoff for `Registry` having no
-  compare-and-swap
+- [x] An S3-backed cluster registry. `ma-coord`'s `s3` feature, over a new
+      `ma-aws` crate holding the one scope-verified S3 client — a safety
+      control that exists twice will disagree with itself, so `ma-persist`
+      now uses the same one. Run live: two nodes, six streams, disjoint
+      throughout, `kill -9` handover one lease later. The live run found that
+      the scoped IAM user has no `DeleteObject`, so `withdraw` is refused —
+      which costs a lease's wait and nothing else, since a node that cannot
+      withdraw is exactly a node that was hard-killed
 
 ## Status
 
@@ -276,6 +281,11 @@ state.
 - **`ma-persist`** — Arrow schema, Parquet writer with hourly rolls, the
   `ObjectStore` trait with a local implementation, and S3 behind a default-off
   feature. The only crate that sees `arrow`/`parquet`.
+- **`ma-aws`** — v4. The one S3 client, and the only place the mandatory
+  prefix, the `MA_S3_ACK_SCOPED_IAM` interlock and the scope probe live. It is
+  a crate rather than a module because `ma-persist` and `ma-coord` both want a
+  bucket, and duplicating a credential control is how it comes to disagree
+  with itself. Nothing depends on it unless an `s3` feature is on.
 - **`ma-coord`** — v3. Rendezvous-hash assignment (pure, no async, like
   `ma-core`), the lease loop with holder-side expiry and a settling period, and
   a `Registry` trait with directory and in-process implementations. No
@@ -364,8 +374,7 @@ a root login session.
 An S3-backed cluster registry is now unblocked. It needs only PutObject,
 ListObjects and DeleteObject — deliberately no conditional write.
 
-**Next up:** the rest of v4 — a cross-node merged view, and an S3-backed
-cluster registry.
+**Next up:** v4's last item — a gateway merging every node's snapshot.
 
 ## Non-goals
 

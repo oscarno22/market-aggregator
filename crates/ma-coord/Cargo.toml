@@ -18,7 +18,16 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Off by default, like `ma-persist`'s. The registry needs only PutObject,
+# ListObjects and DeleteObject — see src/s3.rs — but a default build must not
+# link the AWS SDK, so the offline suite cannot acquire a dependency on
+# credentials by accident.
+s3 = ["dep:ma-aws"]
+
 [dependencies]
+ma-aws = { path = "../ma-aws", optional = true }
 ma-core = { path = "../ma-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

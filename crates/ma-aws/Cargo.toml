@@ -1,0 +1,32 @@
+# One S3 client, which proves it is confined to its prefix before it is handed
+# to anybody.
+#
+# This crate exists because two unrelated subsystems now want a bucket —
+# `ma-persist` for the Parquet archive and `ma-coord` for the cluster registry
+# — and the thing they share is not convenience code. It is the control that
+# stands between a long-running process and a bucket it should not be able to
+# reach, and a safety control that exists twice is a safety control that will
+# eventually disagree with itself. The same argument the Parquet tee makes
+# about a second consumer of the raw channel.
+#
+# Nothing depends on this crate unconditionally: both callers pull it in only
+# under their own `s3` feature, so a default build still neither compiles nor
+# links the AWS SDK.
+[package]
+name = "ma-aws"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

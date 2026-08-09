@@ -15,7 +15,7 @@ workspace = true
 default = []
 # Forwarded to ma-persist. Off by default: CLAUDE.md gates AWS behind an IAM
 # user scoped to one bucket prefix, so the default build does not link the SDK.
-s3 = ["ma-persist/s3"]
+s3 = ["ma-persist/s3", "ma-coord/s3"]
 
 [dependencies]
 async-stream = "0.3.6"
