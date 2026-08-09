@@ -100,22 +100,22 @@ Neither layer replaces the other.
 
 ## Milestones
 
-**v1 — the demonstrable core**
+**v1 — the demonstrable core** — **complete**
 - [x] 3 venues, 1 symbol, top-of-book only — **Coinbase, Kraken, Bitstamp**,
       not Binance as originally planned: Binance 451s on requests from US
       IPs, so Bitstamp took its slot. Its integrity guarantee is weaker
       (`OrderOnly`, no gap detection) than the other two, which turned out to
       be a more interesting three-venue spread than the original plan anyway.
 - [x] Normalization, bounded channel
-- [ ] Single-owner aggregator task (the channel and book/`VenueSync` state
-      machine it will own both exist; the task that ticks it isn't built)
-- [ ] SSE endpoint + minimal chart page (`ma-server` is still a stub)
+- [x] Single-owner aggregator task
+- [x] SSE endpoint + minimal chart page
 - [x] Gap-fill state machine and `Desynced` state, proven offline per-venue
-- [ ] Real reconnect over a live socket (exponential backoff + jitter,
-      capped) — next up
-- [ ] Metrics surface (events/sec, drop count, reconnect count, book age) —
-      the underlying counters already exist (`ChannelMetrics::dropped`, book
-      state transitions), just not wired to an endpoint
+- [x] Real reconnect over a live socket (exponential backoff + **equal**
+      jitter, capped; resets only after a session lasts `min_stable`, so a
+      flapping venue keeps escalating)
+- [x] Metrics surface at `/metrics` (Prometheus text): events/sec, drop
+      count, reconnect count, book age, **time-in-Desynced**
+- [x] First live connection, tape recorded and committed
 
 **v2 — depth and durability**
 - Full L2 order books with depth-limited pruning
@@ -134,40 +134,39 @@ Neither layer replaces the other.
 Snapshot as of the last session; update this when a milestone item lands or
 a design decision changes.
 
-Four-crate workspace, **80 tests passing, clippy-clean (`-D warnings`),
-`cargo fmt` clean**. All pushed to `main`.
+**v1 is complete.** Four-crate workspace, **149 tests passing, clippy-clean
+(`-D warnings`), `cargo fmt` clean**, pushed to `main`. The full suite runs
+offline; `just demo tapes/2026-08-09-btc-usd.jsonl.gz` plays a real recording
+through the real pipeline with the network unplugged.
+
+Read `docs/DESIGN.md` first — it carries the reasoning, the gap-fill sequence
+diagrams, and the operating runbook. This section is only the current state.
 
 - **`ma-core`** — no I/O, no async deps (enforced by a manifest test).
-  `Decimal`-based `Price`/`Qty` (not `f64` — Kraken's checksum depends on
-  exact decimal strings surviving the round trip). `IngestTime` carries both
-  a monotonic and a wall clock, never interchangeably. `Book`/`BookState`
-  with the three-way `Integrity` trust model (`OrderOnly` <
-  `GapDetectable` < `Verified`) and an explicit `Desynced` state.
-- **`ma-venues`** — `VenueSync`: a pure state machine (no socket, no book
-  ownership), which is what lets the scripted `FakeSync` + `Tape`/`Script`
-  drive the exact code path a live venue does. Full parsers, each with
-  golden fixture tests, for the three venues actually in play: **Coinbase**
-  (`sequence_num`, `GapDetectable`, resubscribe recovery), **Kraken** (CRC32
-  checksum, `Verified`, resubscribe recovery — the `f64` hazard on
-  checksum-relevant fields is caught and worked around via
-  `serde_json::RawValue`), **Bitstamp** (REST snapshot + microtimestamp
-  ordering, `OrderOnly`, REST-splice recovery — weaker than the original
-  brief's reconnect algorithm assumed; see `RestSnapshot`'s doc comment for
-  why a "hole means restart" check doesn't work without a dense sequence
-  counter).
-- **`ma-pipeline`** — the bounded, drop-oldest channel (`Mutex<VecDeque>`,
-  never awaits inside the critical section, drop count exposed via
-  `ChannelMetrics`), and the **raw-frame tape recorder + replay**
-  (`TapeWriter`/`TapeReader`/`replay`, in `ma-pipeline::tape`): pre-parse
-  `RawFrame`s to JSONL, replayed back through the same `Sender<RawFrame>` a
-  live ingest task would use, with an optional speed multiplier and
-  drop-oldest reporting identical to a live run's.
-- **`ma-server`** — still a stub (`v1/10` placeholder). No real ingest
-  tasks, no aggregator task, no SSE endpoint, no metrics endpoint yet.
+  `Decimal`-based `Price`/`Qty`, `IngestTime` carrying both clocks,
+  `Book`/`BookState` with the three-way `Integrity` model.
+- **`ma-venues`** — `VenueSync` state machines and golden fixtures for all
+  three venues, plus `endpoint.rs`: URLs, subscribe payloads and REST
+  snapshot URLs as data, so this crate still opens no sockets.
+- **`ma-pipeline`** — bounded drop-oldest channel (plus `send_lossless` for
+  replay, which must not drop), reconnect backoff, per-venue ingest tasks
+  behind a `Network` trait, the single-owner aggregator, counters, and the
+  raw-frame tape recorder/replay.
+- **`ma-server`** — axum SSE with correct `Lagged` handling, `/metrics`,
+  a self-contained chart page, and three binaries: `ma-server` (serve),
+  `record`, `replay`.
 
-**Next up:** v1 item 8 — real ingest tasks (live websocket per venue,
-reconnect/backoff, tee'ing frames to both `VenueSync` and the tape
-recorder), then the aggregator task and SSE endpoint to close out v1.
+**Three bugs the first live tape found, that every hand-written fixture
+missed** — the argument for the tape recorder, recorded here so it is not
+re-learned: Coinbase's `sequence_num` is connection-scoped rather than
+per-channel (every heartbeat read as a gap); Coinbase says `offer`, not
+`ask`; Kraken's `status` frame has no `symbol` and broke an eagerly-typed
+envelope. See `docs/DESIGN.md` §7.
+
+**Next up:** v2 — full L2 depth, the periodic REST re-snapshot audit for
+Bitstamp and Coinbase, Parquet behind an `ObjectStore` trait, then S3. Note
+the sequencing rule: **nothing touches AWS before v2**, and nothing writes to
+S3 before an IAM user scoped to one bucket prefix replaces the root keys.
 
 ## Non-goals
 
