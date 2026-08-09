@@ -83,8 +83,37 @@ pub enum RecoveryStrategy {
     /// **Bitstamp.**
     ///
     /// This is the algorithm the original design brief described as though it
-    /// were universal. It applies to exactly one of our three venues.
+    /// were universal. It applies to exactly one of our three venues, and even
+    /// there it is weaker than the brief assumed — see [`RestSnapshot`].
     RestSnapshot,
+}
+
+/// A snapshot fetched out-of-band over REST, for a venue whose
+/// [`RecoveryStrategy`] is [`RecoveryStrategy::RestSnapshot`].
+///
+/// `ma-venues` has no HTTP client and performs no I/O; the ingest task in
+/// `ma-pipeline` is what actually issues the request. This type is how the
+/// result crosses back into the network-free sync layer, via
+/// [`VenueSync::apply_rest_snapshot`].
+///
+/// **On `as_of` and the hole check the original design brief assumed:** the
+/// brief's reconnect algorithm calls for verifying that the buffered deltas
+/// surviving the splice start at exactly `snapshot_sequence + 1`, and
+/// discarding everything and restarting if there's a hole. That check
+/// requires a dense integer counter. Bitstamp gives us a microtimestamp
+/// instead, and time does not work as a hole detector — an hour can pass
+/// between two adjacent, entirely legitimate diffs. `as_of` is used to
+/// discard deltas the snapshot already contains; there is no corresponding
+/// way to *prove* the ones that survive are complete. That gap is
+/// `Integrity::OrderOnly`'s cost, and it is why the v2 plan calls for a
+/// periodic re-snapshot audit rather than trusting the splice indefinitely.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestSnapshot {
+    pub bids: Vec<Level>,
+    pub asks: Vec<Level>,
+    /// The venue's own ordering marker for this snapshot, in the same units
+    /// as the ordering field on that venue's deltas. Bitstamp: microseconds.
+    pub as_of: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -130,6 +159,21 @@ pub trait VenueSync: fmt::Debug + Send {
 
     /// Return to the pre-subscription state after a reconnect.
     fn reset(&mut self);
+
+    /// Splice in a REST-fetched snapshot, for [`RecoveryStrategy::RestSnapshot`]
+    /// venues. Never called for a [`RecoveryStrategy::Resubscribe`] venue,
+    /// which gets its snapshot over the websocket instead — the default
+    /// implementation is a no-op precisely so that forgetting to override it
+    /// fails loudly in debug builds rather than silently doing nothing useful.
+    fn apply_rest_snapshot(&mut self, snapshot: RestSnapshot) -> Vec<SyncAction> {
+        debug_assert!(
+            self.recovery() == RecoveryStrategy::RestSnapshot,
+            "apply_rest_snapshot called on a venue whose recovery is {:?}, not RestSnapshot",
+            self.recovery()
+        );
+        let _ = snapshot;
+        Vec::new()
+    }
 }
 
 /// A venue's sync state machine paired with the book it maintains.
@@ -184,9 +228,23 @@ impl VenueBook {
 
     /// Feed one frame; apply whatever it implies.
     pub fn feed(&mut self, frame: &RawFrame) -> Result<Vec<Outcome>, VenueError> {
-        let before = self.book.state();
         let actions = self.sync.ingest(frame)?;
-        let at = frame.ingest_ts;
+        Ok(self.apply_actions(actions, frame.ingest_ts))
+    }
+
+    /// Splice in a REST-fetched snapshot. See [`VenueSync::apply_rest_snapshot`]
+    /// and the caveat on [`RestSnapshot`] about what this can and cannot prove
+    /// for an [`Integrity::OrderOnly`] venue.
+    pub fn apply_rest_snapshot(&mut self, snapshot: RestSnapshot, at: IngestTime) -> Vec<Outcome> {
+        let actions = self.sync.apply_rest_snapshot(snapshot);
+        self.apply_actions(actions, at)
+    }
+
+    /// Apply the actions a [`VenueSync`] returned, and report whether trust in
+    /// the book changed as a result. Shared by [`Self::feed`] and
+    /// [`Self::apply_rest_snapshot`] so the two entry points can't drift.
+    fn apply_actions(&mut self, actions: Vec<SyncAction>, at: IngestTime) -> Vec<Outcome> {
+        let before = self.book.state();
         let mut outcomes = Vec::new();
 
         for action in actions {
@@ -233,7 +291,7 @@ impl VenueBook {
                 to: after,
             });
         }
-        Ok(outcomes)
+        outcomes
     }
 
     fn verify(&mut self, expected: u32, at: IngestTime) {

@@ -17,4 +17,7 @@ pub mod fake;
 pub mod sync;
 
 pub use fake::{FakeSync, Script, Tape, fake_checksum};
-pub use sync::{Outcome, RawFrame, RecoveryStrategy, SyncAction, VenueBook, VenueError, VenueSync};
+pub use sync::{
+    Outcome, RawFrame, RecoveryStrategy, RestSnapshot, SyncAction, VenueBook, VenueError,
+    VenueSync,
+};
