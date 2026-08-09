@@ -25,6 +25,39 @@ pub fn init_tracing(default: &str) {
     fmt().with_env_filter(filter).with_target(false).init();
 }
 
+/// Parse a comma-separated symbol list, e.g. `BTC-USD,ETH-USD`.
+///
+/// # Errors
+/// If a symbol is not in normalised `BASE-QUOTE` form, or the list is empty.
+/// Rejected here rather than at the first connection, so a typo costs a
+/// startup failure instead of a book that silently never initialises.
+pub fn parse_symbols(raw: &str) -> Result<Vec<ma_core::Symbol>, String> {
+    let symbols: Vec<ma_core::Symbol> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ma_core::Symbol::new)
+        .collect();
+
+    if symbols.is_empty() {
+        return Err("no symbols given".to_owned());
+    }
+    for symbol in &symbols {
+        // Any venue will do for the check — `native_symbol` rejects a
+        // non-normalised spelling before it ever looks at the venue.
+        ma_venues::native_symbol(ma_core::VenueId::Coinbase, symbol)
+            .map_err(|e| format!("{symbol}: {e}"))?;
+    }
+
+    let mut sorted = symbols.clone();
+    sorted.sort();
+    sorted.dedup();
+    if sorted.len() != symbols.len() {
+        return Err(format!("duplicate symbol in {raw:?}"));
+    }
+    Ok(symbols)
+}
+
 /// Parse a comma-separated venue list, e.g. `coinbase,kraken`.
 ///
 /// # Errors

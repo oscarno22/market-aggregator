@@ -16,11 +16,12 @@
 //! test ever goes green by detecting the loss, the enum is lying.
 
 use ma_core::{
-    Book, Clock, DesyncReason, IngestTime, Integrity, Level, Side, Symbol, TestClock, VenueId,
+    Book, Clock, DesyncReason, IngestTime, Integrity, Level, Side, StreamId, Symbol, TestClock,
+    VenueId,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::sync::{RawFrame, RecoveryStrategy, SyncAction, VenueError, VenueSync};
+use crate::sync::{Ingested, RawFrame, RecoveryStrategy, SyncAction, VenueError, VenueSync};
 
 /// Gap between synthetic frames. Arbitrary, but fixed so replays are
 /// bit-identical run to run.
@@ -104,6 +105,7 @@ pub struct Script {
     seq: u64,
     shadow: Book,
     clock: TestClock,
+    symbol: Symbol,
 }
 
 impl Default for Script {
@@ -114,11 +116,21 @@ impl Default for Script {
 
 impl Script {
     pub fn new() -> Self {
+        Self::for_symbol(Symbol::new("BTC-USD"))
+    }
+
+    /// A script for a named symbol.
+    ///
+    /// Multi-symbol tests need this: the frames a script produces carry a
+    /// [`StreamId`], and a [`VenueBook`](crate::sync::VenueBook) for `ETH-USD`
+    /// fed frames stamped `BTC-USD` would be testing the wrong thing.
+    pub fn for_symbol(symbol: Symbol) -> Self {
         Self {
             frames: Vec::new(),
             seq: 0,
-            shadow: Book::new(VenueId::Fake, Symbol::new("BTC-USD")),
+            shadow: Book::new(VenueId::Fake, symbol.clone()),
             clock: TestClock::new(),
+            symbol,
         }
     }
 
@@ -128,8 +140,11 @@ impl Script {
             // failure into the tape rather than panicking a test helper.
             format!(r#"{{"type":"malformed","error":"{e}"}}"#).into_bytes()
         });
-        self.frames
-            .push(RawFrame::new(VenueId::Fake, payload, self.clock.now()));
+        self.frames.push(RawFrame::new(
+            StreamId::new(VenueId::Fake, self.symbol.clone()),
+            payload,
+            self.clock.now(),
+        ));
         self.clock.advance(FRAME_INTERVAL);
     }
 
@@ -184,19 +199,34 @@ impl Script {
     pub fn build(self) -> Tape {
         Tape {
             frames: self.frames,
+            symbol: self.symbol,
         }
     }
 }
 
 /// A recorded frame sequence, and the ways a network can ruin one.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Tape {
     frames: Vec<RawFrame>,
+    symbol: Symbol,
+}
+
+impl Default for Tape {
+    fn default() -> Self {
+        Self {
+            frames: Vec::new(),
+            symbol: Symbol::new("BTC-USD"),
+        }
+    }
 }
 
 impl Tape {
     pub fn frames(&self) -> &[RawFrame] {
         &self.frames
+    }
+
+    pub fn symbol(&self) -> &Symbol {
+        &self.symbol
     }
 
     pub fn len(&self) -> usize {
@@ -332,11 +362,11 @@ impl VenueSync for FakeSync {
         self.expected_seq = None;
     }
 
-    fn ingest(&mut self, frame: &RawFrame) -> Result<Vec<SyncAction>, VenueError> {
-        if frame.venue != VenueId::Fake {
+    fn ingest(&mut self, frame: &RawFrame) -> Result<Ingested, VenueError> {
+        if frame.venue() != VenueId::Fake {
             return Err(VenueError::WrongVenue {
                 expected: VenueId::Fake,
-                got: frame.venue,
+                got: frame.venue(),
             });
         }
 
@@ -347,17 +377,17 @@ impl VenueSync for FakeSync {
         // expectation instead of being checked against it.
         if let FakeMsg::Snapshot { seq, bids, asks } = &msg {
             self.expected_seq = Some(seq + 1);
-            return Ok(vec![SyncAction::Snapshot {
+            return Ok(Ingested::untimed(vec![SyncAction::Snapshot {
                 bids: to_levels(bids)?,
                 asks: to_levels(asks)?,
-            }]);
+            }]));
         }
 
         if let Some(reason) = self.check_seq(msg.seq()) {
-            return Ok(vec![SyncAction::Desync(reason)]);
+            return Ok(Ingested::untimed(vec![SyncAction::Desync(reason)]));
         }
 
-        Ok(match msg {
+        Ok(Ingested::untimed(match msg {
             FakeMsg::Delta { bids, asks, .. } => vec![SyncAction::Delta {
                 bids: to_levels(&bids)?,
                 asks: to_levels(&asks)?,
@@ -372,14 +402,14 @@ impl VenueSync for FakeSync {
                 Integrity::OrderOnly | Integrity::GapDetectable => vec![SyncAction::Ignore],
             },
             FakeMsg::Snapshot { .. } => unreachable!("handled above"),
-        })
+        }))
     }
 }
 
 /// Convenience for tests: run a whole tape through a fresh book.
 pub fn run(tape: &Tape, integrity: Integrity) -> crate::sync::VenueBook {
     let mut vb =
-        crate::sync::VenueBook::new(Box::new(FakeSync::new(integrity)), Symbol::new("BTC-USD"));
+        crate::sync::VenueBook::new(Box::new(FakeSync::new(integrity)), tape.symbol().clone());
     for frame in tape.frames() {
         let _ = vb.feed(frame);
     }

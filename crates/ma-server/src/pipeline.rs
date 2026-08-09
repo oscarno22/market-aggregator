@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ma_core::{Clock, Symbol, SystemClock, VenueId};
+use ma_core::{Clock, StreamId, Symbol, SystemClock, VenueId};
 use ma_pipeline::aggregator::{Aggregator, Snapshot};
 use ma_pipeline::channel::{Receiver, Sender, bounded};
 use ma_pipeline::ingest::{Ingest, IngestMessage, Shutdown, ShutdownTrigger, shutdown};
@@ -50,7 +50,7 @@ pub struct PipelineHandle {
     /// Subscribe here for the snapshot stream. Every SSE client does.
     pub snapshots: broadcast::Sender<Arc<Snapshot>>,
     pub metrics: Arc<Metrics>,
-    pub symbol: Symbol,
+    pub symbols: Vec<Symbol>,
     pub venues: Vec<VenueId>,
 }
 
@@ -63,7 +63,7 @@ impl PipelineHandle {
 /// A configured but not-yet-running pipeline.
 #[derive(Debug)]
 pub struct Pipeline {
-    symbol: Symbol,
+    symbols: Vec<Symbol>,
     venues: Vec<VenueId>,
     clock: Arc<dyn Clock>,
     tick: Duration,
@@ -78,23 +78,44 @@ pub struct Pipeline {
     rx: Option<Receiver<IngestMessage>>,
     trigger: ShutdownTrigger,
     shutdown: Shutdown,
+    /// Where normalised events go, if a persistence sink was attached. Taken
+    /// by `spawn_aggregator`, which is the only thing that can supply them.
+    events: Option<tokio::sync::mpsc::UnboundedSender<ma_core::MarketEvent>>,
 }
 
 impl Pipeline {
+    /// One symbol, the common case.
+    ///
     /// # Errors
-    /// If any venue has no endpoint, or the symbol is not in normalised
+    /// As [`Self::new`].
+    pub fn single(symbol: Symbol, venues: Vec<VenueId>) -> Result<Self, PipelineError> {
+        Self::new(vec![symbol], venues)
+    }
+
+    /// Every venue crossed with every symbol: one stream, one connection, one
+    /// book, one set of counters per pair. See `ma_core::stream` for why the
+    /// cross is per-connection rather than multiplexed.
+    ///
+    /// # Errors
+    /// If any venue has no endpoint, or a symbol is not in normalised
     /// `BASE-QUOTE` form. Checked here so a typo stops the process at startup
     /// rather than at the first reconnect.
-    pub fn new(symbol: Symbol, venues: Vec<VenueId>) -> Result<Self, PipelineError> {
+    pub fn new(symbols: Vec<Symbol>, venues: Vec<VenueId>) -> Result<Self, PipelineError> {
         for venue in &venues {
-            ma_venues::spec_for(*venue, &symbol)?;
+            for symbol in &symbols {
+                ma_venues::spec_for(*venue, symbol)?;
+            }
         }
+        let streams: Vec<StreamId> = venues
+            .iter()
+            .flat_map(|v| symbols.iter().map(|s| StreamId::new(*v, s.clone())))
+            .collect();
         let (tx, rx) = bounded(CHANNEL_CAPACITY);
         let (trigger, shutdown) = shutdown();
         Ok(Self {
-            metrics: Arc::new(Metrics::new(venues.iter().copied())),
-            resync: ResyncRequests::new(venues.iter().copied()),
-            symbol,
+            metrics: Arc::new(Metrics::new(streams.clone())),
+            resync: ResyncRequests::new(streams),
+            symbols,
             venues,
             clock: Arc::new(SystemClock),
             tick: ma_pipeline::aggregator::DEFAULT_TICK,
@@ -102,12 +123,25 @@ impl Pipeline {
             rx: Some(rx),
             trigger,
             shutdown,
+            events: None,
         })
     }
 
     #[must_use]
     pub fn with_tick(mut self, tick: Duration) -> Self {
         self.tick = tick;
+        self
+    }
+
+    /// Tee every normalised event to a persistence sink — `ma-persist`'s
+    /// Parquet writer. Must be called before [`Self::spawn_aggregator`], which
+    /// is what consumes it.
+    #[must_use]
+    pub fn recording_events_to(
+        mut self,
+        events: tokio::sync::mpsc::UnboundedSender<ma_core::MarketEvent>,
+    ) -> Self {
+        self.events = Some(events);
         self
     }
 
@@ -132,8 +166,15 @@ impl Pipeline {
         &self.venues
     }
 
-    pub fn symbol(&self) -> &Symbol {
-        &self.symbol
+    pub fn symbols(&self) -> &[Symbol] {
+        &self.symbols
+    }
+
+    /// Every (venue, symbol) pair this pipeline runs, in a stable order.
+    pub fn streams(&self) -> impl Iterator<Item = StreamId> + '_ {
+        self.venues
+            .iter()
+            .flat_map(|v| self.symbols.iter().map(|s| StreamId::new(*v, s.clone())))
     }
 
     /// Spawn the aggregator task.
@@ -149,22 +190,20 @@ impl Pipeline {
         let specs = self
             .venues
             .iter()
-            .map(|v| ma_venues::spec_for(*v, &self.symbol))
+            .flat_map(|v| self.symbols.iter().map(move |s| ma_venues::spec_for(*v, s)))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let aggregator = Aggregator::new(
-            self.symbol.clone(),
-            specs,
-            Arc::clone(&self.clock),
-            &self.metrics,
-        )
-        .with_tick(self.tick)
-        .requesting_resync_through(self.resync.clone());
+        let mut aggregator = Aggregator::new(specs, Arc::clone(&self.clock), &self.metrics)
+            .with_tick(self.tick)
+            .requesting_resync_through(self.resync.clone());
+        if let Some(events) = self.events.take() {
+            aggregator = aggregator.publishing_events_to(events);
+        }
 
         let handle = PipelineHandle {
             snapshots: aggregator.publisher(),
             metrics: Arc::clone(&self.metrics),
-            symbol: self.symbol.clone(),
+            symbols: self.symbols.clone(),
             venues: self.venues.clone(),
         };
 
@@ -181,15 +220,16 @@ impl Pipeline {
         tape: Option<tokio::sync::mpsc::UnboundedSender<IngestMessage>>,
     ) -> Result<Vec<JoinHandle<()>>, PipelineError> {
         let net = Arc::new(LiveNetwork::new()?);
-        let mut tasks = Vec::with_capacity(self.venues.len());
+        let mut tasks = Vec::new();
 
-        for venue in &self.venues {
-            let spec = ma_venues::spec_for(*venue, &self.symbol)?;
-            let counters = self.metrics.venue(*venue).unwrap_or_default();
-            info!(%venue, url = %spec.endpoint.ws_url, "starting ingest");
+        for stream in self.streams() {
+            let spec = ma_venues::spec_for(stream.venue, &stream.symbol)?;
+            let counters = self.metrics.stream(&stream).unwrap_or_default();
+            info!(%stream, url = %spec.endpoint.ws_url, "starting ingest");
 
             let mut ingest = Ingest::new(
                 Arc::clone(&net),
+                stream.clone(),
                 spec.endpoint,
                 self.tx.clone(),
                 Arc::clone(&self.clock),
@@ -199,7 +239,7 @@ impl Pipeline {
             if let Some(tape) = tape.clone() {
                 ingest = ingest.recording_to(tape);
             }
-            if let Some(signal) = self.resync.subscribe(*venue) {
+            if let Some(signal) = self.resync.subscribe(&stream) {
                 ingest = ingest.listening_for_resync(signal);
             }
             tasks.push(tokio::spawn(ingest.run()));
@@ -234,13 +274,42 @@ mod tests {
     #[test]
     fn a_bad_symbol_is_refused_at_construction() {
         // Not at the first reconnect, three hours into a soak.
-        let err = Pipeline::new(Symbol::new("BTCUSD"), DEFAULT_VENUES.to_vec()).unwrap_err();
+        let err = Pipeline::single(Symbol::new("BTCUSD"), DEFAULT_VENUES.to_vec()).unwrap_err();
         assert!(matches!(err, PipelineError::Venue(_)), "{err}");
     }
 
     #[test]
     fn the_fake_venue_cannot_be_served() {
-        let err = Pipeline::new(Symbol::new("BTC-USD"), vec![VenueId::Fake]).unwrap_err();
+        let err = Pipeline::single(Symbol::new("BTC-USD"), vec![VenueId::Fake]).unwrap_err();
+        assert!(matches!(err, PipelineError::Venue(_)), "{err}");
+    }
+
+    #[test]
+    fn every_venue_is_crossed_with_every_symbol() {
+        // Three venues and two symbols is six connections, six books, six sets
+        // of counters — not three of anything. See `ma_core::stream` for why
+        // these are separate sockets rather than one multiplexed subscription
+        // per venue.
+        let p = Pipeline::new(
+            vec![Symbol::new("BTC-USD"), Symbol::new("ETH-USD")],
+            DEFAULT_VENUES.to_vec(),
+        )
+        .unwrap();
+
+        let streams: Vec<String> = p.streams().map(|s| s.key()).collect();
+        assert_eq!(streams.len(), 6);
+        assert!(streams.contains(&"coinbase:BTC-USD".to_owned()));
+        assert!(streams.contains(&"bitstamp:ETH-USD".to_owned()));
+        assert_eq!(p.metrics().streams().count(), 6);
+    }
+
+    #[test]
+    fn one_bad_symbol_in_a_list_stops_the_process_at_startup() {
+        let err = Pipeline::new(
+            vec![Symbol::new("BTC-USD"), Symbol::new("ETHUSD")],
+            DEFAULT_VENUES.to_vec(),
+        )
+        .unwrap_err();
         assert!(matches!(err, PipelineError::Venue(_)), "{err}");
     }
 
@@ -249,7 +318,7 @@ mod tests {
         // Two aggregators would each own a partial view of the same stream and
         // both would look plausible. The receiver moves, so the second attempt
         // cannot compile its way around this.
-        let mut p = Pipeline::new(Symbol::new("BTC-USD"), DEFAULT_VENUES.to_vec()).unwrap();
+        let mut p = Pipeline::single(Symbol::new("BTC-USD"), DEFAULT_VENUES.to_vec()).unwrap();
         assert!(p.spawn_aggregator().is_ok());
         assert!(matches!(
             p.spawn_aggregator().unwrap_err(),
@@ -262,14 +331,15 @@ mod tests {
     async fn ingest_and_the_aggregator_share_one_set_of_counters() {
         // If they did not, every metric on the page would read zero forever
         // while looking entirely plausible.
-        let mut p = Pipeline::new(Symbol::new("BTC-USD"), vec![VenueId::Kraken]).unwrap();
+        let mut p = Pipeline::single(Symbol::new("BTC-USD"), vec![VenueId::Kraken]).unwrap();
         let (handle, _task) = p.spawn_aggregator().unwrap();
 
+        let stream = StreamId::new(VenueId::Kraken, Symbol::new("BTC-USD"));
         p.metrics()
-            .venue(VenueId::Kraken)
+            .stream(&stream)
             .expect("registered")
             .record_frame(42);
-        assert_eq!(handle.metrics.snapshot()[&VenueId::Kraken].frames, 1);
+        assert_eq!(handle.metrics.snapshot()[&stream].frames, 1);
         p.stop();
     }
 }

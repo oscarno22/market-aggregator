@@ -135,19 +135,25 @@ async fn metrics(State(handle): State<PipelineHandle>) -> impl IntoResponse {
     let mut out = String::new();
     let counters = handle.metrics.snapshot();
 
-    let mut metric = |name: &str, help: &str, kind: &str, values: &[(String, u64)]| {
+    // Two labels, not one joined `stream` label. A dashboard has to be able to
+    // ask both "how is Coinbase doing" and "how is BTC-USD doing", and a single
+    // `coinbase:BTC-USD` label would force string surgery in every query to get
+    // either. See `ma_core::stream::StreamId::key`.
+    let mut metric = |name: &str, help: &str, kind: &str, values: &[(String, String, u64)]| {
         out.push_str(&format!(
             "# HELP ma_{name} {help}\n# TYPE ma_{name} {kind}\n"
         ));
-        for (venue, value) in values {
-            out.push_str(&format!("ma_{name}{{venue=\"{venue}\"}} {value}\n"));
+        for (venue, symbol, value) in values {
+            out.push_str(&format!(
+                "ma_{name}{{venue=\"{venue}\",symbol=\"{symbol}\"}} {value}\n"
+            ));
         }
     };
 
-    let per_venue = |f: fn(&ma_pipeline::metrics::VenueCountersSnapshot) -> u64| {
+    let per_stream = |f: fn(&ma_pipeline::metrics::VenueCountersSnapshot) -> u64| {
         counters
             .iter()
-            .map(|(venue, c)| (venue.to_string(), f(c)))
+            .map(|(stream, c)| (stream.venue.to_string(), stream.symbol.to_string(), f(c)))
             .collect::<Vec<_>>()
     };
 
@@ -155,67 +161,67 @@ async fn metrics(State(handle): State<PipelineHandle>) -> impl IntoResponse {
         "frames_total",
         "Frames received from a venue.",
         "counter",
-        &per_venue(|c| c.frames),
+        &per_stream(|c| c.frames),
     );
     metric(
         "bytes_total",
         "Bytes received from a venue.",
         "counter",
-        &per_venue(|c| c.bytes),
+        &per_stream(|c| c.bytes),
     );
     metric(
         "connects_total",
         "Successful venue connections. Reconnects are this less one.",
         "counter",
-        &per_venue(|c| c.connects),
+        &per_stream(|c| c.connects),
     );
     metric(
         "disconnects_total",
         "Connections that dropped mid-stream.",
         "counter",
-        &per_venue(|c| c.disconnects),
+        &per_stream(|c| c.disconnects),
     );
     metric(
         "connect_failures_total",
         "Attempts that never opened a socket. Often a rate limit.",
         "counter",
-        &per_venue(|c| c.connect_failures),
+        &per_stream(|c| c.connect_failures),
     );
     metric(
         "idle_timeouts_total",
         "Sessions killed by the idle watchdog: open socket, no data.",
         "counter",
-        &per_venue(|c| c.idle_timeouts),
+        &per_stream(|c| c.idle_timeouts),
     );
     metric(
         "dropped_total",
         "Frames evicted from the ingest channel before the aggregator read them.",
         "counter",
-        &per_venue(|c| c.dropped),
+        &per_stream(|c| c.dropped),
     );
     metric(
         "applied_total",
         "Messages the aggregator processed. frames_total minus dropped_total.",
         "counter",
-        &per_venue(|c| c.applied),
+        &per_stream(|c| c.applied),
     );
     metric(
         "parse_errors_total",
         "Frames the venue parser rejected. Non-zero suggests venue schema drift.",
         "counter",
-        &per_venue(|c| c.parse_errors),
+        &per_stream(|c| c.parse_errors),
     );
     metric(
         "desyncs_total",
         "Times a book went from trusted to untrusted.",
         "counter",
-        &per_venue(|c| c.desyncs),
+        &per_stream(|c| c.desyncs),
     );
     metric(
         "rest_failures_total",
         "Failed REST depth snapshot fetches.",
         "counter",
-        &per_venue(|c| c.rest_failures),
+        &per_stream(|c| c.rest_failures),
     );
 
     // Book age and time-in-desync live on the aggregator's snapshot rather
@@ -227,18 +233,21 @@ async fn metrics(State(handle): State<PipelineHandle>) -> impl IntoResponse {
             "# HELP ma_book_age_ms Time since the last update applied to a book.\n\
              # TYPE ma_book_age_ms gauge\n",
         );
-        for v in &snapshot.venues {
+        for (symbol, v) in snapshot.views() {
             if let Some(age) = v.age_ms {
-                out.push_str(&format!("ma_book_age_ms{{venue=\"{}\"}} {age}\n", v.venue));
+                out.push_str(&format!(
+                    "ma_book_age_ms{{venue=\"{}\",symbol=\"{symbol}\"}} {age}\n",
+                    v.venue
+                ));
             }
         }
         out.push_str(
             "# HELP ma_desynced_total_ms Cumulative time a book has spent untrusted.\n\
              # TYPE ma_desynced_total_ms counter\n",
         );
-        for v in &snapshot.venues {
+        for (symbol, v) in snapshot.views() {
             out.push_str(&format!(
-                "ma_desynced_total_ms{{venue=\"{}\"}} {}\n",
+                "ma_desynced_total_ms{{venue=\"{}\",symbol=\"{symbol}\"}} {}\n",
                 v.venue, v.desynced_total_ms
             ));
         }
@@ -246,9 +255,25 @@ async fn metrics(State(handle): State<PipelineHandle>) -> impl IntoResponse {
             "# HELP ma_book_live Whether a book is currently trusted.\n\
              # TYPE ma_book_live gauge\n",
         );
-        for v in &snapshot.venues {
+        for (symbol, v) in snapshot.views() {
             let live = u8::from(v.status == ma_pipeline::aggregator::BookStatus::Live);
-            out.push_str(&format!("ma_book_live{{venue=\"{}\"}} {live}\n", v.venue));
+            out.push_str(&format!(
+                "ma_book_live{{venue=\"{}\",symbol=\"{symbol}\"}} {live}\n",
+                v.venue
+            ));
+        }
+        out.push_str(
+            "# HELP ma_book_levels Levels currently held per side. The full book, not \
+             the depth served to clients.\n\
+             # TYPE ma_book_levels gauge\n",
+        );
+        for (symbol, v) in snapshot.views() {
+            for (side, n) in [("bid", v.levels_held[0]), ("ask", v.levels_held[1])] {
+                out.push_str(&format!(
+                    "ma_book_levels{{venue=\"{}\",symbol=\"{symbol}\",side=\"{side}\"}} {n}\n",
+                    v.venue
+                ));
+            }
         }
     }
 
@@ -287,24 +312,30 @@ mod tests {
     use std::sync::Arc;
 
     fn handle() -> (PipelineHandle, Aggregator) {
-        let symbol = Symbol::new("BTC-USD");
+        handle_over(&[Symbol::new("BTC-USD")])
+    }
+
+    fn handle_over(symbols: &[Symbol]) -> (PipelineHandle, Aggregator) {
         let venues = vec![VenueId::Coinbase, VenueId::Kraken];
-        let metrics = Arc::new(Metrics::new(venues.iter().copied()));
+        let streams: Vec<ma_core::StreamId> = venues
+            .iter()
+            .flat_map(|v| {
+                symbols
+                    .iter()
+                    .map(|s| ma_core::StreamId::new(*v, s.clone()))
+            })
+            .collect();
+        let metrics = Arc::new(Metrics::new(streams));
         let specs = venues
             .iter()
-            .map(|v| ma_venues::spec_for(*v, &symbol).unwrap())
+            .flat_map(|v| symbols.iter().map(|s| ma_venues::spec_for(*v, s).unwrap()))
             .collect();
-        let agg = Aggregator::new(
-            symbol.clone(),
-            specs,
-            Arc::new(ma_core::SystemClock),
-            &metrics,
-        );
+        let agg = Aggregator::new(specs, Arc::new(ma_core::SystemClock), &metrics);
         (
             PipelineHandle {
                 snapshots: agg.publisher(),
                 metrics,
-                symbol,
+                symbols: symbols.to_vec(),
                 venues,
             },
             agg,
@@ -365,11 +396,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metrics_are_prometheus_text_with_a_venue_label() {
-        let (handle, mut agg) = handle();
+    async fn metrics_are_prometheus_text_with_venue_and_symbol_labels() {
+        let (handle, mut agg) = handle_over(&[Symbol::new("BTC-USD"), Symbol::new("ETH-USD")]);
         handle
             .metrics
-            .venue(VenueId::Kraken)
+            .stream(&ma_core::StreamId::new(
+                VenueId::Kraken,
+                Symbol::new("BTC-USD"),
+            ))
             .unwrap()
             .record_frame(10);
 
@@ -397,11 +431,26 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
 
         assert!(text.contains("# TYPE ma_frames_total counter"));
-        assert!(text.contains(r#"ma_frames_total{venue="kraken"} 1"#));
-        assert!(text.contains(r#"ma_frames_total{venue="coinbase"} 0"#));
+        // Both labels, so a query can aggregate over either axis. A single
+        // joined `stream` label would force string surgery in every dashboard.
+        assert!(
+            text.contains(r#"ma_frames_total{venue="kraken",symbol="BTC-USD"} 1"#),
+            "missing the labelled counter:\n{text}"
+        );
+        // The claim that makes the label worth having: the *same venue's*
+        // other symbol is a separate series and did not absorb the count.
+        assert!(
+            text.contains(r#"ma_frames_total{venue="kraken",symbol="ETH-USD"} 0"#),
+            "a second symbol on the same venue shared its counters:\n{text}"
+        );
+        assert!(text.contains(r#"ma_frames_total{venue="coinbase",symbol="BTC-USD"} 0"#));
         assert!(
             text.contains("ma_book_live"),
             "book gauges missing:\n{text}"
+        );
+        assert!(
+            text.contains(r#"ma_book_levels{venue="kraken",symbol="BTC-USD",side="bid"}"#),
+            "depth gauge missing:\n{text}"
         );
     }
 

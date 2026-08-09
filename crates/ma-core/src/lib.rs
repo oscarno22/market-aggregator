@@ -27,9 +27,11 @@
 pub mod book;
 pub mod event;
 pub mod price;
+pub mod stream;
 pub mod time;
 
 pub use book::{Book, BookError, BookState, BookStateKind, DesyncReason, Integrity, TopOfBook};
 pub use event::{EventKind, Level, MarketEvent, Side, SkewObservation, Symbol, VenueId};
 pub use price::{ParseError, Price, Qty};
+pub use stream::StreamId;
 pub use time::{Clock, IngestTime, SystemClock, TestClock};

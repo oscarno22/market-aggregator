@@ -8,15 +8,16 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use clap::Parser;
-use ma_core::Symbol;
-use ma_server::{DEFAULT_VENUES, Pipeline, http, init_tracing, parse_venues};
+use ma_server::{DEFAULT_VENUES, Pipeline, http, init_tracing, parse_symbols, parse_venues};
 
 #[derive(Parser, Debug)]
 #[command(about = "Multi-venue crypto market data aggregator")]
 struct Args {
-    /// Symbol in normalised BASE-QUOTE form. Translated per venue.
+    /// Comma-separated symbols in normalised BASE-QUOTE form, translated per
+    /// venue. Each (venue, symbol) pair gets its own connection — see
+    /// `ma_core::stream` for why they are not multiplexed onto one socket.
     #[arg(long, default_value = "BTC-USD")]
-    symbol: String,
+    symbols: String,
 
     /// Comma-separated venues.
     #[arg(long, default_value = "coinbase,kraken,bitstamp")]
@@ -41,16 +42,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         parse_venues(&args.venues)?
     };
 
-    let mut pipeline = Pipeline::new(Symbol::new(&args.symbol), venues)?
-        .with_tick(Duration::from_millis(args.tick_ms));
+    let symbols = parse_symbols(&args.symbols)?;
+    let mut pipeline =
+        Pipeline::new(symbols, venues)?.with_tick(Duration::from_millis(args.tick_ms));
 
     let (handle, aggregator) = pipeline.spawn_aggregator()?;
     let ingest = pipeline.spawn_ingest(None)?;
     let shutdown = pipeline.shutdown();
 
     tracing::info!(
-        symbol = %args.symbol,
+        symbols = ?pipeline.symbols(),
         venues = ?pipeline.venues(),
+        streams = pipeline.streams().count(),
         "open http://{} for the chart", args.addr
     );
 

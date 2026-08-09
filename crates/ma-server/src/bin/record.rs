@@ -15,10 +15,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
-use ma_core::Symbol;
 use ma_pipeline::ingest::IngestMessage;
 use ma_pipeline::tape::TapeWriter;
-use ma_server::{Pipeline, init_tracing, parse_venues};
+use ma_server::{Pipeline, init_tracing, parse_symbols, parse_venues};
 
 #[derive(Parser, Debug)]
 #[command(about = "Record raw venue websocket frames to a tape (needs network)")]
@@ -27,6 +26,7 @@ struct Args {
     #[arg(long, default_value = "coinbase,kraken,bitstamp")]
     venue: String,
 
+    /// Comma-separated symbols, in normalised BASE-QUOTE form.
     #[arg(long, default_value = "BTC-USD")]
     symbol: String,
 
@@ -45,21 +45,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing("info");
 
     let venues = parse_venues(&args.venue)?;
-    let symbol = Symbol::new(&args.symbol);
+    let symbols = parse_symbols(&args.symbol)?;
     let path = args.out.unwrap_or_else(|| {
         let names: Vec<&str> = venues.iter().map(|v| v.as_str()).collect();
+        let pairs: Vec<String> = symbols
+            .iter()
+            .map(|s| s.to_string().to_lowercase())
+            .collect();
         PathBuf::from("tapes").join(format!(
             "{}-{}-{}.jsonl",
             date_stamp(),
             names.join("+"),
-            args.symbol.to_lowercase()
+            pairs.join("+")
         ))
     });
     if let Some(dir) = path.parent() {
         tokio::fs::create_dir_all(dir).await?;
     }
 
-    let pipeline = Pipeline::new(symbol, venues)?;
+    let pipeline = Pipeline::new(symbols, venues)?;
     let clock = pipeline.clock();
     let (tape_tx, mut tape_rx) = tokio::sync::mpsc::unbounded_channel::<IngestMessage>();
     let ingest = pipeline.spawn_ingest(Some(tape_tx))?;
@@ -90,6 +94,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match &message {
                     IngestMessage::Frame(_) => frames += 1,
                     IngestMessage::SessionEnded { .. } => boundaries += 1,
+                    // Live ingest never emits these; only Parquet replay does,
+                    // and `write_message` refuses them anyway.
+                    IngestMessage::Event { .. } => continue,
                 }
                 writer.write_message(&message).await?;
                 // Flushing per second rather than per frame: a tape is worth

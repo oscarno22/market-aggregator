@@ -28,53 +28,59 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use ma_core::VenueId;
+use ma_core::StreamId;
 use tokio::sync::watch;
 
 /// The requesting half. Held by the aggregator.
+///
+/// Keyed by [`StreamId`] rather than by venue, and that is the same decision
+/// as `ma_core::stream`'s "one connection per stream" — seen from the other
+/// end. A resync **is** a disconnect, so a venue-keyed request would tear down
+/// every symbol on that venue to repair one of them. Per-stream signals keep
+/// the blast radius of a gap to the book that had the gap.
 #[derive(Clone, Debug, Default)]
 pub struct ResyncRequests {
-    venues: Arc<BTreeMap<VenueId, watch::Sender<u64>>>,
+    streams: Arc<BTreeMap<StreamId, watch::Sender<u64>>>,
 }
 
 impl ResyncRequests {
-    /// Registered once at startup, for a fixed venue set — same reasoning as
+    /// Registered once at startup, for a fixed stream set — same reasoning as
     /// [`crate::metrics::Metrics`]: registration is not a runtime operation,
     /// so nothing here needs a lock.
-    pub fn new(venues: impl IntoIterator<Item = VenueId>) -> Self {
+    pub fn new(streams: impl IntoIterator<Item = StreamId>) -> Self {
         Self {
-            venues: Arc::new(
-                venues
+            streams: Arc::new(
+                streams
                     .into_iter()
-                    .map(|v| (v, watch::channel(0_u64).0))
+                    .map(|s| (s, watch::channel(0_u64).0))
                     .collect(),
             ),
         }
     }
 
-    /// Ask `venue`'s ingest task to tear down its connection and resync.
+    /// Ask one stream's ingest task to tear down its connection and resync.
     ///
     /// Returns whether anyone was listening. A `false` is not an error — the
     /// replay path has no ingest tasks at all, and a replayed desync has
     /// nothing to reconnect.
-    pub fn request(&self, venue: VenueId) -> bool {
-        let Some(tx) = self.venues.get(&venue) else {
+    pub fn request(&self, stream: &StreamId) -> bool {
+        let Some(tx) = self.streams.get(stream) else {
             return false;
         };
         tx.send_modify(|n| *n = n.saturating_add(1));
         tx.receiver_count() > 0
     }
 
-    /// The listening half for one venue.
-    pub fn subscribe(&self, venue: VenueId) -> Option<ResyncSignal> {
-        self.venues
-            .get(&venue)
+    /// The listening half for one stream.
+    pub fn subscribe(&self, stream: &StreamId) -> Option<ResyncSignal> {
+        self.streams
+            .get(stream)
             .map(|tx| ResyncSignal(tx.subscribe()))
     }
 
-    /// How many resyncs have been requested for `venue`. For tests and logs.
-    pub fn requested(&self, venue: VenueId) -> u64 {
-        self.venues.get(&venue).map_or(0, |tx| *tx.borrow())
+    /// How many resyncs have been requested for `stream`. For tests and logs.
+    pub fn requested(&self, stream: &StreamId) -> u64 {
+        self.streams.get(stream).map_or(0, |tx| *tx.borrow())
     }
 }
 
@@ -102,19 +108,26 @@ impl ResyncSignal {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use ma_core::{Symbol, VenueId};
     use std::time::Duration;
+
+    fn stream(venue: VenueId) -> StreamId {
+        StreamId::new(venue, Symbol::new("BTC-USD"))
+    }
 
     #[tokio::test]
     async fn a_request_wakes_a_waiting_ingest_task() {
-        let requests = ResyncRequests::new([VenueId::Coinbase]);
-        let mut signal = requests.subscribe(VenueId::Coinbase).expect("registered");
+        let requests = ResyncRequests::new([stream(VenueId::Coinbase)]);
+        let mut signal = requests
+            .subscribe(&stream(VenueId::Coinbase))
+            .expect("registered");
 
         let waiter = tokio::spawn(async move {
             signal.requested().await;
             signal
         });
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(requests.request(VenueId::Coinbase));
+        assert!(requests.request(&stream(VenueId::Coinbase)));
 
         tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
@@ -126,9 +139,11 @@ mod tests {
     async fn a_request_made_before_anyone_waits_is_not_lost() {
         // The ordering that actually happens: the aggregator notices the gap
         // while the ingest task is still blocked reading the socket.
-        let requests = ResyncRequests::new([VenueId::Kraken]);
-        let mut signal = requests.subscribe(VenueId::Kraken).expect("registered");
-        requests.request(VenueId::Kraken);
+        let requests = ResyncRequests::new([stream(VenueId::Kraken)]);
+        let mut signal = requests
+            .subscribe(&stream(VenueId::Kraken))
+            .expect("registered");
+        requests.request(&stream(VenueId::Kraken));
 
         tokio::time::timeout(Duration::from_millis(50), signal.requested())
             .await
@@ -140,10 +155,12 @@ mod tests {
         // A book that desyncs on every frame for a second would otherwise
         // queue hundreds of reconnects — a self-inflicted reconnect storm,
         // against a venue that may already be rate-limiting us.
-        let requests = ResyncRequests::new([VenueId::Coinbase]);
-        let mut signal = requests.subscribe(VenueId::Coinbase).expect("registered");
+        let requests = ResyncRequests::new([stream(VenueId::Coinbase)]);
+        let mut signal = requests
+            .subscribe(&stream(VenueId::Coinbase))
+            .expect("registered");
         for _ in 0..50 {
-            requests.request(VenueId::Coinbase);
+            requests.request(&stream(VenueId::Coinbase));
         }
 
         signal.requested().await;
@@ -153,7 +170,30 @@ mod tests {
                 .is_err(),
             "50 requests should have collapsed into one observation"
         );
-        assert_eq!(requests.requested(VenueId::Coinbase), 50);
+        assert_eq!(requests.requested(&stream(VenueId::Coinbase)), 50);
+    }
+
+    #[tokio::test]
+    async fn one_symbols_resync_does_not_reconnect_another() {
+        // The reason this is keyed by stream. On a venue-keyed signal — or on
+        // a multiplexed connection — repairing BTC-USD would drop ETH-USD's
+        // perfectly healthy subscription with it, turning one book's gap into
+        // a venue-wide outage.
+        let btc = StreamId::new(VenueId::Coinbase, Symbol::new("BTC-USD"));
+        let eth = StreamId::new(VenueId::Coinbase, Symbol::new("ETH-USD"));
+        let requests = ResyncRequests::new([btc.clone(), eth.clone()]);
+        let mut eth_signal = requests.subscribe(&eth).expect("registered");
+
+        requests.request(&btc);
+
+        assert_eq!(requests.requested(&btc), 1);
+        assert_eq!(requests.requested(&eth), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), eth_signal.requested())
+                .await
+                .is_err(),
+            "ETH-USD's ingest task was woken by BTC-USD's desync"
+        );
     }
 
     #[tokio::test]
@@ -161,16 +201,16 @@ mod tests {
         // Replay registers no ingest tasks, and a replayed desync must not
         // bring the process down trying to reconnect a socket that does not
         // exist.
-        let requests = ResyncRequests::new([VenueId::Coinbase]);
-        assert!(!requests.request(VenueId::Bitstamp));
-        assert!(requests.subscribe(VenueId::Bitstamp).is_none());
+        let requests = ResyncRequests::new([stream(VenueId::Coinbase)]);
+        assert!(!requests.request(&stream(VenueId::Bitstamp)));
+        assert!(requests.subscribe(&stream(VenueId::Bitstamp)).is_none());
     }
 
     #[tokio::test]
     async fn a_venue_with_no_listener_reports_that_nobody_heard() {
-        let requests = ResyncRequests::new([VenueId::Coinbase]);
+        let requests = ResyncRequests::new([stream(VenueId::Coinbase)]);
         assert!(
-            !requests.request(VenueId::Coinbase),
+            !requests.request(&stream(VenueId::Coinbase)),
             "registered but unsubscribed should report no listener"
         );
     }

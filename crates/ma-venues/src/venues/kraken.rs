@@ -18,7 +18,9 @@ use ma_core::{Book, Integrity, Level, Price, Qty, Side, VenueId};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, de::Error as DeError};
 
-use crate::sync::{RawFrame, RecoveryStrategy, SyncAction, VenueError, VenueSync};
+use crate::sync::{Ingested, RawFrame, RecoveryStrategy, SyncAction, VenueError, VenueSync};
+
+use super::common;
 
 /// Deserialize a Kraken price/qty field by capturing its exact source text
 /// before any numeric interpretation.
@@ -76,6 +78,12 @@ struct BookData {
     #[serde(default)]
     asks: Vec<WireLevel>,
     checksum: Option<u32>,
+    /// Kraken's own clock, RFC 3339, present on `update` messages and absent
+    /// from `snapshot` ones. Reported as skew, never used for ordering — which
+    /// is just as well, since a field that appears on only some messages could
+    /// not order anything anyway.
+    #[serde(default)]
+    timestamp: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -162,7 +170,7 @@ impl VenueSync for KrakenSync {
     // holds, every time. There is nothing here to forget on reconnect.
     fn reset(&mut self) {}
 
-    fn ingest(&mut self, frame: &RawFrame) -> Result<Vec<SyncAction>, VenueError> {
+    fn ingest(&mut self, frame: &RawFrame) -> Result<Ingested, VenueError> {
         let envelope: Envelope = serde_json::from_slice(&frame.payload)
             .map_err(|e| VenueError::Malformed(e.to_string()))?;
 
@@ -171,7 +179,7 @@ impl VenueSync for KrakenSync {
             // use a "method"/"success" shape with no "channel" field at all.
             // Out of scope here; the live ingest task surfaces a failed
             // subscribe.
-            return Ok(vec![SyncAction::Ignore]);
+            return Ok(Ingested::ignored());
         };
 
         match channel {
@@ -195,6 +203,7 @@ impl VenueSync for KrakenSync {
                 };
 
                 let mut actions = Vec::new();
+                let mut venue_ts = None;
                 for entry in entries {
                     // A shared connection subscribed to more than one pair
                     // would interleave other pairs' data here; skip what
@@ -202,6 +211,16 @@ impl VenueSync for KrakenSync {
                     if entry.symbol != self.symbol {
                         continue;
                     }
+
+                    // Last one wins. A frame carrying several entries for our
+                    // own symbol is not something Kraken does, and if it ever
+                    // did, the newest claim is the least misleading one to
+                    // report as skew.
+                    venue_ts = entry
+                        .timestamp
+                        .as_deref()
+                        .and_then(common::parse_rfc3339)
+                        .or(venue_ts);
 
                     let bids = to_levels(&entry.bids)?;
                     let asks = to_levels(&entry.asks)?;
@@ -222,14 +241,14 @@ impl VenueSync for KrakenSync {
                         actions.push(SyncAction::Verify { checksum });
                     }
                 }
-                Ok(actions)
+                Ok(Ingested::untimed(actions).at(venue_ts))
             }
 
-            "heartbeat" => Ok(vec![SyncAction::Forward(ma_core::EventKind::Heartbeat {
-                counter: None,
-            })]),
+            "heartbeat" => Ok(Ingested::untimed(vec![SyncAction::Forward(
+                ma_core::EventKind::Heartbeat { counter: None },
+            )])),
 
-            _ => Ok(vec![SyncAction::Ignore]),
+            _ => Ok(Ingested::ignored()),
         }
     }
 }

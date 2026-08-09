@@ -39,7 +39,7 @@
 
 use std::sync::Arc;
 
-use ma_core::{Clock, VenueId};
+use ma_core::{Clock, StreamId, VenueId};
 use ma_venues::{RawFrame, VenueEndpoint};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
@@ -152,27 +152,45 @@ impl SessionEnd {
 pub enum IngestMessage {
     /// Bytes a venue sent.
     Frame(RawFrame),
-    /// A connection ended. The venue's sync state is reset and its book
+    /// An already-normalised event, replayed from durable history rather than
+    /// parsed from a socket.
+    ///
+    /// This is v2's Parquet replay, and it is deliberately a *second* variant
+    /// rather than a re-encoding into `Frame`. The two carry different
+    /// evidence: a frame is bytes a venue sent, and can therefore reproduce a
+    /// parser bug; an event is what we concluded those bytes meant, and cannot.
+    /// Collapsing them would let a Parquet replay claim to prove something only
+    /// a tape can prove. See `ma_venues::VenueBook::apply_event`.
+    Event {
+        stream: StreamId,
+        event: ma_core::MarketEvent,
+    },
+    /// A connection ended. The stream's sync state is reset and its book
     /// marked `Desynced` until a fresh snapshot lands.
     SessionEnded {
-        venue: VenueId,
+        stream: StreamId,
         at: ma_core::IngestTime,
         end: SessionEnd,
     },
 }
 
 impl IngestMessage {
-    pub const fn venue(&self) -> VenueId {
+    pub fn stream(&self) -> &StreamId {
         match self {
-            Self::Frame(frame) => frame.venue,
-            Self::SessionEnded { venue, .. } => *venue,
+            Self::Frame(frame) => &frame.stream,
+            Self::Event { stream, .. } | Self::SessionEnded { stream, .. } => stream,
         }
+    }
+
+    pub fn venue(&self) -> VenueId {
+        self.stream().venue
     }
 }
 
 /// Everything a venue's ingest task needs, assembled once at startup.
 pub struct Ingest<N: Network> {
     net: Arc<N>,
+    stream: StreamId,
     endpoint: VenueEndpoint,
     tx: Sender<IngestMessage>,
     clock: Arc<dyn Clock>,
@@ -188,7 +206,7 @@ pub struct Ingest<N: Network> {
 impl<N: Network> std::fmt::Debug for Ingest<N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Ingest")
-            .field("venue", &self.endpoint.venue)
+            .field("stream", &self.stream)
             .field("url", &self.endpoint.ws_url)
             .field("recording", &self.tape.is_some())
             .finish_non_exhaustive()
@@ -198,6 +216,7 @@ impl<N: Network> std::fmt::Debug for Ingest<N> {
 impl<N: Network> Ingest<N> {
     pub fn new(
         net: Arc<N>,
+        stream: StreamId,
         endpoint: VenueEndpoint,
         tx: Sender<IngestMessage>,
         clock: Arc<dyn Clock>,
@@ -206,6 +225,7 @@ impl<N: Network> Ingest<N> {
     ) -> Self {
         Self {
             net,
+            stream,
             endpoint,
             tx,
             clock,
@@ -257,15 +277,15 @@ impl<N: Network> Ingest<N> {
         self
     }
 
-    const fn venue(&self) -> VenueId {
-        self.endpoint.venue
+    fn stream(&self) -> StreamId {
+        self.stream.clone()
     }
 
     /// Connect, subscribe, read, reconnect. Returns when told to stop or when
     /// nothing downstream is listening.
     pub async fn run(mut self) {
         let mut backoff = Backoff::new(self.policy, EqualJitter::from_entropy());
-        let venue = self.venue();
+        let venue = self.stream.clone();
         // Taken out of `self` so a session can hold it mutably while still
         // borrowing the rest of `self` immutably. Requests that arrive between
         // sessions are not lost: the underlying watch remembers the counter,
@@ -288,7 +308,7 @@ impl<N: Network> Ingest<N> {
             // reporting `Live` prices through a 60-second outage is precisely
             // the silent wrongness this project exists to avoid.
             self.publish(IngestMessage::SessionEnded {
-                venue,
+                stream: self.stream(),
                 at: self.clock.now(),
                 end,
             });
@@ -312,7 +332,7 @@ impl<N: Network> Ingest<N> {
 
     /// One connection attempt, from `connect` to whatever ends it.
     async fn session(&self, mut resync: Option<&mut ResyncSignal>) -> SessionEnd {
-        let venue = self.venue();
+        let venue = self.stream.clone();
 
         let mut socket = match self.net.connect(&self.endpoint.ws_url).await {
             Ok(socket) => socket,
@@ -394,7 +414,8 @@ impl<N: Network> Ingest<N> {
                             return SessionEnd::Errored;
                         }
                         Ok(Ok(Some(payload))) => {
-                            let frame = RawFrame::new(venue, payload, self.clock.now());
+                            let frame =
+                                RawFrame::new(self.stream(), payload, self.clock.now());
                             if !self.emit(frame) {
                                 return SessionEnd::Downstream;
                             }
@@ -419,7 +440,7 @@ impl<N: Network> Ingest<N> {
             std::future::pending::<()>().await;
             return;
         };
-        let venue = self.venue();
+        let venue = self.stream.clone();
         let mut backoff = Backoff::new(self.policy, EqualJitter::from_entropy());
 
         loop {
@@ -427,7 +448,8 @@ impl<N: Network> Ingest<N> {
             match self.net.get(url).await {
                 Ok(body) => {
                     debug!(%venue, bytes = body.len(), "rest depth snapshot fetched");
-                    let frame = RawFrame::rest_snapshot(venue, body.into_bytes(), self.clock.now());
+                    let frame =
+                        RawFrame::rest_snapshot(self.stream(), body.into_bytes(), self.clock.now());
                     self.emit(frame);
                     return;
                 }
@@ -487,6 +509,10 @@ mod tests {
             .endpoint
     }
 
+    fn stream(venue: VenueId) -> StreamId {
+        StreamId::new(venue, Symbol::new("BTC-USD"))
+    }
+
     /// A short schedule so a test that does wait out a delay under tokio's
     /// paused clock does not have to reason about minutes.
     fn fast_policy() -> BackoffPolicy {
@@ -514,6 +540,7 @@ mod tests {
 
             let ingest = Ingest::new(
                 Arc::clone(&net),
+                stream(venue),
                 endpoint(venue),
                 tx,
                 Arc::new(SystemClock),
@@ -539,7 +566,7 @@ mod tests {
                     IngestMessage::Frame(frame) => {
                         return String::from_utf8(frame.payload).expect("utf8");
                     }
-                    IngestMessage::SessionEnded { .. } => {}
+                    IngestMessage::SessionEnded { .. } | IngestMessage::Event { .. } => {}
                 }
             }
         }
@@ -746,6 +773,7 @@ mod tests {
         let handle = tokio::spawn(
             Ingest::new(
                 net,
+                stream(VenueId::Kraken),
                 endpoint(VenueId::Kraken),
                 tx,
                 Arc::new(SystemClock),
@@ -780,12 +808,13 @@ mod tests {
         let (tx, rx) = bounded::<IngestMessage>(64);
         let counters = Arc::new(VenueCounters::default());
         let (trigger, shut) = shutdown();
-        let requests = crate::resync::ResyncRequests::new([VenueId::Coinbase]);
+        let requests = crate::resync::ResyncRequests::new([stream(VenueId::Coinbase)]);
         let probe = Arc::clone(&net);
 
         let handle = tokio::spawn(
             Ingest::new(
                 net,
+                stream(VenueId::Coinbase),
                 endpoint(VenueId::Coinbase),
                 tx,
                 Arc::new(SystemClock),
@@ -793,7 +822,11 @@ mod tests {
                 shut,
             )
             .with_backoff(fast_policy())
-            .listening_for_resync(requests.subscribe(VenueId::Coinbase).expect("registered"))
+            .listening_for_resync(
+                requests
+                    .subscribe(&stream(VenueId::Coinbase))
+                    .expect("registered"),
+            )
             .run(),
         );
 
@@ -801,7 +834,7 @@ mod tests {
         assert!(matches!(first, IngestMessage::Frame(_)));
 
         assert!(
-            requests.request(VenueId::Coinbase),
+            requests.request(&stream(VenueId::Coinbase)),
             "the ingest task should be listening"
         );
 
@@ -819,6 +852,9 @@ mod tests {
                         saw_second = true;
                         break;
                     }
+                }
+                IngestMessage::Event { .. } => {
+                    panic!("live ingest never produces normalised events")
                 }
             }
         }
@@ -862,6 +898,7 @@ mod tests {
         let handle = tokio::spawn(
             Ingest::new(
                 net,
+                stream(VenueId::Kraken),
                 endpoint(VenueId::Kraken),
                 tx,
                 Arc::new(SystemClock),
@@ -927,6 +964,7 @@ mod tests {
         let handle = tokio::spawn(
             Ingest::new(
                 net,
+                stream(VenueId::Kraken),
                 endpoint(VenueId::Kraken),
                 tx,
                 Arc::new(SystemClock),

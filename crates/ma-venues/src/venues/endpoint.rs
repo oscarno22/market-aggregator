@@ -68,6 +68,14 @@ pub struct VenueEndpoint {
 pub struct VenueSpec {
     pub endpoint: VenueEndpoint,
     pub sync: Box<dyn VenueSync>,
+    /// The normalised symbol this spec was built for.
+    ///
+    /// Carried rather than re-derived because the venue-native spelling inside
+    /// `sync` is a one-way translation: `btcusd` cannot be turned back into
+    /// `BTC-USD` without knowing where the base ends. Keeping the normalised
+    /// form here means a caller that crossed a venue list with a symbol list
+    /// does not have to remember which spec came from which pairing.
+    pub symbol: Symbol,
     /// Levels to retain per side, or `None` to retain everything the venue
     /// sends.
     ///
@@ -129,6 +137,7 @@ pub fn spec_for(venue: VenueId, symbol: &Symbol) -> Result<VenueSpec, VenueError
                 idle_timeout: Duration::from_secs(15),
             },
             sync: Box::new(CoinbaseSync::new(native)),
+            symbol: symbol.clone(),
             max_depth: None,
         },
 
@@ -145,6 +154,7 @@ pub fn spec_for(venue: VenueId, symbol: &Symbol) -> Result<VenueSpec, VenueError
                 idle_timeout: Duration::from_secs(15),
             },
             sync: Box::new(KrakenSync::new(native)),
+            symbol: symbol.clone(),
             max_depth: Some(KRAKEN_DEPTH),
         },
 
@@ -168,6 +178,7 @@ pub fn spec_for(venue: VenueId, symbol: &Symbol) -> Result<VenueSpec, VenueError
                 idle_timeout: Duration::from_secs(30),
             },
             sync: Box::new(BitstampSync::new(format!("diff_order_book_{native}"))),
+            symbol: symbol.clone(),
             max_depth: None,
         },
 
@@ -186,7 +197,7 @@ fn subscribe_coinbase(product_id: &str, channel: &str) -> String {
 mod tests {
     use super::*;
     use crate::sync::{RawFrame, SyncAction};
-    use ma_core::{Clock, SystemClock};
+    use ma_core::{Clock, StreamId, SystemClock};
 
     fn sym() -> Symbol {
         Symbol::new("BTC-USD")
@@ -294,14 +305,18 @@ mod tests {
 
         for (venue, payload) in cases {
             let mut spec = spec(venue);
-            let frame = RawFrame::new(venue, payload.as_bytes().to_vec(), now);
-            let actions = spec
+            let frame = RawFrame::new(
+                StreamId::new(venue, sym()),
+                payload.as_bytes().to_vec(),
+                now,
+            );
+            let ingested = spec
                 .sync
                 .ingest(&frame)
                 .unwrap_or_else(|e| panic!("{venue} could not parse its own channel: {e}"));
 
             assert!(
-                !actions.iter().all(|a| *a == SyncAction::Ignore),
+                !ingested.actions.iter().all(|a| *a == SyncAction::Ignore),
                 "{venue} ignored a frame on the channel it subscribes to — \
                  the subscribe payload and the parser have drifted apart"
             );

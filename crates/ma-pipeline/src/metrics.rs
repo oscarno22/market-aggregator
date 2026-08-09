@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use ma_core::VenueId;
+use ma_core::StreamId;
 use serde::Serialize;
 
 /// Live counters for one venue's ingest task.
@@ -205,36 +205,51 @@ impl Rates {
     }
 }
 
-/// Every venue's counters, fixed at startup.
+/// Every stream's counters, fixed at startup.
 ///
-/// The venue set is known when the process starts and never changes, so the
+/// The stream set is known when the process starts and never changes, so the
 /// map is built once and then only read. That is why there is no lock here
 /// and no `RwLock<HashMap>`: registration is not a runtime operation.
+///
+/// # Keyed by stream, not by venue
+///
+/// v1 keyed this by [`VenueId`], which was correct while there was one symbol.
+/// With several, a venue-keyed counter holds the *sum* across symbols, and a
+/// sum is the worst possible answer here: `parse_errors{venue="kraken"} = 3`
+/// tells an operator nothing about which feed is drifting, and a single
+/// desynced symbol is invisible inside a healthy venue total. Every counter is
+/// therefore per [`StreamId`], and `/metrics` emits `venue` and `symbol` as
+/// two labels so a query can still aggregate over either.
 #[derive(Debug, Default)]
 pub struct Metrics {
-    venues: BTreeMap<VenueId, Arc<VenueCounters>>,
+    streams: BTreeMap<StreamId, Arc<VenueCounters>>,
 }
 
 impl Metrics {
-    pub fn new(venues: impl IntoIterator<Item = VenueId>) -> Self {
+    pub fn new(streams: impl IntoIterator<Item = StreamId>) -> Self {
         Self {
-            venues: venues
+            streams: streams
                 .into_iter()
-                .map(|v| (v, Arc::new(VenueCounters::default())))
+                .map(|s| (s, Arc::new(VenueCounters::default())))
                 .collect(),
         }
     }
 
-    /// Counters for a venue, or `None` if it was not registered at startup.
-    pub fn venue(&self, venue: VenueId) -> Option<Arc<VenueCounters>> {
-        self.venues.get(&venue).cloned()
+    /// Counters for a stream, or `None` if it was not registered at startup.
+    pub fn stream(&self, stream: &StreamId) -> Option<Arc<VenueCounters>> {
+        self.streams.get(stream).cloned()
     }
 
-    pub fn snapshot(&self) -> BTreeMap<VenueId, VenueCountersSnapshot> {
-        self.venues
+    pub fn snapshot(&self) -> BTreeMap<StreamId, VenueCountersSnapshot> {
+        self.streams
             .iter()
-            .map(|(venue, counters)| (*venue, counters.snapshot()))
+            .map(|(stream, counters)| (stream.clone(), counters.snapshot()))
             .collect()
+    }
+
+    /// Every registered stream, in a stable order.
+    pub fn streams(&self) -> impl Iterator<Item = &StreamId> {
+        self.streams.keys()
     }
 }
 
@@ -242,6 +257,7 @@ impl Metrics {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use ma_core::VenueId;
 
     #[test]
     fn counters_start_at_zero_and_count_up() {
@@ -316,17 +332,59 @@ mod tests {
         assert_eq!(r.frames_per_sec, 0.0);
     }
 
+    fn stream(venue: VenueId, symbol: &str) -> StreamId {
+        StreamId::new(venue, ma_core::Symbol::new(symbol))
+    }
+
     #[test]
     fn counters_are_shared_not_copied() {
         // The ingest task holds one Arc and the metrics endpoint reads
-        // another. If `venue()` handed out a fresh counter set, every metric
+        // another. If `stream()` handed out a fresh counter set, every metric
         // would read zero forever while looking perfectly plausible.
-        let metrics = Metrics::new([VenueId::Coinbase, VenueId::Kraken]);
-        let held = metrics.venue(VenueId::Coinbase).expect("registered");
+        let metrics = Metrics::new([
+            stream(VenueId::Coinbase, "BTC-USD"),
+            stream(VenueId::Kraken, "BTC-USD"),
+        ]);
+        let held = metrics
+            .stream(&stream(VenueId::Coinbase, "BTC-USD"))
+            .expect("registered");
         held.record_frame(10);
 
-        assert_eq!(metrics.snapshot()[&VenueId::Coinbase].frames, 1);
-        assert_eq!(metrics.snapshot()[&VenueId::Kraken].frames, 0);
-        assert!(metrics.venue(VenueId::Bitstamp).is_none());
+        assert_eq!(
+            metrics.snapshot()[&stream(VenueId::Coinbase, "BTC-USD")].frames,
+            1
+        );
+        assert_eq!(
+            metrics.snapshot()[&stream(VenueId::Kraken, "BTC-USD")].frames,
+            0
+        );
+        assert!(
+            metrics
+                .stream(&stream(VenueId::Bitstamp, "BTC-USD"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn two_symbols_on_one_venue_do_not_share_counters() {
+        // The whole reason this map is keyed by stream. Summing them would
+        // hide a single desynced symbol inside a healthy venue total, and
+        // would look entirely plausible while doing it.
+        let btc = stream(VenueId::Coinbase, "BTC-USD");
+        let eth = stream(VenueId::Coinbase, "ETH-USD");
+        let metrics = Metrics::new([btc.clone(), eth.clone()]);
+
+        metrics.stream(&btc).expect("registered").record_frame(10);
+        metrics.stream(&btc).expect("registered").record_frame(10);
+        metrics
+            .stream(&eth)
+            .expect("registered")
+            .record_parse_error();
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot[&btc].frames, 2);
+        assert_eq!(snapshot[&btc].parse_errors, 0);
+        assert_eq!(snapshot[&eth].frames, 0);
+        assert_eq!(snapshot[&eth].parse_errors, 1);
     }
 }

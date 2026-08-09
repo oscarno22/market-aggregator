@@ -23,7 +23,9 @@
 use ma_core::{DesyncReason, Integrity, Level, VenueId};
 use serde::Deserialize;
 
-use crate::sync::{RawFrame, RecoveryStrategy, RestSnapshot, SyncAction, VenueError, VenueSync};
+use crate::sync::{
+    Ingested, RawFrame, RecoveryStrategy, RestSnapshot, SyncAction, VenueError, VenueSync,
+};
 
 use super::common;
 
@@ -174,7 +176,7 @@ impl VenueSync for BitstampSync {
         parse_rest_snapshot(body)
     }
 
-    fn ingest(&mut self, frame: &RawFrame) -> Result<Vec<SyncAction>, VenueError> {
+    fn ingest(&mut self, frame: &RawFrame) -> Result<Ingested, VenueError> {
         let envelope: Envelope = serde_json::from_slice(&frame.payload)
             .map_err(|e| VenueError::Malformed(e.to_string()))?;
 
@@ -182,7 +184,7 @@ impl VenueSync for BitstampSync {
             // bts:subscription_succeeded, bts:error, and the rest carry no
             // book content. Out of scope here, same as every other venue's
             // acks — the live ingest task is where a failed subscribe surfaces.
-            return Ok(vec![SyncAction::Ignore]);
+            return Ok(Ingested::ignored());
         }
         if envelope.channel != self.channel {
             return Err(VenueError::Malformed(format!(
@@ -197,7 +199,13 @@ impl VenueSync for BitstampSync {
         let bids = common::levels_from_str_pairs(&data.bids)?;
         let asks = common::levels_from_str_pairs(&data.asks)?;
 
-        match &mut self.mode {
+        // The one venue whose ordering field and whose clock are the same
+        // number. It is still only ever *reported* as a timestamp: ordering
+        // uses it because Bitstamp offers nothing else, and that limitation is
+        // exactly what `Integrity::OrderOnly` names.
+        let venue_ts = Some(common::system_time_from_micros(micros));
+
+        let actions = match &mut self.mode {
             Mode::AwaitingSnapshot { pending } => {
                 // Only the first buffered frame is reported as a state change;
                 // the rest are absorbed silently so `Book`'s `since` timestamp
@@ -205,11 +213,11 @@ impl VenueSync for BitstampSync {
                 // that happened to arrive while still waiting.
                 let first = pending.is_empty();
                 pending.push(PendingDiff { micros, bids, asks });
-                Ok(vec![if first {
+                vec![if first {
                     SyncAction::Desync(DesyncReason::AwaitingSnapshot)
                 } else {
                     SyncAction::Ignore
-                }])
+                }]
             }
 
             Mode::Live {
@@ -219,14 +227,16 @@ impl VenueSync for BitstampSync {
                 if micros <= *spliced_at {
                     // Already in the snapshot. Applying it would be harmless
                     // but pointless; calling it a regression would be a lie.
-                    return Ok(vec![SyncAction::Ignore]);
+                    return Ok(Ingested::ignored().at(venue_ts));
                 }
-                Ok(vec![match check_order(last_micros, micros) {
+                vec![match check_order(last_micros, micros) {
                     Some(reason) => SyncAction::Desync(reason),
                     None => SyncAction::Delta { bids, asks },
-                }])
+                }]
             }
-        }
+        };
+
+        Ok(Ingested::untimed(actions).at(venue_ts))
     }
 
     fn apply_rest_snapshot(&mut self, snapshot: RestSnapshot) -> Vec<SyncAction> {

@@ -11,7 +11,7 @@ pub mod net;
 pub mod resync;
 pub mod tape;
 
-pub use aggregator::{Aggregator, BookStatus, Snapshot, VenueView};
+pub use aggregator::{Aggregator, BookStatus, Snapshot, SymbolView, VenueView};
 pub use backoff::{Backoff, BackoffPolicy, EqualJitter, Jitter, NoJitter};
 pub use channel::{ChannelMetrics, Receiver, SendOutcome, Sender, bounded};
 pub use ingest::{Ingest, IngestMessage, SessionEnd, Shutdown, ShutdownTrigger, shutdown};

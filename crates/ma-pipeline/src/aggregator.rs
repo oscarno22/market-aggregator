@@ -36,11 +36,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use ma_core::{
-    BookState, Clock, DesyncReason, EventKind, IngestTime, Integrity, Level, Symbol, VenueId,
+    BookState, Clock, DesyncReason, EventKind, IngestTime, Integrity, Level, MarketEvent, Side,
+    StreamId, Symbol, VenueId,
 };
 use ma_venues::{Outcome, VenueBook, VenueSpec};
 use serde::Serialize;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::channel::{ChannelMetrics, Receiver};
@@ -62,6 +63,21 @@ pub const DEFAULT_TICK: Duration = Duration::from_millis(250);
 /// missing snapshots — and missing them is fine, by design: see
 /// [`Snapshot::seq`] and the SSE handler's `Lagged` behaviour.
 pub const BROADCAST_CAPACITY: usize = 32;
+
+/// How many price levels per side each snapshot carries.
+///
+/// This is a **view** limit, not a retention limit, and the distinction is the
+/// whole of v2's depth story. The books hold everything the venue sends (except
+/// Kraken, which publishes a depth-limited feed and is pruned to match — see
+/// `VenueSpec::max_depth`). Serving fewer levels than we hold costs nothing and
+/// risks nothing.
+///
+/// Serving *more* than a browser can draw is the real hazard, and it is a
+/// throughput one: Coinbase's BTC-USD book runs to tens of thousands of levels,
+/// and publishing all of them four times a second would push megabytes per
+/// second down an SSE connection to render pixels nobody can distinguish. Ten
+/// is what fits on the page and what Kraken checksums.
+pub const DEFAULT_DEPTH_LEVELS: usize = 10;
 
 /// What a book is, in one word, for a consumer that does not want to match on
 /// [`BookState`]'s payloads.
@@ -87,8 +103,21 @@ pub struct VenueView {
     pub integrity: Option<Integrity>,
     /// Why the book is untrusted, in words, when it is.
     pub desync_reason: Option<String>,
+    /// Best bid and ask. Always equal to the first entry of `bids`/`asks`;
+    /// kept as their own fields because the touch is what `spread` and `mid`
+    /// are derived from, and a consumer that only wants the top should not
+    /// have to index into a ladder. `top_of_book_is_the_head_of_the_ladder`
+    /// below pins the two together so they cannot drift.
     pub bid: Option<Level>,
     pub ask: Option<Level>,
+    /// The L2 ladder, best first, up to [`DEFAULT_DEPTH_LEVELS`] per side.
+    ///
+    /// v1 served the touch only. These are what make it an order book rather
+    /// than a price ticker, and they are a projection of the full book the
+    /// aggregator holds — see [`DEFAULT_DEPTH_LEVELS`] on why the served depth
+    /// and the retained depth are different numbers.
+    pub bids: Vec<Level>,
+    pub asks: Vec<Level>,
     /// Exact, as a string. Never a float — see the module docs.
     pub spread: Option<String>,
     pub mid: Option<String>,
@@ -105,16 +134,40 @@ pub struct VenueView {
     /// Age of the last matching checksum. Only ever set for Kraken; a
     /// `Verified` book whose last check is minutes old is not really verified.
     pub last_verified_ms: Option<u64>,
-    /// Levels held per side, `[bids, asks]`.
-    pub depth: [usize; 2],
+    /// Levels *held* per side, `[bids, asks]` — the full book, not the
+    /// truncated ladder above. On Coinbase this is routinely five figures
+    /// while `bids.len()` is ten, and the gap between the two numbers is the
+    /// point: it is how a reader can tell a depth-limited *view* from a
+    /// depth-limited *book*.
+    pub levels_held: [usize; 2],
     pub counters: VenueCountersSnapshot,
     pub rates: Rates,
+}
+
+/// Every venue's view of one symbol.
+///
+/// The grouping exists because the cross-venue comparisons below are only
+/// meaningful *within* a symbol: the weakest integrity across BTC-USD says
+/// nothing about ETH-USD, and a UI that mixed them would invite exactly the
+/// wrong reading.
+#[derive(Clone, Debug, Serialize)]
+pub struct SymbolView {
+    pub symbol: String,
+    /// The weakest integrity among this symbol's live books, or `None` if none
+    /// are live.
+    ///
+    /// `Integrity` is ordered weakest-first precisely so this can be a `min`.
+    /// It is what a cross-venue spread view must display next to any number it
+    /// derives from more than one venue — otherwise a Kraken book verified by
+    /// checksum and a Bitstamp book that may have quietly lost a message get
+    /// combined into a figure that looks more trustworthy than either.
+    pub weakest_integrity: Option<Integrity>,
+    pub venues: Vec<VenueView>,
 }
 
 /// Everything the fan-out publishes, once per tick.
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
-    pub symbol: String,
     /// Monotonic per process, so a client that skipped ahead after a
     /// `Lagged` can say how far it jumped instead of pretending it did not.
     pub seq: u64,
@@ -124,18 +177,27 @@ pub struct Snapshot {
     /// Published rather than documented, per CLAUDE.md's rule that any
     /// surfaced comparison must name its clock.
     pub clock: &'static str,
-    /// The weakest integrity among live books, or `None` if none are live.
-    ///
-    /// `Integrity` is ordered weakest-first precisely so this can be a `min`.
-    /// It is what a future cross-venue spread view must display next to any
-    /// number it derives from more than one venue — otherwise a Kraken book
-    /// verified by checksum and a Bitstamp book that may have quietly lost a
-    /// message get averaged into a figure that looks equally trustworthy than
-    /// either.
-    pub weakest_integrity: Option<Integrity>,
-    pub venues: Vec<VenueView>,
-    /// The ingest channel's occupancy and lifetime drop count.
+    /// One entry per symbol this process tracks, in a stable order.
+    pub symbols: Vec<SymbolView>,
+    /// The ingest channel's occupancy and lifetime drop count. Process-wide:
+    /// every stream shares one channel, which is what makes a single
+    /// `dropped` count meaningful.
     pub channel: ChannelMetrics,
+}
+
+impl Snapshot {
+    /// One symbol's view, by name.
+    pub fn symbol(&self, symbol: &str) -> Option<&SymbolView> {
+        self.symbols.iter().find(|s| s.symbol == symbol)
+    }
+
+    /// Every venue view across every symbol, for consumers like `/metrics`
+    /// that label rather than group.
+    pub fn views(&self) -> impl Iterator<Item = (&str, &VenueView)> {
+        self.symbols
+            .iter()
+            .flat_map(|s| s.venues.iter().map(move |v| (s.symbol.as_str(), v)))
+    }
 }
 
 const INGEST_MONOTONIC: &str = "ingest_monotonic";
@@ -199,36 +261,36 @@ impl VenueState {
 /// Owns every book; reads the ingest channel; publishes snapshots.
 #[derive(Debug)]
 pub struct Aggregator {
-    symbol: Symbol,
-    venues: BTreeMap<VenueId, VenueState>,
+    streams: BTreeMap<StreamId, VenueState>,
     clock: Arc<dyn Clock>,
     tick: Duration,
+    depth_levels: usize,
     seq: u64,
     tx: broadcast::Sender<Arc<Snapshot>>,
     resync: ResyncRequests,
+    events: Option<mpsc::UnboundedSender<MarketEvent>>,
 }
 
 impl Aggregator {
-    /// Build from one [`VenueSpec`] per venue, sharing `metrics`' counters
+    /// Build from one [`VenueSpec`] per stream, sharing `metrics`' counters
     /// with the ingest tasks.
-    pub fn new(
-        symbol: Symbol,
-        specs: Vec<VenueSpec>,
-        clock: Arc<dyn Clock>,
-        metrics: &Metrics,
-    ) -> Self {
+    ///
+    /// A spec carries the symbol it was built for, so the caller passes one
+    /// spec per (venue, symbol) pair and this constructor does not need to know
+    /// how the two lists were crossed.
+    pub fn new(specs: Vec<VenueSpec>, clock: Arc<dyn Clock>, metrics: &Metrics) -> Self {
         let now = clock.now();
-        let venues = specs
+        let streams = specs
             .into_iter()
             .map(|spec| {
-                let venue = spec.sync.venue();
-                let mut book = VenueBook::new(spec.sync, symbol.clone());
+                let stream = StreamId::new(spec.sync.venue(), spec.symbol.clone());
+                let mut book = VenueBook::new(spec.sync, spec.symbol);
                 if let Some(depth) = spec.max_depth {
                     book = book.with_max_depth(depth);
                 }
-                let counters = metrics.venue(venue).unwrap_or_default();
+                let counters = metrics.stream(&stream).unwrap_or_default();
                 (
-                    venue,
+                    stream,
                     VenueState {
                         book,
                         counters,
@@ -242,14 +304,53 @@ impl Aggregator {
             .collect();
 
         Self {
-            symbol,
-            venues,
+            streams,
             clock,
             tick: DEFAULT_TICK,
+            depth_levels: DEFAULT_DEPTH_LEVELS,
             seq: 0,
             tx: broadcast::channel(BROADCAST_CAPACITY).0,
             resync: ResyncRequests::default(),
+            events: None,
         }
+    }
+
+    /// Tee every normalised event to a persistence sink.
+    ///
+    /// # Why the aggregator is the only place this can come from
+    ///
+    /// Normalising is the venue layer's job, and the venue layer's state
+    /// machines live here, inside the single task that owns the books. A
+    /// second consumer reading raw frames off the channel could not produce
+    /// the same events without duplicating every `VenueSync` — two copies of
+    /// the sequence-gap logic, two REST splice buffers, and eventually two
+    /// different opinions about what the market did.
+    ///
+    /// Emitting from here instead means the recorded history is *the same
+    /// sequence* the live books were built from, not a second derivation of
+    /// it. That is what makes the round-trip property in `ma-persist` — replay
+    /// the Parquet, get the same books — a real check rather than a
+    /// tautology about two parsers agreeing.
+    ///
+    /// **The sink is unbounded, and that is the tape tee's policy, not the
+    /// ingest channel's.** Same argument as `ingest::Ingest::recording_to`:
+    /// durable history with a hole in it silently invalidates everything built
+    /// on it, so persistence gets the claims-processing policy rather than the
+    /// market-data one. Unlike the tape tee, this one runs in steady state, so
+    /// the writer is responsible for keeping up — `ma-persist` batches to
+    /// Parquet row groups rather than fsyncing per event.
+    #[must_use]
+    pub fn publishing_events_to(mut self, events: mpsc::UnboundedSender<MarketEvent>) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    /// Levels per side to publish in each snapshot. See
+    /// [`DEFAULT_DEPTH_LEVELS`].
+    #[must_use]
+    pub fn with_depth_levels(mut self, levels: usize) -> Self {
+        self.depth_levels = levels;
+        self
     }
 
     /// Wire up the channel that asks an ingest task to reconnect.
@@ -293,9 +394,9 @@ impl Aggregator {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         info!(
-            symbol = %self.symbol,
-            venues = self.venues.len(),
+            streams = self.streams.len(),
             tick = ?self.tick,
+            depth = self.depth_levels,
             "aggregator started"
         );
 
@@ -340,56 +441,22 @@ impl Aggregator {
     /// of view: everything that can go wrong with a frame is a property of
     /// that frame, recorded on that venue, and must not stop the others.
     pub fn apply(&mut self, message: IngestMessage) {
-        let venue = message.venue();
-        let Some(state) = self.venues.get_mut(&venue) else {
-            // A frame for a venue this process does not track. Possible from a
-            // tape recorded with a different venue set — worth saying once,
-            // not worth stopping for.
-            debug!(%venue, "message for an untracked venue, ignored");
+        let stream = message.stream().clone();
+        let Some(state) = self.streams.get_mut(&stream) else {
+            // A message for a stream this process does not track. Possible
+            // from a tape recorded with a different venue or symbol set —
+            // worth saying once, not worth stopping for.
+            debug!(%stream, "message for an untracked stream, ignored");
             return;
         };
 
         state.counters.record_applied();
 
-        match message {
+        let (before, after, outcomes, at) = match message {
             IngestMessage::Frame(frame) => {
                 let before = state.book.book().state();
                 match state.book.feed(&frame) {
-                    Ok(outcomes) => {
-                        let after = state.book.book().state();
-                        if before != after {
-                            state.note_transition(before, after, frame.ingest_ts);
-                            log_transition(venue, before, after);
-
-                            // A desync caused by the *data* — a gap, a failed
-                            // checksum, a crossed book — needs a new
-                            // subscription to repair, and only the ingest task
-                            // can get one. A desync caused by our own reset
-                            // after a disconnect must not land here, or the
-                            // reconnect that just happened would immediately
-                            // request another; that case is handled in the
-                            // SessionEnded arm, which deliberately does not
-                            // ask.
-                            if let BookState::Desynced { reason, .. } = after
-                                && !matches!(before, BookState::Desynced { .. })
-                                && reason.needs_fresh_stream()
-                            {
-                                let heard = self.resync.request(venue);
-                                warn!(
-                                    %venue, ?reason, heard,
-                                    "requesting a resync; the book cannot repair \
-                                     itself without a fresh snapshot"
-                                );
-                            }
-                        }
-                        for outcome in outcomes {
-                            if let Outcome::Event(event) = outcome
-                                && matches!(event.kind, EventKind::Heartbeat { .. })
-                            {
-                                state.counters.record_heartbeat();
-                            }
-                        }
-                    }
+                    Ok(outcomes) => (before, state.book.book().state(), outcomes, frame.ingest_ts),
                     Err(e) => {
                         // A frame we cannot parse does not desync the book: we
                         // learned nothing, which is different from learning
@@ -397,9 +464,17 @@ impl Aggregator {
                         // climbing parse_errors is how a venue's schema change
                         // announces itself.
                         state.counters.record_parse_error();
-                        warn!(%venue, error = %e, "could not parse frame");
+                        warn!(%stream, error = %e, "could not parse frame");
+                        return;
                     }
                 }
+            }
+
+            IngestMessage::Event { event, .. } => {
+                let before = state.book.book().state();
+                let at = event.ingest_ts;
+                let outcomes = state.book.apply_event(event, at);
+                (before, state.book.book().state(), outcomes, at)
             }
 
             IngestMessage::SessionEnded { at, end, .. } => {
@@ -409,7 +484,47 @@ impl Aggregator {
                 if before != after {
                     state.note_transition(before, after, at);
                 }
-                info!(%venue, ?end, "session ended; book reset and marked desynced");
+                info!(%stream, ?end, "session ended; book reset and marked desynced");
+                return;
+            }
+        };
+
+        if before != after {
+            state.note_transition(before, after, at);
+            log_transition(&stream, before, after);
+
+            // A desync caused by the *data* — a gap, a failed checksum, a
+            // crossed book — needs a new subscription to repair, and only the
+            // ingest task can get one. A desync caused by our own reset after
+            // a disconnect must not land here, or the reconnect that just
+            // happened would immediately request another; that case returns
+            // above from the SessionEnded arm, which deliberately does not
+            // ask.
+            if let BookState::Desynced { reason, .. } = after
+                && !matches!(before, BookState::Desynced { .. })
+                && reason.needs_fresh_stream()
+            {
+                let heard = self.resync.request(&stream);
+                warn!(
+                    %stream, ?reason, heard,
+                    "requesting a resync; the book cannot repair \
+                     itself without a fresh snapshot"
+                );
+            }
+        }
+
+        for outcome in outcomes {
+            let Outcome::Event(event) = outcome else {
+                continue;
+            };
+            if matches!(event.kind, EventKind::Heartbeat { .. }) {
+                state.counters.record_heartbeat();
+            }
+            if let Some(sink) = &self.events {
+                // A closed sink means the writer finished or was never
+                // started. Not a reason to stop aggregating — the live book is
+                // the primary product and persistence is downstream of it.
+                let _ = sink.send(event);
             }
         }
     }
@@ -419,34 +534,42 @@ impl Aggregator {
         let now = self.clock.now();
         self.seq += 1;
         let tick = self.tick;
+        let depth_levels = self.depth_levels;
 
-        let venues: Vec<VenueView> = self
-            .venues
-            .iter_mut()
-            .map(|(venue, state)| {
-                let counters = state.counters.snapshot();
-                let rates = Rates::between(state.previous, counters, tick);
-                state.previous = counters;
+        // Grouped by symbol, preserving the BTreeMap's (venue, symbol) order
+        // within each group. `symbols` ends up ordered by first appearance,
+        // which for a BTreeMap keyed venue-then-symbol is stable run to run —
+        // the property that keeps UI cards from shuffling between ticks.
+        let mut by_symbol: BTreeMap<Symbol, Vec<VenueView>> = BTreeMap::new();
 
-                let book = state.book.book();
-                let top = book.top_of_book(now);
-                let (bids, asks) = book.depth();
+        for (stream, state) in &mut self.streams {
+            let counters = state.counters.snapshot();
+            let rates = Rates::between(state.previous, counters, tick);
+            state.previous = counters;
 
-                let (integrity, last_verified_ms) = match top.state {
-                    BookState::Live {
-                        integrity,
-                        last_verified,
-                        ..
-                    } => (
-                        Some(integrity),
-                        last_verified.map(|at| millis(now.since(at))),
-                    ),
-                    _ => (None, None),
-                };
+            let status = state.status();
+            let book = state.book.book();
+            let top = book.top_of_book(now);
+            let (held_bids, held_asks) = book.depth();
 
-                VenueView {
-                    venue: *venue,
-                    status: state.status(),
+            let (integrity, last_verified_ms) = match top.state {
+                BookState::Live {
+                    integrity,
+                    last_verified,
+                    ..
+                } => (
+                    Some(integrity),
+                    last_verified.map(|at| millis(now.since(at))),
+                ),
+                _ => (None, None),
+            };
+
+            by_symbol
+                .entry(stream.symbol.clone())
+                .or_default()
+                .push(VenueView {
+                    venue: stream.venue,
+                    status,
                     integrity,
                     desync_reason: match top.state {
                         BookState::Desynced { reason, .. } => Some(describe(reason)),
@@ -454,38 +577,44 @@ impl Aggregator {
                     },
                     bid: top.bid,
                     ask: top.ask,
+                    bids: book.top_levels(Side::Bid, depth_levels),
+                    asks: book.top_levels(Side::Ask, depth_levels),
                     spread: top.spread().map(|d| d.to_string()),
                     mid: top.mid().map(|d| d.to_string()),
                     age_ms: top.age.map(millis),
                     status_for_ms: millis(now.since(state.status_since)),
                     desynced_total_ms: millis(state.desynced_total(now)),
                     last_verified_ms,
-                    depth: [bids, asks],
+                    levels_held: [held_bids, held_asks],
                     counters,
                     rates,
-                }
-            })
-            .collect();
+                });
+        }
 
         Snapshot {
-            symbol: self.symbol.to_string(),
             seq: self.seq,
             wall_unix_ms: unix_millis(now.wall()),
             clock: INGEST_MONOTONIC,
-            weakest_integrity: venues.iter().filter_map(|v| v.integrity).min(),
-            venues,
+            symbols: by_symbol
+                .into_iter()
+                .map(|(symbol, venues)| SymbolView {
+                    symbol: symbol.to_string(),
+                    weakest_integrity: venues.iter().filter_map(|v| v.integrity).min(),
+                    venues,
+                })
+                .collect(),
             channel,
         }
     }
 }
 
-fn log_transition(venue: VenueId, from: BookState, to: BookState) {
+fn log_transition(stream: &StreamId, from: BookState, to: BookState) {
     match to {
         BookState::Desynced { reason, .. } => {
-            warn!(%venue, ?from, ?reason, "book lost trust");
+            warn!(%stream, ?from, ?reason, "book lost trust");
         }
         BookState::Live { integrity, .. } => {
-            info!(%venue, ?from, ?integrity, "book is live");
+            info!(%stream, ?from, ?integrity, "book is live");
         }
         BookState::Uninitialized => {}
     }
@@ -542,18 +671,32 @@ mod tests {
     }
 
     fn aggregator(venues: &[VenueId]) -> (Aggregator, Arc<Metrics>) {
-        let metrics = Arc::new(Metrics::new(venues.iter().copied()));
+        aggregator_over(venues, &[symbol()])
+    }
+
+    /// Every venue crossed with every symbol — the shape a multi-symbol
+    /// process actually runs in.
+    fn aggregator_over(venues: &[VenueId], symbols: &[Symbol]) -> (Aggregator, Arc<Metrics>) {
+        let streams: Vec<StreamId> = venues
+            .iter()
+            .flat_map(|v| symbols.iter().map(|s| StreamId::new(*v, s.clone())))
+            .collect();
+        let metrics = Arc::new(Metrics::new(streams));
         let specs = venues
             .iter()
-            .map(|v| spec_for(*v, &symbol()).expect("spec"))
+            .flat_map(|v| symbols.iter().map(|s| spec_for(*v, s).expect("spec")))
             .collect();
-        let agg = Aggregator::new(symbol(), specs, Arc::new(SystemClock), &metrics);
+        let agg = Aggregator::new(specs, Arc::new(SystemClock), &metrics);
         (agg, metrics)
     }
 
     fn frame(venue: VenueId, json: &str) -> IngestMessage {
+        frame_for(venue, &symbol(), json)
+    }
+
+    fn frame_for(venue: VenueId, symbol: &Symbol, json: &str) -> IngestMessage {
         IngestMessage::Frame(RawFrame::new(
-            venue,
+            StreamId::new(venue, symbol.clone()),
             json.as_bytes().to_vec(),
             SystemClock.now(),
         ))
@@ -581,7 +724,13 @@ mod tests {
     }
 
     fn view(snapshot: &Snapshot, venue: VenueId) -> VenueView {
+        view_of(snapshot, "BTC-USD", venue)
+    }
+
+    fn view_of(snapshot: &Snapshot, symbol: &str, venue: VenueId) -> VenueView {
         snapshot
+            .symbol(symbol)
+            .unwrap_or_else(|| panic!("{symbol} in snapshot"))
             .venues
             .iter()
             .find(|v| v.venue == venue)
@@ -589,14 +738,21 @@ mod tests {
             .clone()
     }
 
+    /// The single symbol group, for the many tests that only use one.
+    fn only_symbol(snapshot: &Snapshot) -> &SymbolView {
+        assert_eq!(snapshot.symbols.len(), 1, "expected exactly one symbol");
+        &snapshot.symbols[0]
+    }
+
     #[test]
     fn a_fresh_aggregator_reports_no_data_rather_than_nothing() {
         let (mut agg, _m) = aggregator(&[VenueId::Coinbase, VenueId::Kraken, VenueId::Bitstamp]);
         let snap = agg.snapshot(empty_channel());
 
-        assert_eq!(snap.venues.len(), 3);
-        assert_eq!(snap.weakest_integrity, None);
-        for v in &snap.venues {
+        let group = only_symbol(&snap);
+        assert_eq!(group.venues.len(), 3);
+        assert_eq!(group.weakest_integrity, None);
+        for v in &group.venues {
             assert_eq!(v.status, BookStatus::Uninitialized);
             assert!(v.integrity.is_none(), "an unsynced book claimed integrity");
             assert!(v.bid.is_none() && v.ask.is_none());
@@ -612,7 +768,7 @@ mod tests {
         assert_eq!(v.status, BookStatus::Live);
         assert_eq!(v.integrity, Some(Integrity::GapDetectable));
         assert_eq!(v.spread.as_deref(), Some("1"));
-        assert_eq!(v.depth, [1, 1]);
+        assert_eq!(v.levels_held, [1, 1]);
     }
 
     #[test]
@@ -667,7 +823,7 @@ mod tests {
         );
 
         agg.apply(IngestMessage::SessionEnded {
-            venue: VenueId::Coinbase,
+            stream: StreamId::new(VenueId::Coinbase, symbol()),
             at: SystemClock.now(),
             end: SessionEnd::Idle,
         });
@@ -704,9 +860,8 @@ mod tests {
         // recovers every few seconds looks healthy in every sample and is
         // useless. Only the cumulative number shows it.
         let clock = Arc::new(TestClock::new());
-        let metrics = Arc::new(Metrics::new([VenueId::Coinbase]));
+        let metrics = Arc::new(Metrics::new([StreamId::new(VenueId::Coinbase, symbol())]));
         let mut agg = Aggregator::new(
-            symbol(),
             vec![spec_for(VenueId::Coinbase, &symbol()).unwrap()],
             clock.clone(),
             &metrics,
@@ -714,7 +869,7 @@ mod tests {
 
         let at = |c: &TestClock| c.now();
         agg.apply(IngestMessage::Frame(RawFrame::new(
-            VenueId::Coinbase,
+            StreamId::new(VenueId::Coinbase, symbol()),
             br#"{"channel":"l2_data","sequence_num":0,"events":[{"type":"snapshot","product_id":"BTC-USD","updates":[{"side":"bid","price_level":"100","new_quantity":"1"}]}]}"#.to_vec(),
             at(&clock),
         )));
@@ -725,13 +880,13 @@ mod tests {
 
         // Outage one: 3s.
         agg.apply(IngestMessage::SessionEnded {
-            venue: VenueId::Coinbase,
+            stream: StreamId::new(VenueId::Coinbase, symbol()),
             at: at(&clock),
             end: SessionEnd::Errored,
         });
         clock.advance(Duration::from_secs(3));
         agg.apply(IngestMessage::Frame(RawFrame::new(
-            VenueId::Coinbase,
+            StreamId::new(VenueId::Coinbase, symbol()),
             br#"{"channel":"l2_data","sequence_num":0,"events":[{"type":"snapshot","product_id":"BTC-USD","updates":[{"side":"bid","price_level":"100","new_quantity":"1"}]}]}"#.to_vec(),
             at(&clock),
         )));
@@ -742,7 +897,7 @@ mod tests {
 
         // Outage two, still in progress: 2s so far, and it must be counted.
         agg.apply(IngestMessage::SessionEnded {
-            venue: VenueId::Coinbase,
+            stream: StreamId::new(VenueId::Coinbase, symbol()),
             at: at(&clock),
             end: SessionEnd::Errored,
         });
@@ -770,14 +925,17 @@ mod tests {
         // Kraken's checksum will not match a one-level book, so it desyncs —
         // which is correct, and leaves Kraken out of the minimum entirely.
         agg.apply(IngestMessage::Frame(RawFrame::rest_snapshot(
-            VenueId::Bitstamp,
+            StreamId::new(VenueId::Bitstamp, symbol()),
             br#"{"microtimestamp":"1700000000000000","bids":[["100","1"]],"asks":[["101","1"]]}"#
                 .to_vec(),
             SystemClock.now(),
         )));
 
         let snap = agg.snapshot(empty_channel());
-        assert_eq!(snap.weakest_integrity, Some(Integrity::OrderOnly));
+        assert_eq!(
+            only_symbol(&snap).weakest_integrity,
+            Some(Integrity::OrderOnly)
+        );
     }
 
     #[test]
@@ -786,10 +944,9 @@ mod tests {
         // gap leaves a healthy socket delivering updates the book correctly
         // refuses to apply; nothing else in the system would ever ask for the
         // snapshot that repairs it.
-        let requests = ResyncRequests::new([VenueId::Coinbase]);
-        let metrics = Arc::new(Metrics::new([VenueId::Coinbase]));
+        let requests = ResyncRequests::new([StreamId::new(VenueId::Coinbase, symbol())]);
+        let metrics = Arc::new(Metrics::new([StreamId::new(VenueId::Coinbase, symbol())]));
         let mut agg = Aggregator::new(
-            symbol(),
             vec![spec_for(VenueId::Coinbase, &symbol()).unwrap()],
             Arc::new(SystemClock),
             &metrics,
@@ -797,11 +954,15 @@ mod tests {
         .requesting_resync_through(requests.clone());
 
         agg.apply(coinbase(0, "snapshot", "100", "101"));
-        assert_eq!(requests.requested(VenueId::Coinbase), 0, "healthy book");
+        assert_eq!(
+            requests.requested(&StreamId::new(VenueId::Coinbase, symbol())),
+            0,
+            "healthy book"
+        );
 
         agg.apply(coinbase(9, "update", "100", "101")); // expected 1
         assert_eq!(
-            requests.requested(VenueId::Coinbase),
+            requests.requested(&StreamId::new(VenueId::Coinbase, symbol())),
             1,
             "a sequence gap must ask for a resync"
         );
@@ -816,10 +977,9 @@ mod tests {
         // on every single startup — discarding a healthy socket and restarting
         // a handshake that was about to succeed, against a venue that can
         // rate-limit for it.
-        let requests = ResyncRequests::new([VenueId::Bitstamp]);
-        let metrics = Arc::new(Metrics::new([VenueId::Bitstamp]));
+        let requests = ResyncRequests::new([StreamId::new(VenueId::Bitstamp, symbol())]);
+        let metrics = Arc::new(Metrics::new([StreamId::new(VenueId::Bitstamp, symbol())]));
         let mut agg = Aggregator::new(
-            symbol(),
             vec![spec_for(VenueId::Bitstamp, &symbol()).unwrap()],
             Arc::new(SystemClock),
             &metrics,
@@ -834,7 +994,7 @@ mod tests {
         let v = view(&agg.snapshot(empty_channel()), VenueId::Bitstamp);
         assert_eq!(v.status, BookStatus::Desynced, "should await a snapshot");
         assert_eq!(
-            requests.requested(VenueId::Bitstamp),
+            requests.requested(&StreamId::new(VenueId::Bitstamp, symbol())),
             0,
             "awaiting a REST snapshot means recovery is already in flight"
         );
@@ -846,7 +1006,7 @@ mod tests {
         // is data the snapshot already contains, which is ignored rather than
         // called a regression — see BitstampSync's `spliced_at`.
         agg.apply(IngestMessage::Frame(RawFrame::rest_snapshot(
-            VenueId::Bitstamp,
+            StreamId::new(VenueId::Bitstamp, symbol()),
             br#"{"microtimestamp":"1700000000000000","bids":[["100","1"]],"asks":[["101","1"]]}"#
                 .to_vec(),
             SystemClock.now(),
@@ -864,7 +1024,7 @@ mod tests {
             r#"{"event":"data","channel":"diff_order_book_btcusd","data":{"microtimestamp":"1700000000000010","bids":[["100","3"]],"asks":[]}}"#,
         ));
         assert_eq!(
-            requests.requested(VenueId::Bitstamp),
+            requests.requested(&StreamId::new(VenueId::Bitstamp, symbol())),
             1,
             "a timestamp regression is a real fault and must ask"
         );
@@ -876,10 +1036,9 @@ mod tests {
         // the Desynced state it produces as a fresh problem would have the
         // aggregator request a reconnect for every reconnect — a self-inflicted
         // storm against a venue that may already be rate-limiting us.
-        let requests = ResyncRequests::new([VenueId::Coinbase]);
-        let metrics = Arc::new(Metrics::new([VenueId::Coinbase]));
+        let requests = ResyncRequests::new([StreamId::new(VenueId::Coinbase, symbol())]);
+        let metrics = Arc::new(Metrics::new([StreamId::new(VenueId::Coinbase, symbol())]));
         let mut agg = Aggregator::new(
-            symbol(),
             vec![spec_for(VenueId::Coinbase, &symbol()).unwrap()],
             Arc::new(SystemClock),
             &metrics,
@@ -888,12 +1047,15 @@ mod tests {
 
         agg.apply(coinbase(0, "snapshot", "100", "101"));
         agg.apply(IngestMessage::SessionEnded {
-            venue: VenueId::Coinbase,
+            stream: StreamId::new(VenueId::Coinbase, symbol()),
             at: SystemClock.now(),
             end: SessionEnd::Errored,
         });
 
-        assert_eq!(requests.requested(VenueId::Coinbase), 0);
+        assert_eq!(
+            requests.requested(&StreamId::new(VenueId::Coinbase, symbol())),
+            0
+        );
     }
 
     #[test]
@@ -901,10 +1063,9 @@ mod tests {
         // A venue sending a hundred updates a second into a desynced book must
         // not produce a hundred reconnect requests. The transition is what is
         // interesting, not the state.
-        let requests = ResyncRequests::new([VenueId::Coinbase]);
-        let metrics = Arc::new(Metrics::new([VenueId::Coinbase]));
+        let requests = ResyncRequests::new([StreamId::new(VenueId::Coinbase, symbol())]);
+        let metrics = Arc::new(Metrics::new([StreamId::new(VenueId::Coinbase, symbol())]));
         let mut agg = Aggregator::new(
-            symbol(),
             vec![spec_for(VenueId::Coinbase, &symbol()).unwrap()],
             Arc::new(SystemClock),
             &metrics,
@@ -918,7 +1079,7 @@ mod tests {
         }
 
         assert_eq!(
-            requests.requested(VenueId::Coinbase),
+            requests.requested(&StreamId::new(VenueId::Coinbase, symbol())),
             1,
             "only the transition into Desynced should ask"
         );
@@ -954,7 +1115,7 @@ mod tests {
     fn a_frame_for_an_untracked_venue_is_ignored_not_fatal() {
         let (mut agg, _m) = aggregator(&[VenueId::Coinbase]);
         agg.apply(frame(VenueId::Kraken, r#"{"channel":"heartbeat"}"#));
-        assert_eq!(agg.snapshot(empty_channel()).venues.len(), 1);
+        assert_eq!(only_symbol(&agg.snapshot(empty_channel())).venues.len(), 1);
     }
 
     #[test]

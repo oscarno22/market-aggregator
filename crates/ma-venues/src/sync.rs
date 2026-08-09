@@ -10,9 +10,11 @@
 //! the exact same code path a live connection does.
 
 use std::fmt;
+use std::time::SystemTime;
 
 use ma_core::{
-    Book, DesyncReason, EventKind, IngestTime, Integrity, Level, MarketEvent, Symbol, VenueId,
+    Book, DesyncReason, EventKind, IngestTime, Integrity, Level, MarketEvent, StreamId, Symbol,
+    VenueId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -42,9 +44,24 @@ pub enum FrameSource {
 /// This is deliberately the unit the tape recorder writes. Recording *after*
 /// parsing would mean a recorded session could never reproduce a parser bug or
 /// a venue schema change — the two failures most likely to happen unattended.
+///
+/// # Why the symbol rides alongside the bytes it is already inside
+///
+/// Every venue names the symbol somewhere in the payload, so carrying it
+/// separately looks redundant. It is not, for one reason: **routing happens
+/// before parsing.** The aggregator has to pick which book this frame belongs
+/// to, and the only way to learn that from the payload is to parse it — which
+/// requires already knowing which venue's parser to use *and* which book's
+/// sync state to feed. The [`StreamId`] is what the ingest task subscribed
+/// with, so it is knowledge the task already has and the reader would
+/// otherwise have to re-derive.
+///
+/// It also makes a multi-symbol tape self-describing: a line says which
+/// subscription produced it, rather than leaving a reader to infer it from the
+/// bytes with a venue-specific parser.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RawFrame {
-    pub venue: VenueId,
+    pub stream: StreamId,
     pub payload: Vec<u8>,
     pub ingest_ts: IngestTime,
     pub source: FrameSource,
@@ -53,9 +70,9 @@ pub struct RawFrame {
 impl RawFrame {
     /// A frame read off the websocket — the overwhelmingly common case, which
     /// is why it gets the short constructor.
-    pub fn new(venue: VenueId, payload: impl Into<Vec<u8>>, ingest_ts: IngestTime) -> Self {
+    pub fn new(stream: StreamId, payload: impl Into<Vec<u8>>, ingest_ts: IngestTime) -> Self {
         Self {
-            venue,
+            stream,
             payload: payload.into(),
             ingest_ts,
             source: FrameSource::WebSocket,
@@ -64,14 +81,22 @@ impl RawFrame {
 
     /// A REST depth response, to be spliced rather than parsed as a diff.
     pub fn rest_snapshot(
-        venue: VenueId,
+        stream: StreamId,
         payload: impl Into<Vec<u8>>,
         ingest_ts: IngestTime,
     ) -> Self {
         Self {
             source: FrameSource::RestSnapshot,
-            ..Self::new(venue, payload, ingest_ts)
+            ..Self::new(stream, payload, ingest_ts)
         }
+    }
+
+    pub fn venue(&self) -> VenueId {
+        self.stream.venue
+    }
+
+    pub fn symbol(&self) -> &Symbol {
+        &self.stream.symbol
     }
 
     pub fn as_str(&self) -> Result<&str, VenueError> {
@@ -88,14 +113,58 @@ impl fmt::Debug for RawFrame {
             FrameSource::RestSnapshot => ", rest",
         };
         match std::str::from_utf8(&self.payload) {
-            Ok(s) => write!(f, "RawFrame({}{source}, {s:?})", self.venue),
+            Ok(s) => write!(f, "RawFrame({}{source}, {s:?})", self.stream),
             Err(_) => write!(
                 f,
                 "RawFrame({}{source}, {} bytes)",
-                self.venue,
+                self.stream,
                 self.payload.len()
             ),
         }
+    }
+}
+
+/// What one frame turned into: instructions for the book, plus the venue's own
+/// claim about when it happened.
+///
+/// # Why the timestamp is returned separately rather than on each action
+///
+/// `venue_ts` is a property of the *frame*, not of any one instruction inside
+/// it — a single Kraken book message yields a delta and a checksum verification
+/// that share one timestamp. Hanging it off each action would duplicate it and
+/// invite the two copies to disagree.
+///
+/// It exists to be **measured, never trusted**. `ma_core::MarketEvent`'s docs
+/// and `docs/DESIGN.md` §6 are emphatic: venues disagree by seconds and some
+/// are simply wrong, so nothing orders or windows by this. It is carried so
+/// clock skew is observable and so the persistence layer can write a column
+/// that says what the venue claimed, next to the column that says what we
+/// observed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Ingested {
+    pub actions: Vec<SyncAction>,
+    /// The venue's own timestamp for this frame, if it sent one at all.
+    pub venue_ts: Option<SystemTime>,
+}
+
+impl Ingested {
+    /// Actions with no venue timestamp — acks, and venues that send none.
+    pub fn untimed(actions: Vec<SyncAction>) -> Self {
+        Self {
+            actions,
+            venue_ts: None,
+        }
+    }
+
+    /// Nothing to do. The common case for subscription acks and pongs.
+    pub fn ignored() -> Self {
+        Self::untimed(vec![SyncAction::Ignore])
+    }
+
+    #[must_use]
+    pub fn at(mut self, venue_ts: Option<SystemTime>) -> Self {
+        self.venue_ts = venue_ts;
+        self
     }
 }
 
@@ -197,7 +266,7 @@ pub trait VenueSync: fmt::Debug + Send {
     /// splice must be applied immediately after it, atomically from the book's
     /// point of view. Buffering lives here, in the venue, because only the
     /// venue knows how to decide which buffered deltas the snapshot subsumed.
-    fn ingest(&mut self, frame: &RawFrame) -> Result<Vec<SyncAction>, VenueError>;
+    fn ingest(&mut self, frame: &RawFrame) -> Result<Ingested, VenueError>;
 
     /// Hash the book the way this venue hashes it, for [`SyncAction::Verify`].
     ///
@@ -263,7 +332,19 @@ pub enum Outcome {
         from: ma_core::BookState,
         to: ma_core::BookState,
     },
-    /// A non-book event to forward downstream.
+    /// A normalised event, in the order it was applied.
+    ///
+    /// **Every** frame with content produces one of these, including the
+    /// snapshots and deltas that changed the book — not merely the trades and
+    /// heartbeats that pass through. v1 emitted only the latter, because the
+    /// only consumer was a heartbeat counter.
+    ///
+    /// v2's persistence layer is the reason that changed: a Parquet file
+    /// written from a stream that omits snapshots and deltas records the
+    /// commentary and discards the market. Emitting the applied events here
+    /// means the normalised history and the live book are derived from one
+    /// sequence, so a replay of the history cannot diverge from what the live
+    /// run believed — they are the same events.
     Event(MarketEvent),
 }
 
@@ -271,6 +352,11 @@ impl VenueBook {
     pub fn new(sync: Box<dyn VenueSync>, symbol: Symbol) -> Self {
         let book = Book::new(sync.venue(), symbol);
         Self { sync, book }
+    }
+
+    /// This book's subscription identity.
+    pub fn stream(&self) -> StreamId {
+        StreamId::new(self.book.venue(), self.book.symbol().clone())
     }
 
     /// Cap retained depth, mirroring [`Book::with_max_depth`].
@@ -310,14 +396,14 @@ impl VenueBook {
     /// exactly as it did live. That is the whole reason the discriminator sits
     /// on the frame — see [`FrameSource`].
     pub fn feed(&mut self, frame: &RawFrame) -> Result<Vec<Outcome>, VenueError> {
-        let actions = match frame.source {
+        let ingested = match frame.source {
             FrameSource::WebSocket => self.sync.ingest(frame)?,
             FrameSource::RestSnapshot => {
                 let snapshot = self.sync.parse_rest_snapshot(frame.as_str()?)?;
-                self.sync.apply_rest_snapshot(snapshot)
+                Ingested::untimed(self.sync.apply_rest_snapshot(snapshot))
             }
         };
-        Ok(self.apply_actions(actions, frame.ingest_ts))
+        Ok(self.apply_ingested(ingested, frame.ingest_ts))
     }
 
     /// Splice in a REST-fetched snapshot. See [`VenueSync::apply_rest_snapshot`]
@@ -325,51 +411,109 @@ impl VenueBook {
     /// for an [`Integrity::OrderOnly`] venue.
     pub fn apply_rest_snapshot(&mut self, snapshot: RestSnapshot, at: IngestTime) -> Vec<Outcome> {
         let actions = self.sync.apply_rest_snapshot(snapshot);
-        self.apply_actions(actions, at)
+        self.apply_ingested(Ingested::untimed(actions), at)
     }
 
-    /// Apply the actions a [`VenueSync`] returned, and report whether trust in
-    /// the book changed as a result. Shared by [`Self::feed`] and
-    /// [`Self::apply_rest_snapshot`] so the two entry points can't drift.
-    fn apply_actions(&mut self, actions: Vec<SyncAction>, at: IngestTime) -> Vec<Outcome> {
+    /// Apply an already-normalised event, bypassing the wire parser entirely.
+    ///
+    /// This is the entry point for replaying **normalised** history — v2's
+    /// Parquet layer — as opposed to the raw-frame tape, which goes through
+    /// [`Self::feed`] and the venue's parser like a live socket.
+    ///
+    /// The two replay layers are deliberately not interchangeable, and this
+    /// method is where the difference becomes concrete. A raw-frame tape can
+    /// reproduce a parser bug because the bytes are still bytes. This path
+    /// cannot: parsing already happened, once, when the event was recorded.
+    /// What it *can* do is reproduce the book, including Kraken's checksum
+    /// verification, because [`EventKind::Checksum`] is part of the normalised
+    /// stream — so a replayed book is still checked against what the venue said
+    /// it should be, rather than merely against itself.
+    pub fn apply_event(&mut self, event: MarketEvent, at: IngestTime) -> Vec<Outcome> {
+        let action = match event.kind {
+            EventKind::Snapshot { bids, asks } => SyncAction::Snapshot { bids, asks },
+            EventKind::Delta { bids, asks } => SyncAction::Delta { bids, asks },
+            EventKind::Checksum { value } => SyncAction::Verify { checksum: value },
+            kind @ (EventKind::Trade { .. } | EventKind::Heartbeat { .. }) => {
+                SyncAction::Forward(kind)
+            }
+        };
+        self.apply_ingested(
+            Ingested {
+                actions: vec![action],
+                venue_ts: event.venue_ts,
+            },
+            at,
+        )
+    }
+
+    /// Apply what a [`VenueSync`] returned, and report whether trust in the
+    /// book changed as a result. Shared by every entry point so they can't
+    /// drift.
+    ///
+    /// Each action becomes a [`MarketEvent`] *before* it is applied, and the
+    /// book is then updated from that event's own payload. The order matters
+    /// for a boring but load-bearing reason: it moves the level vectors into
+    /// the event rather than cloning them out of it. Coinbase's opening
+    /// snapshot is tens of thousands of levels, and a design that emitted a
+    /// copy for the persistence layer would double that allocation on every
+    /// resync.
+    fn apply_ingested(&mut self, ingested: Ingested, at: IngestTime) -> Vec<Outcome> {
         let before = self.book.state();
         let mut outcomes = Vec::new();
+        let integrity = self.sync.integrity();
 
-        for action in actions {
-            match action {
-                SyncAction::Ignore => {}
+        for action in ingested.actions {
+            let kind = match action {
+                SyncAction::Ignore => continue,
+
+                SyncAction::Desync(reason) => {
+                    self.book.mark_desynced(reason, at);
+                    continue;
+                }
+
+                SyncAction::Verify { checksum } => {
+                    self.verify(checksum, at);
+                    EventKind::Checksum { value: checksum }
+                }
 
                 SyncAction::Snapshot { bids, asks } => {
-                    // A crossed snapshot desyncs the book from inside
-                    // `apply_snapshot`; the error is the same information as
-                    // the state change we report below.
-                    let _ = self
-                        .book
-                        .apply_snapshot(&bids, &asks, self.sync.integrity(), at);
+                    let kind = EventKind::Snapshot { bids, asks };
+                    if let EventKind::Snapshot { bids, asks } = &kind {
+                        // A crossed snapshot desyncs the book from inside
+                        // `apply_snapshot`; the error is the same information
+                        // as the state change reported below.
+                        let _ = self.book.apply_snapshot(bids, asks, integrity, at);
+                    }
+                    kind
                 }
 
                 SyncAction::Delta { bids, asks } => {
-                    if self.book.apply_delta(&bids, &asks, at).is_err() {
+                    let kind = EventKind::Delta { bids, asks };
+                    if let EventKind::Delta { bids, asks } = &kind
+                        && self.book.apply_delta(bids, asks, at).is_err()
+                    {
                         // Deltas arriving while desynced are expected during a
                         // resync — the venue is still buffering. Dropping them
                         // here is correct; applying them is how books go
-                        // silently wrong.
+                        // silently wrong. It must not reach the persistence
+                        // layer either: a recorded delta that was never
+                        // applied would replay into a book the live run never
+                        // had.
                         continue;
                     }
+                    kind
                 }
 
-                SyncAction::Verify { checksum } => self.verify(checksum, at),
+                SyncAction::Forward(kind) => kind,
+            };
 
-                SyncAction::Forward(kind) => outcomes.push(Outcome::Event(MarketEvent {
-                    venue: self.book.venue(),
-                    symbol: self.book.symbol().clone(),
-                    venue_ts: None,
-                    ingest_ts: at,
-                    kind,
-                })),
-
-                SyncAction::Desync(reason) => self.book.mark_desynced(reason, at),
-            }
+            outcomes.push(Outcome::Event(MarketEvent {
+                venue: self.book.venue(),
+                symbol: self.book.symbol().clone(),
+                venue_ts: ingested.venue_ts,
+                ingest_ts: at,
+                kind,
+            }));
         }
 
         let after = self.book.state();

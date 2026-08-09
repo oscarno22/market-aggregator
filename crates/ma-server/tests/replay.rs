@@ -39,7 +39,7 @@ fn tape_path() -> PathBuf {
 
 /// Replay the whole tape and return the final snapshot.
 async fn run() -> Snapshot {
-    let mut pipeline = Pipeline::new(Symbol::new("BTC-USD"), DEFAULT_VENUES.to_vec())
+    let mut pipeline = Pipeline::new(vec![Symbol::new("BTC-USD")], DEFAULT_VENUES.to_vec())
         .expect("pipeline")
         // Fast enough that the run does not depend on wall-clock timing, and
         // the final snapshot is what everything gets asserted against anyway.
@@ -51,9 +51,19 @@ async fn run() -> Snapshot {
     let clock = pipeline.clock();
 
     let mut reader = TapeReader::open(tape_path()).await.expect("open tape");
-    let stats = replay(&mut reader, &tx, clock.as_ref(), Pacing::Faithful)
-        .await
-        .expect("replay");
+    let stats = replay(
+        &mut reader,
+        &tx,
+        clock.as_ref(),
+        Pacing::Faithful,
+        // The committed tape predates the tape format's symbol field, so
+        // replay is told what it holds. That this still works is the point of
+        // the field being optional: a v1 recording, the artefact that found
+        // three real parser bugs, keeps replaying unchanged.
+        &Symbol::new("BTC-USD"),
+    )
+    .await
+    .expect("replay");
 
     assert!(stats.frames_sent > 1_000, "tape looks truncated: {stats:?}");
     assert_eq!(
@@ -96,7 +106,7 @@ async fn run() -> Snapshot {
 /// the same order have to produce the same prices, the same depth, and the
 /// same trust.
 fn comparable(snapshot: &Snapshot) -> BTreeMap<VenueId, String> {
-    snapshot
+    btc(snapshot)
         .venues
         .iter()
         .map(|v| {
@@ -104,14 +114,17 @@ fn comparable(snapshot: &Snapshot) -> BTreeMap<VenueId, String> {
                 v.venue,
                 format!(
                     "status={:?} integrity={:?} reason={:?} bid={:?} ask={:?} \
-                     spread={:?} depth={:?} applied={} desyncs={} parse_errors={}",
+                     spread={:?} levels_held={:?} bids={:?} asks={:?} \
+                     applied={} desyncs={} parse_errors={}",
                     v.status,
                     v.integrity,
                     v.desync_reason,
                     v.bid.map(|l| (l.price.to_string(), l.qty.to_string())),
                     v.ask.map(|l| (l.price.to_string(), l.qty.to_string())),
                     v.spread,
-                    v.depth,
+                    v.levels_held,
+                    ladder(&v.bids),
+                    ladder(&v.asks),
                     v.counters.applied,
                     v.counters.desyncs,
                     v.counters.parse_errors,
@@ -121,10 +134,24 @@ fn comparable(snapshot: &Snapshot) -> BTreeMap<VenueId, String> {
         .collect()
 }
 
+/// The one symbol this tape holds.
+fn btc(snapshot: &Snapshot) -> &ma_pipeline::SymbolView {
+    snapshot.symbol("BTC-USD").expect("BTC-USD in snapshot")
+}
+
+/// A depth ladder as comparable text.
+fn ladder(levels: &[ma_core::Level]) -> Vec<(String, String)> {
+    levels
+        .iter()
+        .map(|l| (l.price.to_string(), l.qty.to_string()))
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_recorded_session_reaches_a_trusted_book_at_every_venue() {
     let snapshot = run().await;
-    let views: BTreeMap<VenueId, _> = snapshot.venues.iter().map(|v| (v.venue, v)).collect();
+    let group = btc(&snapshot);
+    let views: BTreeMap<VenueId, _> = group.venues.iter().map(|v| (v.venue, v)).collect();
 
     for venue in DEFAULT_VENUES {
         let v = views.get(&venue).expect("venue in snapshot");
@@ -154,7 +181,7 @@ async fn a_recorded_session_reaches_a_trusted_book_at_every_venue() {
         Some(ma_core::Integrity::OrderOnly)
     );
     assert_eq!(
-        snapshot.weakest_integrity,
+        group.weakest_integrity,
         Some(ma_core::Integrity::OrderOnly),
         "a combined view must report its weakest input"
     );
@@ -169,7 +196,7 @@ async fn kraken_stays_checksum_verified_across_the_whole_recording() {
     // byte the book Kraken thinks we should have — including the exact decimal
     // digits, which is what `Price` wrapping `Decimal` instead of `f64` buys.
     let snapshot = run().await;
-    let kraken = snapshot
+    let kraken = btc(&snapshot)
         .venues
         .iter()
         .find(|v| v.venue == VenueId::Kraken)
@@ -190,7 +217,7 @@ async fn kraken_stays_checksum_verified_across_the_whole_recording() {
         "a Verified book must know when it was last actually verified"
     );
     assert_eq!(
-        kraken.depth,
+        kraken.levels_held,
         [10, 10],
         "the subscribed depth and the retained depth must agree, or the \
          checksum is being computed over a different book than Kraken hashed"
@@ -205,7 +232,7 @@ async fn bitstamp_recovers_through_the_rest_splice_and_only_once() {
     // buffered diffs joined onto the snapshot without the ordering check
     // firing afterwards.
     let snapshot = run().await;
-    let bitstamp = snapshot
+    let bitstamp = btc(&snapshot)
         .venues
         .iter()
         .find(|v| v.venue == VenueId::Bitstamp)

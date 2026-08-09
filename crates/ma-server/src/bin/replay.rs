@@ -16,7 +16,7 @@ use std::time::Duration;
 use clap::Parser;
 use ma_core::Symbol;
 use ma_pipeline::tape::{Pacing, TapeReader, replay};
-use ma_server::{DEFAULT_VENUES, Pipeline, http, init_tracing};
+use ma_server::{DEFAULT_VENUES, Pipeline, http, init_tracing, parse_symbols};
 
 #[derive(Parser, Debug)]
 #[command(about = "Replay a recorded tape through the full pipeline (no network)")]
@@ -25,8 +25,15 @@ struct Args {
     #[arg(long)]
     tape: PathBuf,
 
+    /// Symbol(s) to serve, comma-separated.
+    ///
+    /// For a tape recorded before v2 this is also the *assertion* about what
+    /// the tape contains: those recordings carry no symbol field, so replay
+    /// stamps their frames with the first symbol given here. Getting it wrong
+    /// produces a book under the wrong name rather than an error, which is why
+    /// it is a flag rather than a guess. See `TapedFrame::into_message`.
     #[arg(long, default_value = "BTC-USD")]
-    symbol: String,
+    symbols: String,
 
     /// Playback speed. Omit to run as fast as the pipeline can consume, which
     /// is what the test suite wants; `1.0` reproduces the original pacing,
@@ -53,7 +60,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // three. The alternative — inferring the venue set by pre-scanning the
     // file — would mean reading the tape twice to learn something that costs
     // nothing to over-provision.
-    let mut pipeline = Pipeline::new(Symbol::new(&args.symbol), DEFAULT_VENUES.to_vec())?;
+    let symbols = parse_symbols(&args.symbols)?;
+    let fallback = symbols
+        .first()
+        .cloned()
+        .unwrap_or_else(|| Symbol::new("BTC-USD"));
+    let mut pipeline = Pipeline::new(symbols, DEFAULT_VENUES.to_vec())?;
     let (handle, aggregator) = pipeline.spawn_aggregator()?;
     let tx = pipeline.channel();
     let clock = pipeline.clock();
@@ -72,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut reader = TapeReader::open(&args.tape).await?;
     let pacing = Pacing::from_speed(args.speed);
-    let stats = replay(&mut reader, &tx, clock.as_ref(), pacing).await?;
+    let stats = replay(&mut reader, &tx, clock.as_ref(), pacing, &fallback).await?;
 
     tracing::info!(
         tape = %args.tape.display(),

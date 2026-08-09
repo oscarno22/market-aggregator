@@ -10,10 +10,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use ma_core::{
-    Book, BookState, Clock, DesyncReason, Integrity, Side, Symbol, SystemClock, VenueId,
+    Book, BookState, Clock, DesyncReason, Integrity, Side, StreamId, Symbol, SystemClock, VenueId,
 };
 use ma_venues::KrakenSync;
-use ma_venues::sync::RawFrame;
+use ma_venues::sync::{Outcome, RawFrame};
 
 macro_rules! fixture {
     ($name:literal) => {
@@ -30,7 +30,11 @@ fn book() -> ma_venues::sync::VenueBook {
 }
 
 fn frame(json: &str) -> RawFrame {
-    RawFrame::new(VenueId::Kraken, json.as_bytes().to_vec(), SystemClock.now())
+    RawFrame::new(
+        StreamId::new(VenueId::Kraken, Symbol::new("BTC-USD")),
+        json.as_bytes().to_vec(),
+        SystemClock.now(),
+    )
 }
 
 fn levels(book: &Book, side: Side) -> Vec<(String, String)> {
@@ -148,4 +152,34 @@ fn exact_decimal_parsing_preserves_trailing_zeros_from_a_bare_json_number() {
         [("60000.00".to_owned(), "0.00100000".to_owned())],
         "trailing zeros were lost somewhere between the wire and the book"
     );
+}
+
+#[test]
+fn the_venue_clock_is_reported_on_updates_and_absent_from_snapshots() {
+    // Kraken puts its timestamp inside each `data` entry, and only on
+    // `update` messages. A field that appears on some messages and not others
+    // could not order anything even if we were willing to trust it -- which
+    // `docs/DESIGN.md` §6 says we are not.
+    let mut vb = book();
+    let snapshot = vb.feed(&frame(fixture!("snapshot.json"))).unwrap();
+    assert!(
+        venue_ts_of(&snapshot).is_none(),
+        "kraken snapshots carry no timestamp; one appeared from somewhere"
+    );
+
+    let update = vb.feed(&frame(fixture!("update.json"))).unwrap();
+    let venue_ts = venue_ts_of(&update).expect("kraken stamps updates");
+    let nanos = venue_ts
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("post-epoch")
+        .as_nanos();
+    assert_eq!(nanos, 1_786_190_401_000_000_000, "2026-08-08T12:00:01Z");
+}
+
+/// The venue timestamp on the first content-bearing event of a batch.
+fn venue_ts_of(outcomes: &[Outcome]) -> Option<std::time::SystemTime> {
+    outcomes.iter().find_map(|o| match o {
+        Outcome::Event(e) => e.venue_ts,
+        Outcome::StateChanged { .. } => None,
+    })
 }

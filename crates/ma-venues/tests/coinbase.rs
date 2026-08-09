@@ -9,7 +9,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use ma_core::{
-    Book, BookState, Clock, DesyncReason, EventKind, Integrity, Side, Symbol, SystemClock, VenueId,
+    Book, BookState, Clock, DesyncReason, EventKind, Integrity, Side, StreamId, Symbol,
+    SystemClock, VenueId,
 };
 use ma_venues::CoinbaseSync;
 use ma_venues::sync::{Outcome, RawFrame, VenueBook};
@@ -33,7 +34,7 @@ fn book() -> VenueBook {
 
 fn frame(json: &str) -> RawFrame {
     RawFrame::new(
-        VenueId::Coinbase,
+        StreamId::new(VenueId::Coinbase, Symbol::new("BTC-USD")),
         json.as_bytes().to_vec(),
         SystemClock.now(),
     )
@@ -241,4 +242,37 @@ fn sequence_numbers_count_every_message_on_the_connection() {
         }
         other => panic!("expected a SequenceGap across channels, got {other:?}"),
     }
+}
+
+#[test]
+fn the_venue_clock_is_reported_but_never_used_for_ordering() {
+    // v1 carried `venue_ts` on `MarketEvent` and never populated it, so clock
+    // skew was structurally unmeasurable and v2's Parquet `venue_ts` column
+    // would have been entirely null. Coinbase stamps its envelope in RFC 3339
+    // with nanosecond precision.
+    let mut vb = book();
+    let outcomes = vb.feed(&frame(fixture!("snapshot.json"))).unwrap();
+
+    let event = outcomes
+        .iter()
+        .find_map(|o| match o {
+            Outcome::Event(e) if matches!(e.kind, EventKind::Snapshot { .. }) => Some(e),
+            _ => None,
+        })
+        .expect("a snapshot event");
+
+    let venue_ts = event.venue_ts.expect("coinbase stamps every envelope");
+    let nanos = venue_ts
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("post-epoch")
+        .as_nanos();
+    assert_eq!(nanos, 1_786_190_400_000_000_000, "2026-08-08T12:00:00Z");
+
+    // And the rule that makes carrying it safe: ordering and book age come off
+    // `ingest_ts`, never this. `docs/DESIGN.md` §6.
+    assert_ne!(
+        event.ingest_ts.wall(),
+        venue_ts,
+        "the venue clock must not have become the ingest clock"
+    );
 }

@@ -42,7 +42,7 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use ma_core::{Clock, IngestTime, VenueId};
+use ma_core::{Clock, IngestTime, StreamId, Symbol, VenueId};
 use ma_venues::{FrameSource, RawFrame};
 
 use crate::ingest::{IngestMessage, SessionEnd};
@@ -61,6 +61,11 @@ pub enum TapeError {
     Malformed(#[from] serde_json::Error),
     #[error("frame payload was not valid UTF-8; the tape format is text-only, see module docs")]
     NonUtf8Payload,
+    #[error(
+        "a raw-frame tape records bytes a venue sent; a normalised event has none. \
+         Normalised history is the Parquet layer's job — see ma-persist"
+    )]
+    NotRawBytes,
 }
 
 /// On-disk shape of one line. Kept private and separate from [`TapedFrame`]
@@ -69,6 +74,21 @@ pub enum TapeError {
 #[derive(Serialize, Deserialize)]
 struct TapeRecord {
     venue: VenueId,
+    /// Which subscription produced this line.
+    ///
+    /// Added in v2 and deliberately optional, because the v1 tape committed in
+    /// `tapes/` predates it and must keep replaying — it is the recording that
+    /// found three real parser bugs, and a format change that silently
+    /// invalidated it would throw away the most valuable artefact in the
+    /// repository.
+    ///
+    /// `None` means "this tape does not say", which is the honest reading of a
+    /// v1 recording: it was made before the process could track more than one
+    /// symbol, so the symbol is whatever the operator was recording at the
+    /// time. Replay resolves it from `--symbol` rather than guessing — see
+    /// [`TapedFrame::into_message`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    symbol: Option<Symbol>,
     elapsed_nanos: u64,
     recorded_wall_unix_nanos: u64,
     /// Empty for a [`RecordKind::SessionEnded`] record, which carries no
@@ -155,7 +175,8 @@ impl<W: AsyncWrite + Unpin> TapeWriter<W> {
     pub async fn write_frame(&mut self, frame: &RawFrame) -> Result<(), TapeError> {
         let payload = frame.as_str().map_err(|_| TapeError::NonUtf8Payload)?;
         self.write_record(&TapeRecord {
-            venue: frame.venue,
+            venue: frame.venue(),
+            symbol: Some(frame.symbol().clone()),
             elapsed_nanos: nanos(frame.ingest_ts.since(self.start)),
             recorded_wall_unix_nanos: wall_nanos(frame.ingest_ts.wall()),
             payload: payload.to_owned(),
@@ -170,9 +191,15 @@ impl<W: AsyncWrite + Unpin> TapeWriter<W> {
     pub async fn write_message(&mut self, message: &IngestMessage) -> Result<(), TapeError> {
         match message {
             IngestMessage::Frame(frame) => self.write_frame(frame).await,
-            IngestMessage::SessionEnded { venue, at, .. } => {
+            // A normalised event has no bytes to record. Writing one as an
+            // empty frame would produce a tape that replays into parse errors,
+            // so this refuses instead — and cannot happen in practice, because
+            // only Parquet replay produces these and only live ingest records.
+            IngestMessage::Event { .. } => Err(TapeError::NotRawBytes),
+            IngestMessage::SessionEnded { stream, at, .. } => {
                 self.write_record(&TapeRecord {
-                    venue: *venue,
+                    venue: stream.venue,
+                    symbol: Some(stream.symbol.clone()),
                     elapsed_nanos: nanos(at.since(self.start)),
                     recorded_wall_unix_nanos: wall_nanos(at.wall()),
                     payload: String::new(),
@@ -201,6 +228,9 @@ impl<W: AsyncWrite + Unpin> TapeWriter<W> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TapedFrame {
     pub venue: VenueId,
+    /// The subscription this line came from, or `None` on a v1 tape that
+    /// predates the field. See [`TapeRecord::symbol`].
+    pub symbol: Option<Symbol>,
     /// Empty for a session boundary, which carries no bytes.
     pub payload: Vec<u8>,
     /// Offset from the tape's first frame. This, not `recorded_wall`, is
@@ -219,11 +249,20 @@ impl TapedFrame {
     /// `base`. Two replays of the same tape from different `base` readings
     /// produce messages with different wall clocks but identical relative
     /// ordering and spacing — the property that makes replay deterministic.
-    pub fn into_message(self, base: IngestTime) -> IngestMessage {
+    /// `fallback` supplies the symbol for a tape that does not record one — a
+    /// v1 recording. It is the operator's assertion about what was recorded,
+    /// which is the only source of that fact once the bytes are on disk, and
+    /// it is why replay takes a `--symbol` flag rather than inventing a
+    /// default here where a wrong guess would be invisible.
+    pub fn into_message(self, base: IngestTime, fallback: &Symbol) -> IngestMessage {
         let at = base.advanced_by(self.elapsed);
+        let stream = StreamId::new(
+            self.venue,
+            self.symbol.clone().unwrap_or_else(|| fallback.clone()),
+        );
         if self.session_ended {
             return IngestMessage::SessionEnded {
-                venue: self.venue,
+                stream,
                 at,
                 // A tape records that the stream restarted, not why. The
                 // aggregator's response is identical for every cause — reset
@@ -234,8 +273,8 @@ impl TapedFrame {
             };
         }
         IngestMessage::Frame(match self.source {
-            FrameSource::WebSocket => RawFrame::new(self.venue, self.payload, at),
-            FrameSource::RestSnapshot => RawFrame::rest_snapshot(self.venue, self.payload, at),
+            FrameSource::WebSocket => RawFrame::new(stream, self.payload, at),
+            FrameSource::RestSnapshot => RawFrame::rest_snapshot(stream, self.payload, at),
         })
     }
 }
@@ -305,6 +344,7 @@ impl<R: AsyncRead + Unpin> TapeReader<R> {
             let record: TapeRecord = serde_json::from_str(&line)?;
             return Ok(Some(TapedFrame {
                 venue: record.venue,
+                symbol: record.symbol,
                 payload: record.payload.into_bytes(),
                 elapsed: Duration::from_nanos(record.elapsed_nanos),
                 recorded_wall: SystemTime::UNIX_EPOCH
@@ -385,6 +425,7 @@ pub async fn replay<R, C>(
     tx: &Sender<IngestMessage>,
     clock: &C,
     pacing: Pacing,
+    fallback_symbol: &ma_core::Symbol,
 ) -> Result<ReplayStats, TapeError>
 where
     R: AsyncRead + Unpin,
@@ -407,7 +448,7 @@ where
         }
         previous_elapsed = elapsed;
 
-        let message = taped.into_message(base);
+        let message = taped.into_message(base, fallback_symbol);
         stats.frames_sent += 1;
 
         match pacing {
@@ -436,7 +477,11 @@ mod tests {
     use std::time::Duration;
 
     fn frame(venue: VenueId, payload: &str, at: IngestTime) -> RawFrame {
-        RawFrame::new(venue, payload.as_bytes().to_vec(), at)
+        RawFrame::new(
+            StreamId::new(venue, Symbol::new("BTC-USD")),
+            payload.as_bytes().to_vec(),
+            at,
+        )
     }
 
     #[tokio::test]
@@ -490,7 +535,11 @@ mod tests {
             .await
             .expect("create");
 
-        let bad = RawFrame::new(VenueId::Fake, vec![0xff, 0xfe], TestClock::new().now());
+        let bad = RawFrame::new(
+            StreamId::new(VenueId::Fake, Symbol::new("BTC-USD")),
+            vec![0xff, 0xfe],
+            TestClock::new().now(),
+        );
         let err = writer.write_frame(&bad).await.unwrap_err();
         assert!(matches!(err, TapeError::NonUtf8Payload));
     }
@@ -551,9 +600,15 @@ mod tests {
         let (tx, rx) = bounded::<IngestMessage>(8);
         let replay_clock = TestClock::new();
 
-        let stats = replay(&mut reader, &tx, &replay_clock, Pacing::Faithful)
-            .await
-            .expect("replay");
+        let stats = replay(
+            &mut reader,
+            &tx,
+            &replay_clock,
+            Pacing::Faithful,
+            &Symbol::new("BTC-USD"),
+        )
+        .await
+        .expect("replay");
         drop(tx);
 
         assert_eq!(stats.frames_sent, 3);
@@ -564,7 +619,9 @@ mod tests {
         while let Some(message) = rx.recv().await {
             match message {
                 IngestMessage::Frame(frame) => received.push(frame),
-                IngestMessage::SessionEnded { .. } => panic!("no boundaries on this tape"),
+                IngestMessage::SessionEnded { .. } | IngestMessage::Event { .. } => {
+                    panic!("a raw-frame tape yields only frames")
+                }
             }
         }
         assert_eq!(received.len(), 3);
@@ -608,6 +665,7 @@ mod tests {
             &tx,
             &TestClock::new(),
             Pacing::Realtime { speed: 1e9 },
+            &Symbol::new("BTC-USD"),
         )
         .await
         .expect("replay");

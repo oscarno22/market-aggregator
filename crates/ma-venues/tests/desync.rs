@@ -391,14 +391,18 @@ fn a_truncated_stream_leaves_the_book_stale_rather_than_wrong() {
 
 #[test]
 fn a_malformed_frame_is_an_error_not_a_silent_skip() {
-    use ma_core::{Clock, SystemClock, VenueId};
+    use ma_core::{Clock, StreamId, SystemClock, VenueId};
     use ma_venues::sync::RawFrame;
 
     let mut vb = VenueBook::new(
         Box::new(FakeSync::new(Integrity::Verified)),
         Symbol::new("BTC-USD"),
     );
-    let junk = RawFrame::new(VenueId::Fake, b"{not json".to_vec(), SystemClock.now());
+    let junk = RawFrame::new(
+        StreamId::new(VenueId::Fake, Symbol::new("BTC-USD")),
+        b"{not json".to_vec(),
+        SystemClock.now(),
+    );
 
     assert!(
         vb.feed(&junk).is_err(),

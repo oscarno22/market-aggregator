@@ -12,7 +12,7 @@
 use ma_core::{DesyncReason, EventKind, Integrity, Level, VenueId};
 use serde::Deserialize;
 
-use crate::sync::{RecoveryStrategy, SyncAction, VenueError, VenueSync};
+use crate::sync::{Ingested, RecoveryStrategy, SyncAction, VenueError, VenueSync};
 
 use super::common;
 
@@ -20,6 +20,13 @@ use super::common;
 struct Envelope {
     channel: String,
     sequence_num: u64,
+    /// Coinbase's own clock, RFC 3339. Reported as skew, never trusted for
+    /// ordering — see `docs/DESIGN.md` §6. Optional and untyped-until-parsed
+    /// for the same reason every other field here is: a venue dropping or
+    /// reformatting a decorative field must not fail the frame that carries
+    /// the book.
+    #[serde(default)]
+    timestamp: Option<String>,
     #[serde(default)]
     events: Vec<serde_json::Value>,
 }
@@ -138,9 +145,14 @@ impl VenueSync for CoinbaseSync {
         self.expected_seq = None;
     }
 
-    fn ingest(&mut self, frame: &crate::sync::RawFrame) -> Result<Vec<SyncAction>, VenueError> {
+    fn ingest(&mut self, frame: &crate::sync::RawFrame) -> Result<Ingested, VenueError> {
         let envelope: Envelope = serde_json::from_slice(&frame.payload)
             .map_err(|e| VenueError::Malformed(e.to_string()))?;
+
+        let venue_ts = envelope
+            .timestamp
+            .as_deref()
+            .and_then(common::parse_rfc3339);
 
         // `sequence_num` counts every message on the *connection*, not the
         // messages on any one channel, so the check has to happen before the
@@ -160,10 +172,10 @@ impl VenueSync for CoinbaseSync {
         // produced, because a fixture author writes the messages they are
         // thinking about.
         if let Some(reason) = self.check_seq(envelope.sequence_num) {
-            return Ok(vec![SyncAction::Desync(reason)]);
+            return Ok(Ingested::untimed(vec![SyncAction::Desync(reason)]).at(venue_ts));
         }
 
-        match envelope.channel.as_str() {
+        let actions = match envelope.channel.as_str() {
             "l2_data" => {
                 let mut actions = Vec::with_capacity(envelope.events.len());
                 for raw in envelope.events {
@@ -185,7 +197,7 @@ impl VenueSync for CoinbaseSync {
                         L2Kind::Update => SyncAction::Delta { bids, asks },
                     });
                 }
-                Ok(actions)
+                actions
             }
 
             "heartbeats" => {
@@ -197,13 +209,15 @@ impl VenueSync for CoinbaseSync {
                         counter: Some(hb.heartbeat_counter),
                     }));
                 }
-                Ok(actions)
+                actions
             }
 
             // Subscription acks, error frames, and any channel we haven't
             // wired up carry no book content. Out of scope here; the live
             // ingest task (v1/8) is where a subscribe failure gets surfaced.
-            _ => Ok(vec![SyncAction::Ignore]),
-        }
+            _ => vec![SyncAction::Ignore],
+        };
+
+        Ok(Ingested::untimed(actions).at(venue_ts))
     }
 }

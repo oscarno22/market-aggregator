@@ -19,10 +19,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use ma_core::{
-    Book, BookState, Clock, DesyncReason, Integrity, Side, Symbol, SystemClock, VenueId,
+    Book, BookState, Clock, DesyncReason, Integrity, Side, StreamId, Symbol, SystemClock, VenueId,
 };
 use ma_venues::BitstampSync;
-use ma_venues::sync::{RawFrame, VenueBook};
+use ma_venues::sync::{Outcome, RawFrame, VenueBook};
 use ma_venues::venues::bitstamp::parse_rest_snapshot;
 
 macro_rules! fixture {
@@ -44,7 +44,7 @@ fn book() -> VenueBook {
 
 fn frame(json: &str) -> RawFrame {
     RawFrame::new(
-        VenueId::Bitstamp,
+        StreamId::new(VenueId::Bitstamp, Symbol::new("BTC-USD")),
         json.as_bytes().to_vec(),
         SystemClock.now(),
     )
@@ -257,7 +257,7 @@ fn a_rest_body_arriving_as_a_frame_drives_the_splice() {
     );
 
     let rest = RawFrame::rest_snapshot(
-        VenueId::Bitstamp,
+        StreamId::new(VenueId::Bitstamp, Symbol::new("BTC-USD")),
         fixture!("rest_order_book.json").as_bytes().to_vec(),
         SystemClock.now(),
     );
@@ -276,7 +276,11 @@ fn a_rest_body_offered_to_a_resubscribe_venue_is_an_error() {
         Box::new(ma_venues::KrakenSync::new("BTC/USD")),
         Symbol::new("BTC-USD"),
     );
-    let rest = RawFrame::rest_snapshot(VenueId::Kraken, b"{}".to_vec(), SystemClock.now());
+    let rest = RawFrame::rest_snapshot(
+        StreamId::new(VenueId::Kraken, Symbol::new("BTC-USD")),
+        b"{}".to_vec(),
+        SystemClock.now(),
+    );
     assert!(vb.feed(&rest).is_err());
 }
 
@@ -313,4 +317,41 @@ fn a_mid_stream_rest_audit_re_anchors_without_a_buffer_to_splice() {
             );
         }
     }
+}
+
+#[test]
+fn the_ordering_field_and_the_venue_clock_are_the_same_number() {
+    // Bitstamp is the one venue where these coincide: `microtimestamp` is both
+    // the only ordering signal it offers and its wall clock. That coincidence
+    // is exactly what `Integrity::OrderOnly` names -- ordering by a clock is
+    // all this venue makes possible, and it cannot detect a hole.
+    let mut vb = book();
+    vb.feed(&frame(fixture!("diff_before_snapshot.json")))
+        .unwrap();
+    let rest = RawFrame::rest_snapshot(
+        StreamId::new(VenueId::Bitstamp, Symbol::new("BTC-USD")),
+        fixture!("rest_order_book.json").as_bytes().to_vec(),
+        SystemClock.now(),
+    );
+    vb.feed(&rest).unwrap();
+
+    let outcomes = vb
+        .feed(&frame(fixture!("diff_after_snapshot.json")))
+        .unwrap();
+    let venue_ts = outcomes
+        .iter()
+        .find_map(|o| match o {
+            Outcome::Event(e) => e.venue_ts,
+            Outcome::StateChanged { .. } => None,
+        })
+        .expect("bitstamp stamps every diff");
+
+    let micros = venue_ts
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("post-epoch")
+        .as_micros();
+    assert_eq!(
+        micros, 1_700_000_000_200_000,
+        "the fixture's microtimestamp"
+    );
 }
