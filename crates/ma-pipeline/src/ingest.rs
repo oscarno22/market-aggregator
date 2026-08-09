@@ -369,6 +369,12 @@ impl<N: Network> Ingest<N> {
         tokio::pin!(rest);
         let mut rest_pending = true;
 
+        // Runs for the life of the session, unlike the one-shot fetch above.
+        // Scoped to the session on purpose: a reconnect produces a fresh book,
+        // and evidence gathered about the previous one does not apply to it.
+        let audit = self.audit_loop();
+        tokio::pin!(audit);
+
         let mut shutdown = self.shutdown.clone();
 
         loop {
@@ -391,6 +397,12 @@ impl<N: Network> Ingest<N> {
 
                 () = &mut rest, if rest_pending => {
                     rest_pending = false;
+                }
+
+                () = &mut audit => {
+                    // Only reachable for a venue with no audit configured,
+                    // where the future is `pending()` and never resolves.
+                    unreachable!("the audit loop does not terminate")
                 }
 
                 received = tokio::time::timeout(self.endpoint.idle_timeout, socket.recv()) => {
@@ -421,6 +433,59 @@ impl<N: Network> Ingest<N> {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Periodically re-fetch depth and hand it downstream to be *compared*
+    /// against the book, not applied to it.
+    ///
+    /// # Why this lives in the ingest task and the comparison does not
+    ///
+    /// Same split as everything else here: the ingest task owns the network, so
+    /// it is the only thing that can make the request; the aggregator owns the
+    /// books, so it is the only thing that can compare one. The body therefore
+    /// travels as a [`RawFrame`] tagged
+    /// [`FrameSource::RestAudit`](ma_venues::FrameSource::RestAudit), through
+    /// the same channel as everything else.
+    ///
+    /// That also means an audit lands on a **tape**, so a recorded session
+    /// replays its audits too — the drift they detect is reproducible offline
+    /// rather than being a live-only phenomenon nobody can debug.
+    ///
+    /// A failed fetch is counted and otherwise ignored. The audit is a check,
+    /// not a dependency: a book that cannot currently be checked is in exactly
+    /// the state it was in before v2, and saying so through
+    /// `audit_failures_total` is more useful than reacting to it.
+    async fn audit_loop(&self) {
+        let Some(audit) = self.endpoint.rest_audit.as_ref() else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        let venue = self.stream.clone();
+        let mut ticker = tokio::time::interval(audit.interval);
+        // `interval` fires immediately; skip that one. At startup the book is
+        // usually not live yet — Bitstamp is still awaiting its first REST
+        // snapshot — so an immediate audit would be a request that could only
+        // ever be discarded.
+        ticker.tick().await;
+
+        loop {
+            ticker.tick().await;
+            self.counters.record_audit_fetch();
+            match self.net.get(&audit.url).await {
+                Ok(body) => {
+                    debug!(%venue, bytes = body.len(), "depth audit fetched");
+                    let frame =
+                        RawFrame::rest_audit(self.stream(), body.into_bytes(), self.clock.now());
+                    if !self.emit(frame) {
+                        std::future::pending::<()>().await;
+                    }
+                }
+                Err(e) => {
+                    self.counters.record_audit_failure();
+                    warn!(%venue, url = %audit.url, error = %e, "depth audit fetch failed");
                 }
             }
         }

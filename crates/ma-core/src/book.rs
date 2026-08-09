@@ -70,6 +70,16 @@ pub enum DesyncReason {
     ConnectionLost,
     /// Resync in progress: buffering deltas, waiting on a snapshot.
     AwaitingSnapshot,
+    /// A periodic REST depth audit disagreed with our book, repeatedly.
+    ///
+    /// The only loss signal available to a venue that publishes no checksum
+    /// and — for Bitstamp — no sequence number either. `consecutive` is
+    /// carried because a single disagreement is not evidence: the fetch races
+    /// the stream, so one finding may be timing. See [`crate::audit`].
+    AuditMismatch {
+        price: crate::price::Price,
+        consecutive: u32,
+    },
     /// The buffered deltas did not join onto the snapshot cleanly. Everything
     /// is discarded and the resync restarts.
     SnapshotGap,

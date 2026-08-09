@@ -13,8 +13,8 @@ use std::fmt;
 use std::time::SystemTime;
 
 use ma_core::{
-    Book, DesyncReason, EventKind, IngestTime, Integrity, Level, MarketEvent, StreamId, Symbol,
-    VenueId,
+    AuditPolicy, AuditTrail, Book, DesyncReason, EventKind, IngestTime, Integrity, Level,
+    MarketEvent, StreamId, Symbol, VenueId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +37,17 @@ pub enum FrameSource {
     /// The body of an out-of-band REST depth request, for a
     /// [`RecoveryStrategy::RestSnapshot`] venue.
     RestSnapshot,
+    /// The body of a **periodic** REST depth request, fetched to check a book
+    /// we already trust rather than to build one.
+    ///
+    /// Distinct from [`Self::RestSnapshot`] because the two do opposite
+    /// things with the same bytes. A snapshot *replaces* the book and is how
+    /// Bitstamp recovers; an audit *compares* against it and leaves the book
+    /// alone. Collapsing them would mean every audit silently repaired the
+    /// drift it was supposed to detect — the book would look healthy forever
+    /// and the one question the audit exists to answer, "did we drift?", could
+    /// never be asked. See [`ma_core::audit`].
+    RestAudit,
 }
 
 /// Bytes as they came off the wire, before anything was parsed.
@@ -79,6 +90,19 @@ impl RawFrame {
         }
     }
 
+    /// A periodic REST depth response, to be compared against the book rather
+    /// than applied to it.
+    pub fn rest_audit(
+        stream: StreamId,
+        payload: impl Into<Vec<u8>>,
+        ingest_ts: IngestTime,
+    ) -> Self {
+        Self {
+            source: FrameSource::RestAudit,
+            ..Self::new(stream, payload, ingest_ts)
+        }
+    }
+
     /// A REST depth response, to be spliced rather than parsed as a diff.
     pub fn rest_snapshot(
         stream: StreamId,
@@ -111,6 +135,7 @@ impl fmt::Debug for RawFrame {
         let source = match self.source {
             FrameSource::WebSocket => "",
             FrameSource::RestSnapshot => ", rest",
+            FrameSource::RestAudit => ", audit",
         };
         match std::str::from_utf8(&self.payload) {
             Ok(s) => write!(f, "RawFrame({}{source}, {s:?})", self.stream),
@@ -320,6 +345,8 @@ pub trait VenueSync: fmt::Debug + Send {
 pub struct VenueBook {
     sync: Box<dyn VenueSync>,
     book: Book,
+    audit_policy: AuditPolicy,
+    audit_trail: AuditTrail,
 }
 
 /// Something worth telling the rest of the system about.
@@ -351,7 +378,25 @@ pub enum Outcome {
 impl VenueBook {
     pub fn new(sync: Box<dyn VenueSync>, symbol: Symbol) -> Self {
         let book = Book::new(sync.venue(), symbol);
-        Self { sync, book }
+        Self {
+            sync,
+            book,
+            audit_policy: AuditPolicy::DEFAULT,
+            audit_trail: AuditTrail::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_audit_policy(mut self, policy: AuditPolicy) -> Self {
+        self.audit_policy = policy;
+        self
+    }
+
+    /// Lifetime audit totals: how many comparisons ran, and how many
+    /// disagreed. The audit's primary output is this pair, not the desync —
+    /// see [`ma_core::audit`] on why a single finding is not evidence.
+    pub fn audit_trail(&self) -> AuditTrail {
+        self.audit_trail
     }
 
     /// This book's subscription identity.
@@ -386,7 +431,51 @@ impl VenueBook {
     /// book until a fresh snapshot lands.
     pub fn reset(&mut self, at: IngestTime) {
         self.sync.reset();
+        // The book that failed an audit is gone; the case against it does not
+        // carry over to its replacement. Lifetime totals survive, because they
+        // are a record of what happened rather than evidence about the book
+        // that exists now.
+        self.audit_trail.reset();
         self.book.mark_desynced(DesyncReason::ConnectionLost, at);
+    }
+
+    /// Compare the book against a periodically-fetched REST snapshot.
+    ///
+    /// This is the **only** independent evidence available for Coinbase and
+    /// Bitstamp: Kraken hashes our book on every message, and the other two
+    /// hash nothing at all. See [`ma_core::audit`] for why a single
+    /// disagreement is treated as noise and a repeated one as proof.
+    ///
+    /// Auditing a book that is not live is skipped rather than reported. A
+    /// desynced book is *expected* to disagree — it is mid-recovery — and
+    /// counting that as a finding would manufacture the evidence the audit is
+    /// supposed to be gathering. Same argument as [`Self::verify`] refusing to
+    /// checksum a book that does not exist.
+    pub fn audit(&mut self, snapshot: &RestSnapshot, at: IngestTime) -> Vec<Outcome> {
+        if !self.book.state().is_live() {
+            return Vec::new();
+        }
+
+        let before = self.book.state();
+        let outcome = ma_core::audit(
+            &self.book,
+            &snapshot.bids,
+            &snapshot.asks,
+            self.audit_policy,
+        );
+
+        if let Some(reason) = self.audit_trail.observe(outcome, self.audit_policy) {
+            self.book.mark_desynced(reason, at);
+        }
+
+        let after = self.book.state();
+        if before == after {
+            return Vec::new();
+        }
+        vec![Outcome::StateChanged {
+            from: before,
+            to: after,
+        }]
     }
 
     /// Feed one frame; apply whatever it implies.
@@ -401,6 +490,10 @@ impl VenueBook {
             FrameSource::RestSnapshot => {
                 let snapshot = self.sync.parse_rest_snapshot(frame.as_str()?)?;
                 Ingested::untimed(self.sync.apply_rest_snapshot(snapshot))
+            }
+            FrameSource::RestAudit => {
+                let snapshot = self.sync.parse_rest_snapshot(frame.as_str()?)?;
+                return Ok(self.audit(&snapshot, frame.ingest_ts));
             }
         };
         Ok(self.apply_ingested(ingested, frame.ingest_ts))

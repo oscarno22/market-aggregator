@@ -44,6 +44,8 @@ pub struct VenueCounters {
     dropped: AtomicU64,
     rest_fetches: AtomicU64,
     rest_failures: AtomicU64,
+    audit_fetches: AtomicU64,
+    audit_failures: AtomicU64,
     parse_errors: AtomicU64,
     heartbeats: AtomicU64,
     desyncs: AtomicU64,
@@ -70,6 +72,8 @@ counter! {
     dropped => record_drop,
     rest_fetches => record_rest_fetch,
     rest_failures => record_rest_failure,
+    audit_fetches => record_audit_fetch,
+    audit_failures => record_audit_failure,
     parse_errors => record_parse_error,
     heartbeats => record_heartbeat,
     desyncs => record_desync,
@@ -97,6 +101,8 @@ impl VenueCounters {
             dropped: load(&self.dropped),
             rest_fetches: load(&self.rest_fetches),
             rest_failures: load(&self.rest_failures),
+            audit_fetches: load(&self.audit_fetches),
+            audit_failures: load(&self.audit_failures),
             parse_errors: load(&self.parse_errors),
             heartbeats: load(&self.heartbeats),
             desyncs: load(&self.desyncs),
@@ -129,6 +135,14 @@ pub struct VenueCountersSnapshot {
     pub dropped: u64,
     pub rest_fetches: u64,
     pub rest_failures: u64,
+    /// Periodic depth-audit requests issued, and how many never came back.
+    ///
+    /// Separate from `rest_fetches`, which counts the *recovery* fetch that
+    /// builds a Bitstamp book. These two use the same protocol and mean
+    /// entirely different things: a failing recovery fetch means a book that
+    /// cannot start, a failing audit means a book that cannot be checked.
+    pub audit_fetches: u64,
+    pub audit_failures: u64,
     /// Frames the venue's parser rejected. Non-zero means the venue changed
     /// its wire format, or we misread it — the drift that risk register #2
     /// says tape fixtures exist to catch.

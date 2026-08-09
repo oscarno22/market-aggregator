@@ -134,6 +134,14 @@ pub struct VenueView {
     /// Age of the last matching checksum. Only ever set for Kraken; a
     /// `Verified` book whose last check is minutes old is not really verified.
     pub last_verified_ms: Option<u64>,
+    /// Periodic depth audits run against this book, and how many disagreed.
+    ///
+    /// The audit's primary output. A desync only follows repeated findings —
+    /// see [`ma_core::audit`] — so a climbing `audit_mismatches` with a still-
+    /// `live` book is the interesting reading: the book is drifting in a way
+    /// no single comparison has been able to prove.
+    pub audits: u64,
+    pub audit_mismatches: u64,
     /// Levels *held* per side, `[bids, asks]` — the full book, not the
     /// truncated ladder above. On Coinbase this is routinely five figures
     /// while `bids.len()` is ten, and the gap between the two numbers is the
@@ -548,6 +556,7 @@ impl Aggregator {
             state.previous = counters;
 
             let status = state.status();
+            let trail = state.book.audit_trail();
             let book = state.book.book();
             let top = book.top_of_book(now);
             let (held_bids, held_asks) = book.depth();
@@ -581,6 +590,8 @@ impl Aggregator {
                     asks: book.top_levels(Side::Ask, depth_levels),
                     spread: top.spread().map(|d| d.to_string()),
                     mid: top.mid().map(|d| d.to_string()),
+                    audits: trail.audits,
+                    audit_mismatches: trail.mismatches,
                     age_ms: top.age.map(millis),
                     status_for_ms: millis(now.since(state.status_since)),
                     desynced_total_ms: millis(state.desynced_total(now)),
@@ -639,6 +650,9 @@ fn describe(reason: DesyncReason) -> String {
         } => format!("timestamps went backwards: after {last_micros}, got {got_micros}"),
         DesyncReason::CrossedBook { best_bid, best_ask } => {
             format!("crossed book: bid {best_bid} >= ask {best_ask}")
+        }
+        DesyncReason::AuditMismatch { price, consecutive } => {
+            format!("depth audit disagreed at {price}, {consecutive} audits running")
         }
         DesyncReason::ConnectionLost => "connection lost".to_owned(),
         DesyncReason::AwaitingSnapshot => "awaiting a REST depth snapshot".to_owned(),

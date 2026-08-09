@@ -275,6 +275,7 @@ impl TapedFrame {
         IngestMessage::Frame(match self.source {
             FrameSource::WebSocket => RawFrame::new(stream, self.payload, at),
             FrameSource::RestSnapshot => RawFrame::rest_snapshot(stream, self.payload, at),
+            FrameSource::RestAudit => RawFrame::rest_audit(stream, self.payload, at),
         })
     }
 }

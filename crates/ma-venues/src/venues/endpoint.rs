@@ -39,6 +39,14 @@ use crate::venues::{BitstampSync, CoinbaseSync, KrakenSync};
 /// the same object.
 const KRAKEN_DEPTH: usize = 10;
 
+/// Levels per side to request for a periodic audit.
+///
+/// Matches [`AuditPolicy::depth`](ma_core::AuditPolicy::depth): asking for less
+/// than we compare would make every audit inconclusive past the response's
+/// depth, and asking for much more would pay for levels the comparison window
+/// discards.
+const AUDIT_DEPTH: usize = 50;
+
 /// Everything needed to open and drive one venue connection, as plain data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VenueEndpoint {
@@ -57,6 +65,35 @@ pub struct VenueEndpoint {
     /// socket is still open. See [`VenueEndpoint::idle_timeout`]'s per-venue
     /// values in [`spec_for`] for why they differ.
     pub idle_timeout: Duration,
+    /// Where to GET a depth snapshot for the **periodic audit**, and how often.
+    ///
+    /// `None` means this venue is not audited. Exactly one venue is not, and
+    /// the reason is worth stating: Kraken hashes the book we actually built
+    /// and sends the hash with *every message*. A REST comparison four times an
+    /// hour would be strictly weaker evidence than what it already provides
+    /// continuously, at the cost of extra requests to a venue that rate-limits.
+    /// Auditing it would be ceremony.
+    ///
+    /// The other two publish nothing that checks our book at all, which is what
+    /// makes this the only independent evidence available for either. See
+    /// [`ma_core::audit`].
+    pub rest_audit: Option<RestAudit>,
+}
+
+/// The periodic depth check for one venue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestAudit {
+    pub url: String,
+    /// How often to fetch.
+    ///
+    /// Deliberately slow. Every venue here rate-limits, the audit competes with
+    /// nothing else for that budget but should not have to, and the failure it
+    /// detects — a lost delta deep in the book — persists indefinitely once it
+    /// happens. There is no benefit to finding it in five seconds rather than
+    /// sixty, and a real cost to asking sixty times as often.
+    pub interval: Duration,
+    /// Comparison strictness. See [`AuditPolicy`](ma_core::AuditPolicy).
+    pub policy: ma_core::AuditPolicy,
 }
 
 /// An endpoint paired with the sync state machine that understands what comes
@@ -135,6 +172,18 @@ pub fn spec_for(venue: VenueId, symbol: &Symbol) -> Result<VenueSpec, VenueError
                 // Heartbeats arrive every second, so 15s of total silence is
                 // 15 missed heartbeats — dead, not quiet.
                 idle_timeout: Duration::from_secs(15),
+                // `GapDetectable` catches a *lost message* and nothing else.
+                // A delta applied to the wrong side, or a level our own code
+                // dropped, leaves the sequence perfectly contiguous. This is
+                // the only thing that would ever notice.
+                rest_audit: Some(RestAudit {
+                    url: format!(
+                        "https://api.coinbase.com/api/v3/brokerage/market/product_book\
+                         ?product_id={native}&limit={AUDIT_DEPTH}"
+                    ),
+                    interval: Duration::from_secs(60),
+                    policy: ma_core::AuditPolicy::DEFAULT,
+                }),
             },
             sync: Box::new(CoinbaseSync::new(native)),
             symbol: symbol.clone(),
@@ -152,6 +201,11 @@ pub fn spec_for(venue: VenueId, symbol: &Symbol) -> Result<VenueSpec, VenueError
                 // Kraken sends its own heartbeat channel roughly every second
                 // to any connection holding a subscription.
                 idle_timeout: Duration::from_secs(15),
+                // Not audited, and this is the interesting `None`. See
+                // `VenueEndpoint::rest_audit`: a book checksummed against the
+                // venue's own hash on every single message has stronger
+                // evidence than a periodic REST comparison could ever add.
+                rest_audit: None,
             },
             sync: Box::new(KrakenSync::new(native)),
             symbol: symbol.clone(),
@@ -176,6 +230,15 @@ pub fn spec_for(venue: VenueId, symbol: &Symbol) -> Result<VenueSpec, VenueError
                 // to be careful about which pairs get added at v2's
                 // multi-symbol step.
                 idle_timeout: Duration::from_secs(30),
+                // The venue that needs this most. `OrderOnly` means a dropped
+                // diff leaves no trace whatsoever in the protocol, so without
+                // an audit a Bitstamp book can be wrong indefinitely while
+                // every counter reports health.
+                rest_audit: Some(RestAudit {
+                    url: format!("https://www.bitstamp.net/api/v2/order_book/{native}/"),
+                    interval: Duration::from_secs(60),
+                    policy: ma_core::AuditPolicy::DEFAULT,
+                }),
             },
             sync: Box::new(BitstampSync::new(format!("diff_order_book_{native}"))),
             symbol: symbol.clone(),
@@ -275,6 +338,97 @@ mod tests {
                 "{venue}'s REST url and its recovery strategy disagree"
             );
         }
+    }
+
+    #[test]
+    fn the_two_venues_that_prove_nothing_about_our_book_are_the_audited_ones() {
+        // The audit is the only independent evidence Coinbase and Bitstamp can
+        // ever produce. Kraken already hashes the book we built, on every
+        // message — auditing it would be strictly weaker evidence bought with
+        // extra requests to a venue that rate-limits.
+        assert!(spec(VenueId::Coinbase).endpoint.rest_audit.is_some());
+        assert!(spec(VenueId::Bitstamp).endpoint.rest_audit.is_some());
+        assert!(
+            spec(VenueId::Kraken).endpoint.rest_audit.is_none(),
+            "a continuously checksum-verified book does not need a periodic \
+             REST comparison"
+        );
+
+        for venue in [VenueId::Coinbase, VenueId::Bitstamp] {
+            let spec = spec(venue);
+            let audit = spec.endpoint.rest_audit.expect("audited");
+            assert!(
+                audit.url.starts_with("https://"),
+                "{venue} audit is not TLS"
+            );
+            assert!(
+                audit.url.contains(&native_symbol(venue, &sym()).unwrap()),
+                "{venue} audit url does not name the symbol: {}",
+                audit.url
+            );
+            // Requesting less depth than the comparison window would make
+            // every audit inconclusive past the response's depth.
+            assert!(
+                audit.policy.depth <= AUDIT_DEPTH,
+                "{venue} compares deeper than it fetches"
+            );
+            assert!(
+                audit.policy.guard < audit.policy.depth,
+                "{venue}'s guard band swallows the whole window"
+            );
+            assert!(
+                audit.interval >= Duration::from_secs(30),
+                "{venue} audits often enough to matter to a rate limiter"
+            );
+        }
+    }
+
+    #[test]
+    fn an_audited_venue_can_parse_the_body_it_will_be_sent() {
+        // The same class of coupling as `subscribing_and_parsing_agree_on_the
+        // _channel`: an audit URL whose response this venue cannot parse
+        // produces a parse error every interval, forever, and never audits
+        // anything. Both bodies below are trimmed captures of the real
+        // responses.
+        let cases: [(VenueId, &str); 2] = [
+            (
+                VenueId::Coinbase,
+                r#"{"pricebook":{"product_id":"BTC-USD","bids":[{"price":"64740.08","size":"0.41225831"}],"asks":[{"price":"64740.09","size":"0.18759049"}],"time":"2026-08-09T03:47:11.486806Z"}}"#,
+            ),
+            (
+                VenueId::Bitstamp,
+                r#"{"timestamp":"1786278896","microtimestamp":"1786278896123456","bids":[["64740.08","0.41225831"]],"asks":[["64740.09","0.18759049"]]}"#,
+            ),
+        ];
+
+        for (venue, body) in cases {
+            let spec = spec(venue);
+            let parsed = spec
+                .sync
+                .parse_rest_snapshot(body)
+                .unwrap_or_else(|e| panic!("{venue} cannot parse its own audit body: {e}"));
+            assert_eq!(parsed.bids.len(), 1, "{venue} lost the bid side");
+            assert_eq!(parsed.asks.len(), 1, "{venue} lost the ask side");
+            // Exact digits, not f64 round trips — the whole reason `Price`
+            // wraps `Decimal`.
+            assert_eq!(parsed.bids[0].price.to_string(), "64740.08");
+            assert_eq!(parsed.bids[0].qty.to_string(), "0.41225831");
+        }
+    }
+
+    #[test]
+    fn coinbase_can_read_a_rest_book_but_still_cannot_recover_with_one() {
+        // Parsing the wire shape and being able to splice it are different
+        // capabilities, and Coinbase has only the first. Its REST response
+        // carries no ordering marker, and `sequence_num` is connection-scoped,
+        // so there is no position at which a splice could join. The audit
+        // compares and never applies.
+        let spec = spec(VenueId::Coinbase);
+        assert_eq!(spec.sync.recovery(), crate::RecoveryStrategy::Resubscribe);
+        assert!(
+            spec.endpoint.rest_snapshot_url.is_none(),
+            "a resubscribe venue must not carry a recovery REST url"
+        );
     }
 
     #[test]

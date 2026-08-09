@@ -219,9 +219,22 @@ async fn metrics(State(handle): State<PipelineHandle>) -> impl IntoResponse {
     );
     metric(
         "rest_failures_total",
-        "Failed REST depth snapshot fetches.",
+        "Failed REST depth snapshot fetches (recovery, not audit).",
         "counter",
         &per_stream(|c| c.rest_failures),
+    );
+    metric(
+        "audit_fetches_total",
+        "Periodic REST depth audits requested.",
+        "counter",
+        &per_stream(|c| c.audit_fetches),
+    );
+    metric(
+        "audit_failures_total",
+        "Periodic depth audits that could not be fetched. A book that cannot be \
+         checked, which is not the same as a book that failed a check.",
+        "counter",
+        &per_stream(|c| c.audit_failures),
     );
 
     // Book age and time-in-desync live on the aggregator's snapshot rather
@@ -260,6 +273,28 @@ async fn metrics(State(handle): State<PipelineHandle>) -> impl IntoResponse {
             out.push_str(&format!(
                 "ma_book_live{{venue=\"{}\",symbol=\"{symbol}\"}} {live}\n",
                 v.venue
+            ));
+        }
+        out.push_str(
+            "# HELP ma_audits_total Depth audits compared against a live book.\n\
+             # TYPE ma_audits_total counter\n",
+        );
+        for (symbol, v) in snapshot.views() {
+            out.push_str(&format!(
+                "ma_audits_total{{venue=\"{}\",symbol=\"{symbol}\"}} {}\n",
+                v.venue, v.audits
+            ));
+        }
+        out.push_str(
+            "# HELP ma_audit_mismatches_total Depth audits that disagreed with our book. \
+             The drift signal for venues that publish no checksum; a single mismatch is \
+             expected noise, a climbing count is not.\n\
+             # TYPE ma_audit_mismatches_total counter\n",
+        );
+        for (symbol, v) in snapshot.views() {
+            out.push_str(&format!(
+                "ma_audit_mismatches_total{{venue=\"{}\",symbol=\"{symbol}\"}} {}\n",
+                v.venue, v.audit_mismatches
             ));
         }
         out.push_str(

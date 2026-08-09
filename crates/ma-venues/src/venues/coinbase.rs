@@ -12,7 +12,7 @@
 use ma_core::{DesyncReason, EventKind, Integrity, Level, VenueId};
 use serde::Deserialize;
 
-use crate::sync::{Ingested, RecoveryStrategy, SyncAction, VenueError, VenueSync};
+use crate::sync::{Ingested, RecoveryStrategy, RestSnapshot, SyncAction, VenueError, VenueSync};
 
 use super::common;
 
@@ -75,6 +75,68 @@ struct L2Update {
 #[derive(Deserialize)]
 struct HeartbeatEvent {
     heartbeat_counter: u64,
+}
+
+/// `GET /api/v3/brokerage/market/product_book`. Public, unauthenticated, and
+/// — importantly — decimal **strings**, so the exact digits survive.
+#[derive(Deserialize)]
+struct ProductBook {
+    pricebook: PriceBook,
+}
+
+#[derive(Deserialize)]
+struct PriceBook {
+    #[serde(default)]
+    bids: Vec<RestLevel>,
+    #[serde(default)]
+    asks: Vec<RestLevel>,
+}
+
+#[derive(Deserialize)]
+struct RestLevel {
+    price: String,
+    size: String,
+}
+
+/// Parse Coinbase's REST depth response.
+///
+/// # This venue can parse a REST book but cannot recover with one
+///
+/// Coinbase's [`RecoveryStrategy`] is [`RecoveryStrategy::Resubscribe`], and
+/// that does not change: its websocket sends a snapshot on every new
+/// subscription, and splicing a REST body into a live stream would need an
+/// ordering marker to discard what the snapshot already covers — which this
+/// response does not carry. `sequence_num` is connection-scoped, so a REST
+/// body fetched over a *different* connection has no comparable position at
+/// all.
+///
+/// So the two halves of the REST story are deliberately split here:
+/// `parse_rest_snapshot` (the wire shape) is implemented and
+/// `apply_rest_snapshot` (the splice) is not. The parsed body is only ever
+/// used by the periodic audit, which compares and never applies — see
+/// [`FrameSource::RestAudit`](crate::sync::FrameSource::RestAudit).
+pub fn parse_rest_snapshot(body: &str) -> Result<RestSnapshot, VenueError> {
+    let parsed: ProductBook =
+        serde_json::from_str(body).map_err(|e| VenueError::Malformed(e.to_string()))?;
+    let level = |l: &RestLevel| common::level_from_str_pair(&l.price, &l.size);
+    Ok(RestSnapshot {
+        bids: parsed
+            .pricebook
+            .bids
+            .iter()
+            .map(level)
+            .collect::<Result<_, _>>()?,
+        asks: parsed
+            .pricebook
+            .asks
+            .iter()
+            .map(level)
+            .collect::<Result<_, _>>()?,
+        // No ordering marker exists in this response, and none is needed: the
+        // audit compares state, it does not splice. A fabricated one would
+        // imply a splice were possible.
+        as_of: 0,
+    })
 }
 
 /// Sync discipline for one Coinbase product (e.g. `BTC-USD`).
@@ -143,6 +205,13 @@ impl VenueSync for CoinbaseSync {
 
     fn reset(&mut self) {
         self.expected_seq = None;
+    }
+
+    /// Implemented for the periodic audit only. See [`parse_rest_snapshot`]:
+    /// `apply_rest_snapshot` is deliberately left as the refusing default,
+    /// because this venue recovers by resubscribing and has no way to splice.
+    fn parse_rest_snapshot(&self, body: &str) -> Result<RestSnapshot, VenueError> {
+        parse_rest_snapshot(body)
     }
 
     fn ingest(&mut self, frame: &crate::sync::RawFrame) -> Result<Ingested, VenueError> {

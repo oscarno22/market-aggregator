@@ -24,12 +24,14 @@
 //! [`Integrity`] is `Ord`, weakest first, so a combined view can take the
 //! minimum rather than quietly presenting the strongest.
 
+pub mod audit;
 pub mod book;
 pub mod event;
 pub mod price;
 pub mod stream;
 pub mod time;
 
+pub use audit::{AuditFinding, AuditOutcome, AuditPolicy, AuditTrail, audit};
 pub use book::{Book, BookError, BookState, BookStateKind, DesyncReason, Integrity, TopOfBook};
 pub use event::{EventKind, Level, MarketEvent, Side, SkewObservation, Symbol, VenueId};
 pub use price::{ParseError, Price, Qty};
