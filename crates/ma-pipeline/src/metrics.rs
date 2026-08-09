@@ -48,6 +48,7 @@ pub struct VenueCounters {
     audit_failures: AtomicU64,
     parse_errors: AtomicU64,
     heartbeats: AtomicU64,
+    trades: AtomicU64,
     desyncs: AtomicU64,
     applied: AtomicU64,
 }
@@ -76,6 +77,7 @@ counter! {
     audit_failures => record_audit_failure,
     parse_errors => record_parse_error,
     heartbeats => record_heartbeat,
+    trades => record_trade,
     desyncs => record_desync,
     applied => record_applied,
 }
@@ -105,6 +107,7 @@ impl VenueCounters {
             audit_failures: load(&self.audit_failures),
             parse_errors: load(&self.parse_errors),
             heartbeats: load(&self.heartbeats),
+            trades: load(&self.trades),
             desyncs: load(&self.desyncs),
             applied: load(&self.applied),
         }
@@ -148,6 +151,13 @@ pub struct VenueCountersSnapshot {
     /// says tape fixtures exist to catch.
     pub parse_errors: u64,
     pub heartbeats: u64,
+    /// Prints forwarded from this stream's trades channel.
+    ///
+    /// `#[serde(default)]` because the gateway deserialises other nodes'
+    /// snapshots, and a node one release older has no field here — zero is
+    /// exactly what it has to say.
+    #[serde(default)]
+    pub trades: u64,
     /// Times this venue's book went from trusted to untrusted. Distinct from
     /// `disconnects`: a checksum mismatch or a sequence gap desyncs a book on
     /// a connection that never dropped.

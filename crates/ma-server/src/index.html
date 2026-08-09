@@ -91,6 +91,13 @@
   table.windows tr.partial td.cover { color: var(--desync); font-weight: 600; }
   table.windows td.cover { color: var(--muted); }
   .windows-note { font-size: 0.7rem; color: var(--desync); margin: 0.1rem 0 0.6rem; }
+  /* The most recent print. Colored by taker side, aged like everything else. */
+  .last-trade { font-size: 0.78rem; margin: 0.3rem 0; color: var(--muted); }
+  .last-trade .num { color: var(--fg); }
+  .last-trade .trade-side { font-weight: 600; }
+  .last-trade.buy .trade-side { color: var(--live); }
+  .last-trade.sell .trade-side { color: var(--desync); }
+  .last-trade .trade-age { color: var(--muted); }
   tr.bid td:first-child { color: var(--live); }
   tr.touch td { border-top: 1px solid var(--line); padding: 0.1rem 0; }
 
@@ -325,20 +332,23 @@ function windowRows(v) {
         <td class="num">${signed(w.change_bps)}</td>
         <td class="num">${bps(w.range_bps)}</td>
         <td class="num">${bps(w.mean_spread_bps)}</td>
+        <td class="num">${w.trades ?? 0}</td>
+        <td class="num">${w.volume ?? "—"}</td>
         <td class="num cover">${partial ? pct + "%" : "full"}</td>
       </tr>`;
   }).join("");
 
   const note = anyPartial
     ? `<div class="windows-note">A window under 100% covered spans time this book was not
-       trusted, or time before this process started. Its figures describe only the covered
-       part.</div>`
+       trusted, or time before this process started. Its book-derived figures describe only
+       the covered part; trades are counted regardless, because a print is the venue's own
+       fact rather than a claim about our book.</div>`
     : "";
 
   return `
     <table class="windows">
       <thead><tr>
-        <th>window</th><th>Δ bps</th><th>range bps</th><th>spread bps</th><th>covered</th>
+        <th>window</th><th>Δ bps</th><th>range bps</th><th>spread bps</th><th>trades</th><th>volume</th><th>covered</th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>${note}`;
@@ -346,6 +356,19 @@ function windowRows(v) {
 
 function span(ms) {
   return ms % 1000 === 0 ? `${ms / 1000}s` : `${ms}ms`;
+}
+
+// The most recent print. Rendered whatever the book's state, because a trade
+// is the venue's fact about its own matches — but with its age beside it,
+// which on the gateway already includes the node's lag.
+function lastTrade(v) {
+  const t = v.last_trade;
+  if (!t) return "";
+  const side = t.taker_side ? (t.taker_side === "bid" ? "buy" : "sell") : "";
+  return `<div class="last-trade ${side}">Last trade:
+    <span class="num">${t.qty}</span> @ <span class="num">${t.price}</span>
+    ${side ? `<span class="trade-side">${side}</span>` : ""}
+    <span class="trade-age">${ms(t.age_ms)} ago</span></div>`;
 }
 
 function card(v) {
@@ -372,6 +395,7 @@ function card(v) {
       <div><span class="label">Ask</span><span class="value num">${v.ask ? v.ask.price : "—"}</span></div>
       <div><span class="label">Spread</span><span class="value num">${v.spread ?? "—"}</span></div>
     </div>
+    ${lastTrade(v)}
     ${ladder(v)}
     ${windowRows(v)}
     <table>

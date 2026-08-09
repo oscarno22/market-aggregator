@@ -236,7 +236,13 @@ picks the units they are thinking in. Both are why
   high" over a book that spent twenty of those seconds `Desynced` is a
   40-second high wearing a 60-second label. Each reading carries `trusted_ms`
   beside `span_ms` and the weakest `Integrity` it sampled under, and a window
-  with nothing in it is `null` rather than zero.
+  with nothing in it is `null` rather than zero. Trades share the same bucket
+  ring — a second ring would need a second coverage account, and two coverage
+  accounts over one stream will eventually disagree — but are counted whatever
+  the book's state, because a print is the venue's fact about its own matches,
+  not a claim about our book. `vwap` weighs by what traded; `mean` weighs by
+  how often the book moved; the two answer different questions and both are
+  published.
 - **Sharding without consensus, and the two rules that make it safe.** Each
   node writes exactly one key — its own lease — so there is no
   compare-and-swap anywhere and a shared directory is a complete registry.

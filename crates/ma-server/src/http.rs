@@ -226,6 +226,13 @@ async fn metrics(State(handle): State<PipelineHandle>) -> impl IntoResponse {
         &per_stream(|c| c.applied),
     );
     metric(
+        "trades_total",
+        "Prints forwarded from the venue's trades channel. Flat on a liquid pair \
+         means the trade subscription has quietly died while the book stays healthy.",
+        "counter",
+        &per_stream(|c| c.trades),
+    );
+    metric(
         "parse_errors_total",
         "Frames the venue parser rejected. Non-zero suggests venue schema drift.",
         "counter",
@@ -561,12 +568,30 @@ type WindowGauge = (
     fn(&WindowReading) -> Option<String>,
 );
 
-const WINDOW_GAUGES: [WindowGauge; 6] = [
+const WINDOW_GAUGES: [WindowGauge; 9] = [
     (
         "window_samples",
         "Book updates that produced a two-sided mid inside the window. Small with a full \
          ma_window_trusted_ms means a quiet market; small with a small one means no data.",
         |w| Some(w.samples.to_string()),
+    ),
+    (
+        "window_trades",
+        "Prints inside the window. Counted whatever the book's state — a print is the \
+         venue's fact about its own matches, not a claim about our book.",
+        |w| Some(w.trades.to_string()),
+    ),
+    (
+        "window_volume",
+        "Total quantity printed inside the window. Absent when no trade landed: no \
+         data, not zero volume.",
+        |w| w.volume.map(|d| d.to_string()),
+    ),
+    (
+        "window_vwap",
+        "Volume-weighted average price of the window's prints. Compare with \
+         ma_window_mid, which weights by book updates instead of by what traded.",
+        |w| w.vwap.map(|d| d.to_string()),
     ),
     (
         "window_mid",
@@ -827,6 +852,10 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
 
         assert!(text.contains("# TYPE ma_frames_total counter"));
+        assert!(
+            text.contains("# TYPE ma_trades_total counter"),
+            "the trades counter is missing:\n{text}"
+        );
         // Both labels, so a query can aggregate over either axis. A single
         // joined `stream` label would force string surgery in every dashboard.
         assert!(

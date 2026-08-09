@@ -79,7 +79,7 @@ use std::time::Duration;
 use ma_core::{
     BookState, CrossPolicy, DesyncReason, IngestTime, Integrity, Symbol, TopOfBook, VenueId,
 };
-use ma_pipeline::aggregator::{BookStatus, Snapshot, SymbolView, VenueView, cross_view};
+use ma_pipeline::aggregator::{BookStatus, Snapshot, SymbolView, TradeView, VenueView, cross_view};
 use ma_pipeline::channel::ChannelMetrics;
 use serde::Serialize;
 
@@ -386,6 +386,7 @@ pub fn merge(
 /// - `last_verified_ms` — age of Kraken's last matching checksum. A `Verified`
 ///   book whose verification is minutes old is not really verified, and the
 ///   whole point of publishing this is to let a reader notice.
+/// - `last_trade.age_ms` — the print is as stale as the node it came through.
 ///
 /// `desynced_total_ms` is deliberately *not* adjusted: it is a cumulative
 /// total, not an age, and adding lag to it would inflate a counter rather than
@@ -402,6 +403,10 @@ fn aged(view: &VenueView, lag: Duration) -> VenueView {
         age_ms: Some(view.age_ms.map_or(lag_ms, |a| a.saturating_add(lag_ms))),
         status_for_ms: view.status_for_ms.saturating_add(lag_ms),
         last_verified_ms: view.last_verified_ms.map(|v| v.saturating_add(lag_ms)),
+        last_trade: view.last_trade.clone().map(|t| TradeView {
+            age_ms: t.age_ms.saturating_add(lag_ms),
+            ..t
+        }),
         ..view.clone()
     }
 }
@@ -488,6 +493,12 @@ mod tests {
             audit_mismatches: 0,
             levels_held: [10, 10],
             windows: Vec::new(),
+            last_trade: Some(ma_pipeline::aggregator::TradeView {
+                price: "100.5".to_owned(),
+                qty: "0.25".to_owned(),
+                taker_side: None,
+                age_ms: 15,
+            }),
             counters: VenueCountersSnapshot::default(),
             rates: Rates::default(),
         }
@@ -626,6 +637,11 @@ mod tests {
         assert_eq!(
             v.desynced_total_ms, 250,
             "a cumulative total was inflated by lag as though it were an age"
+        );
+        assert_eq!(
+            v.last_trade.as_ref().map(|t| t.age_ms),
+            Some(615),
+            "a print is as stale as the node it came through"
         );
         assert_eq!(merged.snapshot.symbols[0].cross.oldest_leg_ms, Some(640));
     }

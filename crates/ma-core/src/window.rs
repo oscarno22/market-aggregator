@@ -140,10 +140,14 @@ impl Default for WindowSpec {
 
 /// One window's indicators, as of the last completed bucket.
 ///
-/// Every price-derived field is `Option` and every one of them is `None` under
-/// the same condition: no trusted two-sided sample landed in the window. A
-/// caller cannot accidentally read "no data" as zero, which is the mistake
-/// this whole project is organised against.
+/// Every price-derived field is `Option`, and they go `None` under exactly
+/// two conditions, one per source. The book-derived fields (`first` through
+/// `mean_spread_bps`) are `None` when no trusted two-sided sample landed in
+/// the window; the trade-derived ones (`volume`, `vwap`) are `None` when no
+/// print did. The two conditions are independent — a desynced book still
+/// prints trades — and either way a caller cannot accidentally read "no
+/// data" as zero, which is the mistake this whole project is organised
+/// against.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowReading {
     /// The window actually examined: the configured span rounded up to a whole
@@ -174,9 +178,8 @@ pub struct WindowReading {
     /// Arithmetic mean of every sampled mid. Sample-weighted, not
     /// time-weighted: a second with a thousand updates counts a thousand
     /// times. That is the right weighting for "where did the book sit while it
-    /// was moving", and the wrong one for "what was the average price"; the
-    /// distinction is why this is not called `vwap`, which needs trade volume
-    /// this process does not subscribe to.
+    /// was moving", and the wrong one for "what was the average price" —
+    /// that one is `vwap` below, which weights by what actually traded.
     pub mean: Option<Decimal>,
     /// `(last - first) / first`, in basis points. Signed: negative is down.
     pub change_bps: Option<Decimal>,
@@ -192,6 +195,27 @@ pub struct WindowReading {
     /// digit basis points in every normal regime, and in an abnormal one
     /// `range_bps` is already the number being read.
     pub mean_spread_bps: Option<Decimal>,
+    /// Prints observed in the window. Counted whatever the book's state —
+    /// a print is the venue's fact about its own matches, not a claim about
+    /// our book — so a desynced stretch still counts its trades while
+    /// `trusted_ms` honestly labels how much of the *book*-derived numbers
+    /// to believe.
+    ///
+    /// `#[serde(default)]` on all three trade fields because the gateway
+    /// deserialises other nodes' snapshots, and a node one release behind
+    /// simply has no trades to report — which is exactly what zero and
+    /// `None` say.
+    #[serde(default)]
+    pub trades: u64,
+    /// Total quantity printed in the window. `None` when `trades` is zero —
+    /// no data, not zero volume.
+    #[serde(default)]
+    pub volume: Option<Decimal>,
+    /// Volume-weighted average price of the window's prints. The average
+    /// `mean` is deliberately not: weighted by what traded, not by how often
+    /// the book moved.
+    #[serde(default)]
+    pub vwap: Option<Decimal>,
 }
 
 impl WindowReading {
@@ -211,6 +235,9 @@ impl WindowReading {
             change_bps: None,
             range_bps: None,
             mean_spread_bps: None,
+            trades: 0,
+            volume: None,
+            vwap: None,
         }
     }
 
@@ -242,6 +269,12 @@ struct Bucket {
     high: Option<Decimal>,
     low: Option<Decimal>,
     integrity: Option<Integrity>,
+    /// Prints, in the same bucket as the book samples rather than a ring of
+    /// their own: a second ring would need its own coverage accounting, and
+    /// two coverage accounts over one stream will eventually disagree.
+    trades: u64,
+    sum_qty: Decimal,
+    sum_price_qty: Decimal,
     /// Time inside this bucket during which the book was not `Live`.
     untrusted: Duration,
 }
@@ -265,6 +298,12 @@ impl Bucket {
         self.high = Some(self.high.map_or(mid, |h| h.max(mid)));
         self.low = Some(self.low.map_or(mid, |l| l.min(mid)));
         self.integrity = Some(self.integrity.map_or(integrity, |i| i.min(integrity)));
+    }
+
+    fn record_trade(&mut self, price: Decimal, qty: Decimal) {
+        self.trades += 1;
+        self.sum_qty += qty;
+        self.sum_price_qty += price * qty;
     }
 }
 
@@ -354,6 +393,19 @@ impl RollingWindows {
             .record((bid + ask) / Decimal::TWO, ask - bid, integrity);
     }
 
+    /// Fold one print in.
+    ///
+    /// Deliberately independent of book state: a print is the venue's fact
+    /// about its own matches, not a claim about the book we built, so a
+    /// desynced stretch still counts its trades. It does not touch the trust
+    /// clock either — `trusted_ms` keeps describing the *book*-derived
+    /// numbers, which is the reading it was designed to guard.
+    pub fn observe_trade(&mut self, price: Decimal, qty: Decimal, at: IngestTime) {
+        self.charge(at);
+        let idx = self.index_at(at);
+        self.slot_mut(idx).record_trade(price, qty);
+    }
+
     /// Every configured window, in `spec.spans` order.
     ///
     /// Takes `&mut self` because reading advances the trust accounting to
@@ -389,6 +441,8 @@ impl RollingWindows {
         let mut out = WindowReading::empty(span_ms);
         let mut sum_mid = Decimal::ZERO;
         let mut sum_spread = Decimal::ZERO;
+        let mut sum_qty = Decimal::ZERO;
+        let mut sum_price_qty = Decimal::ZERO;
 
         for idx in oldest..=newest {
             // A slot whose index does not match never existed — the process
@@ -401,6 +455,14 @@ impl RollingWindows {
 
             out.trusted_ms += millis(self.spec.resolution.saturating_sub(bucket.untrusted));
 
+            // Trades accumulate before the samples check: a bucket can hold
+            // prints and no book samples — a desynced book still trades —
+            // and gating one source's data on the other's presence would
+            // quietly drop it.
+            out.trades += bucket.trades;
+            sum_qty += bucket.sum_qty;
+            sum_price_qty += bucket.sum_price_qty;
+
             if bucket.samples == 0 {
                 continue;
             }
@@ -412,6 +474,13 @@ impl RollingWindows {
             out.high = max_opt(out.high, bucket.high);
             out.low = min_opt(out.low, bucket.low);
             out.integrity_floor = min_opt(out.integrity_floor, bucket.integrity);
+        }
+
+        if out.trades > 0 {
+            out.volume = Some(sum_qty);
+            if !sum_qty.is_zero() {
+                out.vwap = Some((sum_price_qty / sum_qty).round_dp(MID_SCALE));
+            }
         }
 
         if out.samples == 0 {
@@ -637,6 +706,75 @@ mod tests {
     fn only(readings: Vec<WindowReading>) -> WindowReading {
         assert_eq!(readings.len(), 1);
         readings.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn trades_are_counted_summed_and_vwap_weighted() {
+        let clock = TestClock::new();
+        let mut w = windows(&clock);
+
+        // Two prints in the first bucket: 2 @ 100 and 1 @ 130.
+        w.observe_trade(dec("100"), dec("2"), clock.now());
+        w.observe_trade(dec("130"), dec("1"), clock.now());
+
+        // Let the bucket complete, then read.
+        clock.advance(Duration::from_millis(500));
+        let r = only(w.read(clock.now()));
+
+        assert_eq!(r.trades, 2);
+        assert_eq!(r.volume, Some(dec("3")));
+        // (100*2 + 130*1) / 3 = 110, weighted by quantity — the mid-based
+        // `mean` could never produce this number from these inputs.
+        assert_eq!(r.vwap, Some(dec("110").round_dp(8)));
+    }
+
+    #[test]
+    fn a_window_with_no_trades_has_no_volume_not_zero_volume() {
+        let clock = TestClock::new();
+        let mut w = windows(&clock);
+        w.observe(&live("100", "101", clock.now()), clock.now());
+        clock.advance(Duration::from_millis(500));
+
+        let r = only(w.read(clock.now()));
+        assert!(r.samples > 0, "the book sample must have landed");
+        assert_eq!(r.trades, 0);
+        assert_eq!(r.volume, None, "no prints is no data, not zero volume");
+        assert_eq!(r.vwap, None);
+    }
+
+    #[test]
+    fn trades_expire_with_the_ring_like_everything_else() {
+        let clock = TestClock::new();
+        let mut w = windows(&clock);
+        w.observe_trade(dec("100"), dec("1"), clock.now());
+
+        // Two seconds later the 1s window has aged the print out entirely.
+        clock.advance(Duration::from_secs(2));
+        let r = only(w.read(clock.now()));
+        assert_eq!(r.trades, 0, "a print outlived the window that held it");
+        assert_eq!(r.volume, None);
+    }
+
+    #[test]
+    fn trades_during_untrusted_time_still_count_while_coverage_stays_low() {
+        // The design point: a print is the venue's fact, not a claim about
+        // our book. A desynced stretch counts its trades, and `trusted_ms`
+        // keeps honestly labelling the book-derived numbers.
+        let clock = TestClock::new();
+        let mut w = windows(&clock);
+        w.observe(&desynced(clock.now()), clock.now());
+        clock.advance(Duration::from_millis(250));
+        w.observe_trade(dec("100"), dec("1"), clock.now());
+        clock.advance(Duration::from_millis(750));
+
+        let r = only(w.read(clock.now()));
+        assert_eq!(r.trades, 1, "a desynced book still prints trades");
+        assert_eq!(r.volume, Some(dec("1")));
+        assert_eq!(r.trusted_ms, 0, "counting the print must not invent trust");
+        assert_eq!(
+            r.high, None,
+            "no book-derived number without a trusted sample"
+        );
     }
 
     #[test]

@@ -37,8 +37,8 @@ use std::time::{Duration, SystemTime};
 
 use ma_core::{
     BookState, Clock, CrossLeg, CrossPolicy, DesyncReason, EventKind, IngestTime, Integrity, Level,
-    MarketEvent, RollingWindows, Side, StreamId, Symbol, TopOfBook, VenueId, WindowReading,
-    WindowSpec,
+    MarketEvent, Price, Qty, RollingWindows, Side, StreamId, Symbol, TopOfBook, VenueId,
+    WindowReading, WindowSpec,
 };
 use ma_venues::{Outcome, VenueBook, VenueSpec};
 use serde::{Deserialize, Serialize};
@@ -160,8 +160,29 @@ pub struct VenueView {
     /// for the previous forty seconds has a perfectly healthy `status` and a
     /// 60s window that means almost nothing.
     pub windows: Vec<WindowReading>,
+    /// The most recent print, if this venue's trades channel has produced
+    /// one. `#[serde(default)]` because the gateway deserialises other
+    /// nodes' snapshots and an older node has no field here.
+    #[serde(default)]
+    pub last_trade: Option<TradeView>,
     pub counters: VenueCountersSnapshot,
     pub rates: Rates,
+}
+
+/// The last print, rendered for the wire.
+///
+/// Price and quantity leave as strings for the same reason `spread` and
+/// `mid` do: a JSON number is an `f64` in every browser, and exact digits
+/// that survived three venues' wire formats should not be rounded at the
+/// last hop.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TradeView {
+    pub price: String,
+    pub qty: String,
+    pub taker_side: Option<Side>,
+    /// Time since the print was ingested. An age, so the gateway adds its
+    /// lag to it like every other age — see `gateway`'s `aged`.
+    pub age_ms: u64,
 }
 
 /// Every venue's view of one symbol.
@@ -297,6 +318,10 @@ struct VenueState {
     /// Rolling indicators over this stream's mid. Sampled per applied message,
     /// not per publish tick — see [`RollingWindows::observe`].
     windows: RollingWindows,
+    /// The most recent print and when it was ingested. Age is derived at
+    /// snapshot time, so it keeps growing on a quiet stream rather than
+    /// freezing at whatever it was when the print arrived.
+    last_trade: Option<(Price, Qty, Option<Side>, IngestTime)>,
 }
 
 impl VenueState {
@@ -420,6 +445,7 @@ impl Aggregator {
                         desynced_since: None,
                         status_since: now,
                         windows: RollingWindows::new(window_spec.clone(), now),
+                        last_trade: None,
                     },
                 )
             })
@@ -676,6 +702,21 @@ impl Aggregator {
             if matches!(event.kind, EventKind::Heartbeat { .. }) {
                 state.counters.record_heartbeat();
             }
+            if let EventKind::Trade {
+                price,
+                qty,
+                taker_side,
+            } = event.kind
+            {
+                state.counters.record_trade();
+                state.last_trade = Some((price, qty, taker_side, event.ingest_ts));
+                // Charged to the same ring the book samples use, so trade
+                // and book statistics share one coverage account by
+                // construction — see `RollingWindows::observe_trade`.
+                state
+                    .windows
+                    .observe_trade(price.as_decimal(), qty.as_decimal(), event.ingest_ts);
+            }
             if let Some(sink) = &self.events {
                 // A closed sink means the writer finished or was never
                 // started. Not a reason to stop aggregating — the live book is
@@ -773,6 +814,15 @@ impl Aggregator {
                     last_verified_ms,
                     levels_held: [held_bids, held_asks],
                     windows,
+                    last_trade: state
+                        .last_trade
+                        .as_ref()
+                        .map(|(price, qty, side, at)| TradeView {
+                            price: price.to_string(),
+                            qty: qty.to_string(),
+                            taker_side: *side,
+                            age_ms: millis(now.since(*at)),
+                        }),
                     counters,
                     rates,
                 });
@@ -1590,5 +1640,40 @@ mod tests {
             .await
             .expect("aggregator kept running with no producers")
             .expect("aggregator panicked");
+    }
+
+    #[test]
+    fn a_trade_is_counted_surfaced_and_folded_into_the_windows() {
+        let (mut agg, metrics) = aggregator(&[VenueId::Coinbase]);
+        agg.apply(coinbase(0, "snapshot", "100", "101"));
+
+        // A market_trades update on the same connection, next in sequence.
+        agg.apply(frame(
+            VenueId::Coinbase,
+            r#"{"channel":"market_trades","sequence_num":1,"events":[{"type":"update",
+               "trades":[{"trade_id":"1","product_id":"BTC-USD","price":"100.50",
+                          "size":"0.25","side":"BUY","time":"2026-08-09T00:00:00Z"}]}]}"#,
+        ));
+
+        let snapshot = agg.snapshot(empty_channel());
+        let v = view(&snapshot, VenueId::Coinbase);
+
+        let trade = v.last_trade.expect("the print must surface on the view");
+        assert_eq!(trade.price, "100.50");
+        assert_eq!(trade.qty, "0.25");
+        assert_eq!(trade.taker_side, Some(Side::Bid));
+
+        assert_eq!(v.counters.trades, 1, "the print must be counted");
+        // And the book is exactly what the snapshot built — a print applies
+        // nothing.
+        assert_eq!(v.bid.expect("bid").price.to_string(), "100");
+
+        // The windows saw it too. The in-progress bucket is excluded from
+        // reads, so rather than wait out a bucket here, check the invariant
+        // that matters at this layer: the trade did not corrupt book trust.
+        assert_eq!(v.status, BookStatus::Live);
+
+        let stream = StreamId::new(VenueId::Coinbase, symbol());
+        assert_eq!(metrics.stream(&stream).unwrap().snapshot().trades, 1);
     }
 }
