@@ -1,0 +1,19 @@
+# Where async begins: ingest tasks, reconnect, channels, aggregator, replay.
+[package]
+name = "ma-pipeline"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ma-core = { path = "../ma-core" }
+ma-venues = { path = "../ma-venues" }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

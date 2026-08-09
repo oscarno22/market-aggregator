@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+.env
+.DS_Store
+
+# Recorded tapes are committed (they are test fixtures), but raw uncompressed
+# captures and local parquet output are not.
+/tapes/*.jsonl
+/data/

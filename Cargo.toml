@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ma-core",
+    "crates/ma-venues",
+    "crates/ma-pipeline",
+    "crates/ma-server",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+# The book and sync state machines are where silent wrongness hides. Panicking
+# paths in those crates are bugs, not conveniences.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+float_arithmetic = "warn"
+
+[profile.release]
+debug = 1

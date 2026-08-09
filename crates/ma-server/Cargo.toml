@@ -1,0 +1,16 @@
+[package]
+name = "ma-server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ma-core = { path = "../ma-core" }
+ma-pipeline = { path = "../ma-pipeline" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

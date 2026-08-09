@@ -1,0 +1,29 @@
+# NOTE: this manifest deliberately has no `tokio`, no `reqwest`, no
+# `tokio-tungstenite`, and no I/O of any kind. That absence is the proof of the
+# claim in docs/DESIGN.md that the book and sync logic are unit-testable without
+# a network. It is enforced by the compiler rather than by discipline, and by
+# the `no_async_dependencies` test in tests/manifest.rs.
+#
+# Adding an async dependency here should be treated as a design change, not a
+# convenience.
+[package]
+name = "ma-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rust_decimal = { version = "1", default-features = false, features = ["serde", "std"] }
+# `rc` is for `Symbol(Arc<str>)`. Serde's caveat — that shared pointers are
+# serialised by value, not by identity — is fine here: symbols are compared by
+# content, never by pointer.
+serde = { version = "1", features = ["derive", "rc"] }
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+serde_json = "1"
