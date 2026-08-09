@@ -1,0 +1,10 @@
+{
+  "data": {
+    "timestamp": "1700000000",
+    "microtimestamp": "1700000000180000",
+    "bids": [["59998.00", "0.99000000"]],
+    "asks": []
+  },
+  "channel": "diff_order_book_btcusd",
+  "event": "data"
+}

@@ -1,0 +1,10 @@
+{
+  "data": {
+    "timestamp": "1700000000",
+    "microtimestamp": "1700000000100000",
+    "bids": [["3000.00", "1.00000000"]],
+    "asks": []
+  },
+  "channel": "diff_order_book_ethusd",
+  "event": "data"
+}

@@ -19,7 +19,6 @@ pub mod venues;
 
 pub use fake::{FakeSync, Script, Tape, fake_checksum};
 pub use sync::{
-    Outcome, RawFrame, RecoveryStrategy, RestSnapshot, SyncAction, VenueBook, VenueError,
-    VenueSync,
+    Outcome, RawFrame, RecoveryStrategy, RestSnapshot, SyncAction, VenueBook, VenueError, VenueSync,
 };
-pub use venues::{CoinbaseSync, KrakenSync};
+pub use venues::{BitstampSync, CoinbaseSync, KrakenSync};
