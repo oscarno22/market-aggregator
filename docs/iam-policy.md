@@ -8,9 +8,17 @@ because the policy's *shape* is load-bearing in a way a policy JSON cannot
 say about itself, and because for a while the only copy of it lived in a
 console nobody could diff against.
 
-> **Status: reconstructed** from the policy as widened on 2026-08-09, to be
-> verified against the console during the next Tier-3 run — at which point
-> this caveat comes out.
+> **Status: behaviourally verified, textually reconstructed.** The scoped
+> user cannot read its own policy (`iam:ListUserPolicies` → AccessDenied,
+> which is correct), so the JSON below is reconstructed rather than exported.
+> Every operative claim in it was verified against the live bucket on
+> 2026-08-09: bucket-root listing **denied** (the probe's success condition),
+> `cluster/` list/put/delete **allowed** (a full round trip), `events/`
+> sub-prefix listing **allowed** (the part-number resume ran against it and
+> produced `part-00001` beside `part-00000`), and the S3 registry's
+> `withdraw` **succeeded** where the pre-widening policy refused it. If the
+> console text ever drifts from this file, those four behaviours are the
+> diff that matters.
 
 ```json
 {

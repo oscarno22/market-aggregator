@@ -863,6 +863,16 @@ the caller already warns, counts it against `ma_archive_write_failures_total`,
 and retries the listing on the next append — a transient outage costs a
 bounded, counted gap, exactly like a failed upload.
 
+Proven against real S3 on 2026-08-09: two live runs into the same UTC hour,
+each `SIGTERM`'d, left `part-00000.parquet` (55,562 rows) and
+`part-00001.parquet` (54,469 rows) side by side — the resume's listing passed
+through the real `s3:prefix`-conditioned `ListBucket`, which was risk-listed
+as the one thing only a live run could prove. The same run surfaced an
+operator gotcha worth knowing: the store URI's path and `--archive-prefix`
+*compose*, so `--archive s3://bucket/events` with the default prefix writes
+under `events/events/…`. Pass the bucket root and let the writer add its own
+prefix.
+
 ---
 
 ## 10. What v2 left unproven
@@ -1175,6 +1185,22 @@ Stale records do not accumulate, because a record is named after its node: a
 restarting `node-a` overwrites `node-a.json` rather than adding to it. The
 residue is one dead object per node id that never returns, and one extra
 `GetObject` per renewal for each.
+
+**What the second live run established (2026-08-09, after the policy was
+widened).** Two processes, six live streams, the registry in its own
+`s3://…/cluster` prefix this time:
+
+| | Result |
+|---|---|
+| Scope probe | Bucket-root listing still denied — widening the policy did not loosen the probe's success condition |
+| Assignment | 4 / 2 split, each node's `elsewhere` exactly the other's `owned`, disjoint throughout |
+| Registry | `cluster/node-a.json` + `cluster/node-b.json`, nothing else |
+| `SIGTERM` on node-b | **The withdrawal succeeded**: `node-b.json` deleted from the registry, no refusal in the log, and node-a owned all six streams ~13s after the signal — most of which is node-b's own 5s shutdown budget, not lease arithmetic. Under the old policy the survivor waited out the full `ttl` plus a renewal |
+| `SIGTERM` on node-a | Withdrew its own record on the way out; the registry listing came back empty |
+
+The refused-withdraw finding above is therefore fully historical, exactly as
+§13 now frames it — and the offline `NoDelete` pin keeps the behaviour it
+proved.
 
 Two operational notes. A registry belongs in its own prefix, not inside the
 archive's; the first live run used `events/cluster` only because that day's

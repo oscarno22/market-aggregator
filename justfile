@@ -142,6 +142,10 @@ audit-probe venue="coinbase" symbol="BTC-USD" secs="20":
 # the process can tell a scoped key from a root one.
 
 # Serve, archiving to S3. Needs --features s3 and the acknowledgement above.
+#
+# Pass the BUCKET ROOT, not the events prefix: the URI's path and
+# --archive-prefix (default "events") compose, so `s3://bucket/events` writes
+# under events/events/. Found the embarrassing way on 2026-08-09.
 archive-s3 uri venues="coinbase,kraken,bitstamp" symbols="BTC-USD":
     cargo run -p ma-server --features s3 -- --venues {{venues}} --symbols {{symbols}} --archive {{uri}}
 
