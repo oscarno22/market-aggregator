@@ -22,4 +22,4 @@ pub use sync::{
     Outcome, RawFrame, RecoveryStrategy, RestSnapshot, SyncAction, VenueBook, VenueError,
     VenueSync,
 };
-pub use venues::CoinbaseSync;
+pub use venues::{CoinbaseSync, KrakenSync};

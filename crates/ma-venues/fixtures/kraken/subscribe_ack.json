@@ -1,0 +1,7 @@
+{
+  "method": "subscribe",
+  "result": { "symbol": "BTC/USD", "channel": "book", "depth": 10 },
+  "success": true,
+  "time_in": "2026-08-08T12:00:00.000000Z",
+  "time_out": "2026-08-08T12:00:00.000100Z"
+}

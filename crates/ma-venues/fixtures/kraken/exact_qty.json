@@ -1,0 +1,14 @@
+{
+  "channel": "book",
+  "type": "snapshot",
+  "data": [
+    {
+      "symbol": "BTC/USD",
+      "bids": [
+        { "price": 60000.00, "qty": 0.00100000 }
+      ],
+      "asks": [],
+      "checksum": 0
+    }
+  ]
+}

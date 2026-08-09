@@ -4,7 +4,9 @@
 //! integrity discipline.
 
 pub mod coinbase;
+pub mod kraken;
 
 mod common;
 
 pub use coinbase::CoinbaseSync;
+pub use kraken::KrakenSync;
