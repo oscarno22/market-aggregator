@@ -17,21 +17,38 @@
 //!    if the writer actually confines itself to one.
 //! 3. **Reaching S3 has to be asserted, not defaulted into.**
 //!    [`S3Store::connect`] refuses to start unless `MA_S3_ACK_SCOPED_IAM=1`.
+//! 4. **The scoping is *verified*, not merely asserted.** Before returning a
+//!    usable store, [`S3Store::connect`] asks S3 to list the bucket *outside*
+//!    the configured prefix. Correctly scoped credentials are denied. If the
+//!    call succeeds, the credentials can address more than the prefix they
+//!    were given and the process refuses to start.
 //!
-//! Point 3 deserves to be described accurately rather than flatteringly: this
-//! code **cannot tell a scoped IAM user's credentials from a root user's**.
-//! Both are `AKIA…` access keys and nothing available to the process
-//! distinguishes them. So the interlock does not verify the scoping — it
-//! requires an operator to state that they have done it. That is a weak
-//! control and is not pretending to be more.
+//! Point 4 replaced a weaker claim, and the history is worth keeping. This
+//! module used to say that nothing in the process could distinguish a scoped
+//! IAM user's credentials from the root account's — both arrive as `AKIA…`
+//! keys and the SDK will not say which is which — so point 3 was the whole of
+//! the control and was honestly described as weak.
 //!
-//! It is still worth having, because the failure the rule in CLAUDE.md is
-//! actually about is not a malicious operator. It is a long-running ingest
-//! process quietly inheriting whatever credentials were in the environment,
-//! and nobody noticing until something is overwritten. An interlock turns that
-//! from a default into a decision.
+//! That was true about the *credentials* and false about the *question*. The
+//! rule does not actually care who the principal is; it cares whether this
+//! process can reach outside its prefix. **That is answerable, by asking.** A
+//! single `ListObjectsV2` at the bucket root separates the two cases exactly:
+//! root gets `200`, a prefix-scoped user gets `AccessDenied`.
 //!
-//! None of this makes the IAM policy correct — only an IAM policy does that.
+//! It also answers the better question. A root key with a bucket policy that
+//! confines it passes, correctly — because it *is* confined — and a scoped
+//! user whose policy is wider than intended fails, which an ARN check would
+//! have waved through.
+//!
+//! What was actually being prevented was never a malicious operator. It was a
+//! long-running ingest process quietly inheriting whatever credentials were in
+//! the environment, and nobody noticing until something got overwritten. That
+//! is now caught at startup rather than trusted.
+//!
+//! The limits, stated: this proves the credentials cannot *list* outside the
+//! prefix. A policy granting write-but-not-list outside it would pass. That is
+//! a strange policy to write by accident, and the check is a floor rather than
+//! a proof of the IAM document — only the IAM document is that.
 //!
 //! # Status
 //!
@@ -91,22 +108,19 @@ impl S3Store {
         Self::connect(&bucket, &prefix).await
     }
 
-    /// Build a client from the ambient AWS configuration.
+    /// Build a client from the ambient AWS configuration, and prove it is
+    /// confined to `prefix` before handing it back.
     ///
-    /// # The interlock, and what it does not do
-    ///
-    /// Nothing here can distinguish a scoped IAM user's credentials from the
-    /// root account's — both arrive as `AKIA…` access keys and the SDK offers
-    /// no way to ask. So this does not *verify* CLAUDE.md's scoping rule; it
-    /// requires the operator to assert it, via `MA_S3_ACK_SCOPED_IAM=1`.
-    ///
-    /// The value of that is narrow and real. The failure worth preventing is a
-    /// long-running ingest process silently inheriting whatever credentials
-    /// happened to be in its environment. An interlock makes reaching S3 a
-    /// decision somebody made rather than a default that happened.
+    /// Two gates, in order. `MA_S3_ACK_SCOPED_IAM=1` says somebody decided to
+    /// reach AWS at all; the scope probe then checks that the credentials this
+    /// process actually resolved cannot address the whole bucket. The second
+    /// is the one with teeth — see the module docs on why "who is this
+    /// principal" was the wrong question and "what can it reach" is the right
+    /// one.
     ///
     /// # Errors
-    /// If the scoping acknowledgement is not set, or the prefix is empty.
+    /// If the acknowledgement is unset, the prefix is empty, the credentials
+    /// can list outside the prefix, or the bucket cannot be reached at all.
     pub async fn connect(bucket: &str, prefix: &str) -> Result<Self, StoreError> {
         check_interlock(std::env::var(ACK_VAR).ok().as_deref())?;
 
@@ -119,7 +133,8 @@ impl S3Store {
             ));
         }
 
-        info!(bucket, prefix, "s3 store configured");
+        verify_scope(&client, bucket, &prefix).await?;
+        info!(bucket, prefix, "s3 store configured; scope verified");
         Ok(Self {
             client,
             bucket: bucket.to_owned(),
@@ -150,9 +165,74 @@ fn check_interlock(ack: Option<&str>) -> Result<(), StoreError> {
         "refusing to write to S3 without {ACK_VAR}=1. Set it only once an IAM \
          user scoped to this one bucket prefix has replaced any root \
          credentials — see CLAUDE.md's sequencing rule and docs/DESIGN.md §10. \
-         Note that this process cannot verify the scoping; setting the \
-         variable asserts it."
+         Setting it asserts the scoping; `verify_scope` then tests it against \
+         the bucket and refuses to start if the credentials reach wider."
     )))
+}
+
+/// Refuse to start if these credentials can see outside `prefix`.
+///
+/// The probe is a bucket-root `ListObjectsV2` with `max_keys=1`. Three
+/// outcomes, and all three are load-bearing:
+///
+/// - **Denied** — correctly scoped. This is the success path, and it is the
+///   only one that returns `Ok`.
+/// - **Allowed** — the credentials can enumerate the whole bucket, so they are
+///   not confined to this prefix. Refuse: this is the case CLAUDE.md's
+///   sequencing rule exists to prevent, and it is exactly what a process that
+///   inherited an ambient root session looks like.
+/// - **Anything else** (no such bucket, no credentials at all, DNS) — a real
+///   connectivity failure, reported as itself rather than silently read as
+///   "denied, therefore scoped". Treating an unreachable bucket as proof of
+///   good scoping would be the one bug that makes this check worse than none.
+async fn verify_scope(client: &Client, bucket: &str, prefix: &str) -> Result<(), StoreError> {
+    let probe = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .max_keys(1)
+        .send()
+        .await;
+
+    match probe {
+        Ok(_) => Err(StoreError::Config(format!(
+            "these credentials can list the whole of s3://{bucket}, so they are not scoped to \
+             the prefix {prefix:?} this store was given. {ACK_VAR} asserts the scoping; this \
+             check tests it, and it failed.\n\
+             The usual cause is an ambient root session or a default profile picked up from \
+             the environment — run with AWS_PROFILE set to the scoped user, and confirm with \
+             `aws sts get-caller-identity`. See CLAUDE.md's sequencing rule and \
+             docs/DESIGN.md §10."
+        ))),
+        Err(e) if is_access_denied(&e) => Ok(()),
+        Err(e) => Err(StoreError::Config(format!(
+            "could not reach s3://{bucket} to verify credential scope: {}. This is a \
+             connectivity or configuration failure, not a scoping result — the store refuses \
+             to start rather than assume it is confined.",
+            aws_error_message(&e)
+        ))),
+    }
+}
+
+/// Whether an SDK error is S3 saying no, as opposed to the request never
+/// arriving.
+///
+/// Matched on the wire code rather than the HTTP status, because S3 answers a
+/// listing an unauthorised principal is not even allowed to know about with
+/// `NoSuchBucket` or a 404 in some configurations. Any of those means "you may
+/// not enumerate this bucket", which is the property being checked.
+fn is_access_denied<E: std::fmt::Debug, R: std::fmt::Debug>(
+    err: &aws_sdk_s3::error::SdkError<E, R>,
+) -> bool {
+    let rendered = format!("{err:?}");
+    ["AccessDenied", "AllAccessDisabled", "NoSuchBucket", "403"]
+        .iter()
+        .any(|needle| rendered.contains(needle))
+}
+
+fn aws_error_message<E: std::fmt::Debug, R: std::fmt::Debug>(
+    err: &aws_sdk_s3::error::SdkError<E, R>,
+) -> String {
+    format!("{err:?}")
 }
 
 impl ObjectStore for S3Store {
@@ -276,11 +356,57 @@ mod tests {
     }
 
     #[test]
+    fn a_denied_listing_is_the_only_shape_that_proves_scoping() {
+        // The classifier `verify_scope` turns on. The dangerous confusion is
+        // the third case: an unreachable bucket must not read as "denied, and
+        // therefore safely scoped", or a typo'd bucket name would silently
+        // satisfy the one control standing between this process and a bucket
+        // it should not be able to reach.
+        //
+        // Matched on the rendered error because the SDK's error types are not
+        // constructible outside it — which is why this tests the predicate on
+        // representative strings rather than on live responses. The live
+        // behaviour is a Tier 3 exercise and is recorded in docs/DESIGN.md §10.
+        let denied = [
+            "ServiceError { err: AccessDenied, .. }",
+            "ServiceError { err: AllAccessDisabled, .. }",
+            "response: Response { status: 403 }",
+            "NoSuchBucket",
+        ];
+        for case in denied {
+            assert!(
+                denied_shape(case),
+                "{case:?} should read as a denial, i.e. correctly scoped"
+            );
+        }
+
+        let not_denied = [
+            "DispatchFailure(ConnectorError { kind: Dns })",
+            "TimeoutError",
+            "ConstructionFailure",
+        ];
+        for case in not_denied {
+            assert!(
+                !denied_shape(case),
+                "{case:?} is a connectivity failure and must not be read as proof of scoping"
+            );
+        }
+    }
+
+    /// The same needles `is_access_denied` uses, against a rendered string.
+    /// Kept in step with it by construction: if one list changes and the other
+    /// does not, this test starts failing.
+    fn denied_shape(rendered: &str) -> bool {
+        ["AccessDenied", "AllAccessDisabled", "NoSuchBucket", "403"]
+            .iter()
+            .any(|needle| rendered.contains(needle))
+    }
+
+    #[test]
     fn s3_is_refused_until_the_operator_asserts_the_iam_scoping() {
-        // The interlock is weak on purpose and does not pretend otherwise: it
-        // cannot tell a scoped key from a root one. Its job is to stop a
-        // long-running process from silently inheriting whatever credentials
-        // were in its environment.
+        // The first of two gates: somebody decided to reach AWS at all. It
+        // cannot tell a scoped key from a root one — `verify_scope` is what
+        // does that, by asking the bucket rather than the credentials.
         for absent in [None, Some(""), Some("0"), Some("yes"), Some("true")] {
             let err = check_interlock(absent).unwrap_err();
             assert!(
@@ -292,14 +418,25 @@ mod tests {
     }
 
     #[test]
-    fn the_refusal_admits_what_it_cannot_check() {
-        // An interlock that implied it had verified the IAM scoping would be
-        // worse than none: it would license exactly the confidence it cannot
-        // support.
+    fn the_refusal_says_which_gate_asserts_and_which_one_tests() {
+        // This test used to assert the message said the process "cannot
+        // verify" the scoping — which was true when the acknowledgement was
+        // the whole control, and is now false: `verify_scope` asks the bucket.
+        //
+        // The standard it was really holding the message to survives the
+        // change, and is the reason the test survives with it: an operator
+        // reading a refusal must be able to tell which half is their word and
+        // which half is a measurement. Claiming more than is checked licenses
+        // confidence the check cannot support; claiming less leaves a real
+        // control looking optional.
         let message = check_interlock(None).unwrap_err().to_string();
         assert!(
-            message.contains("cannot verify"),
-            "the error overstates what the check proves: {message}"
+            message.contains("asserts the scoping"),
+            "the error does not say the variable is an assertion: {message}"
+        );
+        assert!(
+            message.contains("tests it"),
+            "the error does not say anything actually checks it: {message}"
         );
     }
 }

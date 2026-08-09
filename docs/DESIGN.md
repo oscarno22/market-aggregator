@@ -801,29 +801,59 @@ What v2 added, and what each piece is actually worth:
 | Periodic REST depth audit | Done, and **corrected twice against live venues** — see §5 |
 | Parquet, hourly rolls, `ObjectStore` | Done, with an end-to-end round-trip test through the real pipeline |
 | Parquet replay | Done, and still checksum-verified against Kraken |
-| S3 | **Written, compiled, never run.** See below |
+| S3 | **Run against a real bucket**, once the IAM gate was satisfied. See below |
 
-### The one thing that is written and unproven
+### The gate, and what finally opened it
 
-`ma-persist`'s S3 store compiles under `--features s3` and has never been
-pointed at a bucket. That is deliberate and it is the sequencing rule in
-CLAUDE.md: nothing writes to S3 before an IAM user scoped to one bucket prefix
-replaces any root credentials.
+`ma-persist`'s S3 store spent v2 written, compiled and never pointed at a
+bucket. That was the sequencing rule in CLAUDE.md: nothing writes to S3 before
+an IAM user scoped to one bucket prefix replaces any root credentials. The rule
+was satisfied during v3, and the store has now been exercised end to end.
 
-Three things make that structural rather than remembered — the feature is off
-by default so the offline suite cannot acquire a dependency on credentials; a
-prefix is mandatory, because a writer that can address a bucket root is not
-"scoped" whatever the policy says; and `MA_S3_ACK_SCOPED_IAM=1` is required to
-start. That last one is a weak control and its own error message says so:
-nothing in the process can distinguish a scoped key from a root one. It stops a
-long-running process from silently inheriting whatever was in its environment,
-which is the failure actually worth preventing.
+Four things make the rule structural rather than remembered:
 
-**What remains unproven is this file against real S3 semantics** — pagination
-past the first page, error shapes, and whether `PutObject`'s atomicity holds up
-the way `LocalStore`'s rename does. No amount of local testing establishes any
-of that. The first run against a real bucket is a Tier 3 exercise and should be
-treated as one.
+1. **The feature is off by default**, so the offline suite cannot acquire a
+   dependency on credentials.
+2. **A prefix is mandatory.** A writer that can address a bucket root is not
+   "scoped" whatever the policy says.
+3. **`MA_S3_ACK_SCOPED_IAM=1` is required to start** — somebody decided to
+   reach AWS, rather than defaulting into it.
+4. **The scoping is verified.** `S3Store::connect` asks S3 to list the bucket
+   *outside* the configured prefix and refuses to start if that succeeds.
+
+Point 4 replaced a weaker claim this document used to make, and the correction
+is worth keeping. The old text said nothing in the process could tell a scoped
+key from a root one — true of the *credentials*, and false of the *question*.
+The rule does not care who the principal is; it cares whether this process can
+reach outside its prefix, and that is answerable by asking. Root gets `200` at
+the bucket root; a prefix-scoped user gets `AccessDenied`.
+
+It answers the better question too: a root key confined by a bucket policy
+passes, because it *is* confined, and a scoped user whose policy is wider than
+intended fails — which an ARN check would have waved through.
+
+The classifier has three outcomes and the third is the one that matters:
+*denied* is the only success, *allowed* is a refusal, and **anything else —
+DNS, no credentials, a typo'd bucket — is a refusal too**, never read as
+"denied, therefore scoped". That third arm earned itself immediately: the first
+live run hit a credential-provider configuration error, and reading it as a
+denial would have started the process with unusable credentials and a clean
+bill of health.
+
+### What the first live run established
+
+Run against `s3://…/events` as the scoped user, then read back:
+
+| | Result |
+|---|---|
+| Scope probe against real IAM | Refused ambient root; passed the scoped profile |
+| Hourly partitioning | `events/live/date=2026-08-09/hour=08/part-00000.parquet` |
+| `SIGTERM` flush (the v2 fix) | 58,574 rows, one file, no loss |
+| Replay **out of S3** | 1578 events, 0 dropped; all three books rebuilt to `Live` at their correct per-venue `Integrity` |
+
+What that leaves untested is the far tail: pagination past the first page of a
+listing, and multi-part behaviour at file sizes this project does not yet
+produce.
 
 ---
 

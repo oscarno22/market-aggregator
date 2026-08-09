@@ -206,8 +206,10 @@ Neither layer replaces the other.
 - [x] Replay mode over normalized/Parquet events (raw-frame tape replay is a
       v1 deliverable and was already done — see §6)
 - [x] Multi-symbol, one connection per `(venue, symbol)` stream
-- [x] S3 store **written and compiled, never run** — gated per the sequencing
-      rule below
+- [x] S3 store written, compiled, and — during v3 — **run against a real
+      bucket** once an IAM user scoped to one prefix replaced the root
+      credentials. `S3Store::connect` now *verifies* that scoping rather than
+      taking the operator's word for it
 
 **v3 — sharding, indicators, cross-venue** — **complete**
 - [x] Shard streams across nodes with a coordination layer — `ma-coord`:
@@ -333,14 +335,24 @@ code, both only observable over a long run against real traffic:
    and v2 because nothing before v3 published a number derived from a duration.
    `ma_core::ScaledClock` now advances with the tape.
 
+**The S3 gate is now open, and was opened properly.** As of 2026-08-09 an IAM
+user (`market-aggregator`) scoped to exactly one bucket prefix replaced the root
+credentials, and the store has been run end to end: written under
+`s3://market-aggregator-…/events`, flushed 58,574 rows on `SIGTERM`, and
+replayed back out of S3 into three live checksum-verified books.
+
+`MA_S3_ACK_SCOPED_IAM=1` is still required, but it is no longer the whole
+control: `S3Store::connect` now lists the bucket *outside* its configured prefix
+and refuses to start if that succeeds. Root is allowed there, a scoped user is
+denied, and **any other error is also a refusal** — never read as proof of
+scoping. Run with `AWS_PROFILE=market-aggregator`; the ambient default is still
+a root login session.
+
+An S3-backed cluster registry is now unblocked. It needs only PutObject,
+ListObjects and DeleteObject — deliberately no conditional write.
+
 **Next up:** v4 — a cross-node merged view, symbol-partitioned Parquet, a tape
-across a real reconnect. Note the sequencing rule still standing: nothing writes
-to S3 before an IAM user scoped to one bucket prefix replaces the root keys. The
-S3 store is written and compiles under `--features s3`, and has **never been run
-against a bucket**; `MA_S3_ACK_SCOPED_IAM=1` is the interlock, and it asserts
-the scoping rather than verifying it. As of 2026-08-09 the account's CLI
-credentials are still **root** (`arn:aws:iam::…:root`), so the gate is closed —
-an S3-backed cluster registry is blocked behind the same one.
+across a real reconnect.
 
 ## Non-goals
 

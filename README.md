@@ -249,21 +249,22 @@ through one registry and asserts that no two ever hold the same stream.
 
 Deliberately unfinished, and stated rather than hidden:
 
-- **S3 is written, compiles under `--features s3`, and has never been run
-  against a bucket.** Nothing writes to S3 before an IAM user scoped to one
-  bucket prefix exists. That is enforced three ways: the feature is off by
-  default, a prefix is mandatory, and `MA_S3_ACK_SCOPED_IAM=1` is required to
-  start — an assertion by the operator, not a verification, and its own error
-  message says so.
+- ~~S3 is written and has never been run against a bucket.~~ **Done.** An IAM
+  user scoped to one prefix replaced the root credentials, and the store has
+  been exercised end to end: archived to S3, flushed on `SIGTERM`, and replayed
+  back out into three live checksum-verified books. The scoping is now
+  *verified* rather than asserted — `S3Store::connect` lists the bucket outside
+  its own prefix and refuses to start if that succeeds. What is still untested
+  is the far tail: listing pagination, and file sizes this project does not yet
+  produce.
 - **No tape has been recorded across a real reconnect.** Both committed tapes
   are clean runs; every recorded session boundary count is zero. The reconnect
   path is proven against the scripted fake venue and, for the audit, against
   live venues — but not yet from a recording of a real outage.
 
-- **A cluster registry backed by S3 is not implemented**, for the same reason.
-  The trait needs only `PutObject`, `ListObjects` and `DeleteObject` —
-  deliberately no conditional write — so it is a small addition behind the same
-  gate.
+- **A cluster registry backed by S3 is not implemented.** The trait needs only
+  `PutObject`, `ListObjects` and `DeleteObject` — deliberately no conditional
+  write — so it is a small addition, and no longer a blocked one.
 - **Nothing merges the nodes.** Each node serves its own page and its own share
   of the streams; `/cluster` says who has what. A gateway that re-consolidates
   across nodes inherits the whole cross-venue timing problem across a network
