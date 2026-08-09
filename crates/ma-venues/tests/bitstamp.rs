@@ -210,6 +210,77 @@ fn a_frame_for_the_wrong_channel_is_an_error() {
 }
 
 #[test]
+fn a_diff_the_snapshot_already_covers_is_ignored_not_called_a_regression() {
+    // The race the concurrent REST fetch creates. ma_pipeline::ingest runs the
+    // depth request alongside the read loop -- deliberately, so diffs arriving
+    // during the fetch are buffered rather than lost -- which means a diff
+    // generated before the snapshot can be *delivered* after it.
+    //
+    // Such a diff is redundant by definition: the snapshot already contains
+    // it. Treating it as a timestamp regression would desync a book that is
+    // exactly correct, and would do so intermittently, under network timing,
+    // on the venue whose integrity is already the weakest of the three.
+    let mut vb = book();
+    let snapshot = parse_rest_snapshot(fixture!("rest_order_book.json")).unwrap(); // as_of ...150000
+    vb.apply_rest_snapshot(snapshot, SystemClock.now());
+    assert!(vb.book().state().is_live());
+    let before = levels(vb.book(), Side::Bid);
+
+    // ...100000, earlier than the snapshot it would be applied on top of.
+    vb.feed(&frame(fixture!("diff_before_snapshot.json")))
+        .unwrap();
+
+    assert!(
+        vb.book().state().is_live(),
+        "a diff the snapshot already covers desynced the book: {:?}",
+        vb.book().state()
+    );
+    assert_eq!(
+        levels(vb.book(), Side::Bid),
+        before,
+        "a redundant diff was applied on top of the snapshot"
+    );
+}
+
+#[test]
+fn a_rest_body_arriving_as_a_frame_drives_the_splice() {
+    // The ingest task delivers the REST body through the same channel as
+    // websocket frames, tagged with FrameSource::RestSnapshot, so that a
+    // recorded tape contains it and replays into a synced book. Without this
+    // dispatch a Bitstamp tape could never leave AwaitingSnapshot.
+    let mut vb = book();
+    vb.feed(&frame(fixture!("diff_after_snapshot.json")))
+        .unwrap();
+    assert!(
+        !vb.book().state().is_live(),
+        "should be awaiting a snapshot"
+    );
+
+    let rest = RawFrame::rest_snapshot(
+        VenueId::Bitstamp,
+        fixture!("rest_order_book.json").as_bytes().to_vec(),
+        SystemClock.now(),
+    );
+    vb.feed(&rest).unwrap();
+
+    assert!(vb.book().state().is_live());
+    assert_eq!(vb.book().state().integrity(), Some(Integrity::OrderOnly));
+}
+
+#[test]
+fn a_rest_body_offered_to_a_resubscribe_venue_is_an_error() {
+    // Coinbase and Kraken have no REST endpoint, so a frame tagged as one of
+    // their snapshots means something upstream mislabelled it. Failing loudly
+    // beats parsing a websocket frame as a depth response.
+    let mut vb = VenueBook::new(
+        Box::new(ma_venues::KrakenSync::new("BTC/USD")),
+        Symbol::new("BTC-USD"),
+    );
+    let rest = RawFrame::rest_snapshot(VenueId::Kraken, b"{}".to_vec(), SystemClock.now());
+    assert!(vb.feed(&rest).is_err());
+}
+
+#[test]
 fn a_mid_stream_rest_audit_re_anchors_without_a_buffer_to_splice() {
     // The v2 periodic re-snapshot audit: a REST snapshot can arrive while the
     // book is already Live, not just during initial recovery. There is no

@@ -110,7 +110,24 @@ enum Mode {
     AwaitingSnapshot { pending: Vec<PendingDiff> },
     /// Snapshot applied; tracking the last-applied microtimestamp so ordering
     /// can still be checked going forward.
-    Live { last_micros: u64 },
+    Live {
+        last_micros: u64,
+        /// The `as_of` of the snapshot this book was built from.
+        ///
+        /// Kept separately from `last_micros` to tell two different things
+        /// apart. A diff older than the snapshot is *redundant* — the
+        /// snapshot already contains it by definition — whereas a diff older
+        /// than something we have already applied on top of the snapshot is
+        /// *reordering*, which is a real desync. Collapsing both into
+        /// `last_micros` reports the first as the second.
+        ///
+        /// This is not hypothetical. The REST fetch runs concurrently with
+        /// the read loop (see `ma_pipeline::ingest`), so diffs generated
+        /// between the subscribe and the snapshot can arrive on either side
+        /// of it. Landing after it must not desync a book that is perfectly
+        /// correct.
+        spliced_at: u64,
+    },
 }
 
 /// Sync discipline for one Bitstamp pair (e.g. `btcusd`).
@@ -153,6 +170,10 @@ impl VenueSync for BitstampSync {
         };
     }
 
+    fn parse_rest_snapshot(&self, body: &str) -> Result<RestSnapshot, VenueError> {
+        parse_rest_snapshot(body)
+    }
+
     fn ingest(&mut self, frame: &RawFrame) -> Result<Vec<SyncAction>, VenueError> {
         let envelope: Envelope = serde_json::from_slice(&frame.payload)
             .map_err(|e| VenueError::Malformed(e.to_string()))?;
@@ -191,14 +212,25 @@ impl VenueSync for BitstampSync {
                 }])
             }
 
-            Mode::Live { last_micros } => Ok(vec![match check_order(last_micros, micros) {
-                Some(reason) => SyncAction::Desync(reason),
-                None => SyncAction::Delta { bids, asks },
-            }]),
+            Mode::Live {
+                last_micros,
+                spliced_at,
+            } => {
+                if micros <= *spliced_at {
+                    // Already in the snapshot. Applying it would be harmless
+                    // but pointless; calling it a regression would be a lie.
+                    return Ok(vec![SyncAction::Ignore]);
+                }
+                Ok(vec![match check_order(last_micros, micros) {
+                    Some(reason) => SyncAction::Desync(reason),
+                    None => SyncAction::Delta { bids, asks },
+                }])
+            }
         }
     }
 
     fn apply_rest_snapshot(&mut self, snapshot: RestSnapshot) -> Vec<SyncAction> {
+        let snapshot_as_of = snapshot.as_of;
         let pending = match &mut self.mode {
             Mode::AwaitingSnapshot { pending } => std::mem::take(pending),
             // A REST re-snapshot arriving while already live is the v2
@@ -232,7 +264,10 @@ impl VenueSync for BitstampSync {
             });
         }
 
-        self.mode = Mode::Live { last_micros };
+        self.mode = Mode::Live {
+            last_micros,
+            spliced_at: snapshot_as_of,
+        };
         actions
     }
 }

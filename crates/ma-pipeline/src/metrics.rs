@@ -1,0 +1,299 @@
+//! Counters.
+//!
+//! CLAUDE.md's line about the drop policy — "a silent drop policy is a bug" —
+//! generalises to everything in this module. A reconnect nobody counted, a
+//! book that spent four minutes `Desynced` while the UI showed prices, a REST
+//! snapshot that 503'd on every attempt: each of those is a system that is
+//! wrong and looks fine. The counters here are what make them visible.
+//!
+//! # Monotonic counters, rates derived at the edge
+//!
+//! Everything here only ever increases. Nothing computes an average, and
+//! nothing holds a window. "Events per second" is produced by the aggregator
+//! diffing two snapshots a tick apart ([`Rates::between`]), which means the
+//! rate is always attributable to a stated interval rather than to a decaying
+//! average whose time constant nobody remembers. It is also what a Prometheus
+//! scrape would want if this grows one.
+//!
+//! # Why atomics rather than a channel
+//!
+//! Ingest tasks are on the hot path, and the point of the bounded channel is
+//! that ingest never waits for a consumer. Making ingest publish metrics
+//! through a channel would reintroduce exactly the coupling the channel
+//! removes. A relaxed atomic increment is a few nanoseconds and cannot block
+//! anybody. Relaxed ordering is correct here because no counter guards access
+//! to other memory — they are read for display, never to make a decision.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use ma_core::VenueId;
+use serde::Serialize;
+
+/// Live counters for one venue's ingest task.
+#[derive(Debug, Default)]
+pub struct VenueCounters {
+    frames: AtomicU64,
+    bytes: AtomicU64,
+    connects: AtomicU64,
+    disconnects: AtomicU64,
+    connect_failures: AtomicU64,
+    idle_timeouts: AtomicU64,
+    dropped: AtomicU64,
+    rest_fetches: AtomicU64,
+    rest_failures: AtomicU64,
+}
+
+macro_rules! counter {
+    ($( $field:ident => $bump:ident ),* $(,)?) => {
+        impl VenueCounters {
+            $(
+                pub fn $bump(&self) {
+                    self.$field.fetch_add(1, Ordering::Relaxed);
+                }
+            )*
+        }
+    };
+}
+
+counter! {
+    connects => record_connect,
+    disconnects => record_disconnect,
+    connect_failures => record_connect_failure,
+    idle_timeouts => record_idle_timeout,
+    dropped => record_drop,
+    rest_fetches => record_rest_fetch,
+    rest_failures => record_rest_failure,
+}
+
+impl VenueCounters {
+    /// One frame arrived. Byte count travels with it so that "the venue is
+    /// sending, but sending nothing useful" is distinguishable from silence.
+    pub fn record_frame(&self, bytes: usize) {
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        self.bytes
+            .fetch_add(bytes.try_into().unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> VenueCountersSnapshot {
+        let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        VenueCountersSnapshot {
+            frames: load(&self.frames),
+            bytes: load(&self.bytes),
+            connects: load(&self.connects),
+            disconnects: load(&self.disconnects),
+            connect_failures: load(&self.connect_failures),
+            idle_timeouts: load(&self.idle_timeouts),
+            dropped: load(&self.dropped),
+            rest_fetches: load(&self.rest_fetches),
+            rest_failures: load(&self.rest_failures),
+        }
+    }
+}
+
+/// A reading of [`VenueCounters`] at one instant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct VenueCountersSnapshot {
+    pub frames: u64,
+    pub bytes: u64,
+    /// Successful connections. Also the reconnect count, less one, which is
+    /// the number CLAUDE.md's metric list asks for.
+    pub connects: u64,
+    pub disconnects: u64,
+    /// Attempts that never opened a socket. Separate from `disconnects`
+    /// because "the venue refuses us" and "the venue keeps hanging up" call
+    /// for different responses: the first is often a ban, the second is not.
+    pub connect_failures: u64,
+    /// Sessions killed by the idle watchdog. A climbing count with no
+    /// `connect_failures` is the signature of a venue that accepts
+    /// connections and then stops talking — the failure a liveness check that
+    /// only watched the socket would never see.
+    pub idle_timeouts: u64,
+    /// Frames the bounded channel evicted before the aggregator read them.
+    /// See `channel`'s module docs for why dropping is the policy and why
+    /// this counter is what keeps it from being a silent one.
+    pub dropped: u64,
+    pub rest_fetches: u64,
+    pub rest_failures: u64,
+}
+
+impl VenueCountersSnapshot {
+    /// Reconnects, i.e. connections after the first.
+    pub const fn reconnects(&self) -> u64 {
+        self.connects.saturating_sub(1)
+    }
+}
+
+/// Per-second rates over a stated interval, derived from two snapshots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct Rates {
+    pub frames_per_sec: f64,
+    pub bytes_per_sec: f64,
+    pub drops_per_sec: f64,
+    /// The interval these rates were measured over. Published alongside them
+    /// deliberately: a rate without its window is not a number anyone can
+    /// check.
+    pub over_secs: f64,
+}
+
+impl Rates {
+    /// Rates between an earlier and a later reading.
+    ///
+    /// Returns zeroes for a non-positive interval rather than dividing — two
+    /// snapshots taken inside the same tick is a caller mistake, not a reason
+    /// to publish an infinity into a chart.
+    #[allow(clippy::float_arithmetic)]
+    pub fn between(
+        earlier: VenueCountersSnapshot,
+        later: VenueCountersSnapshot,
+        interval: Duration,
+    ) -> Self {
+        let secs = interval.as_secs_f64();
+        if secs <= 0.0 {
+            return Self::default();
+        }
+        let per_sec = |a: u64, b: u64| {
+            // Counters only increase, but a restarted process or a
+            // freshly-registered venue can make `later` smaller. Saturating
+            // keeps a negative rate off the chart.
+            let delta = b.saturating_sub(a);
+            // Lossy past 2^53 frames, which at any plausible venue rate is
+            // several million years of uptime.
+            delta as f64 / secs
+        };
+        Self {
+            frames_per_sec: per_sec(earlier.frames, later.frames),
+            bytes_per_sec: per_sec(earlier.bytes, later.bytes),
+            drops_per_sec: per_sec(earlier.dropped, later.dropped),
+            over_secs: secs,
+        }
+    }
+}
+
+/// Every venue's counters, fixed at startup.
+///
+/// The venue set is known when the process starts and never changes, so the
+/// map is built once and then only read. That is why there is no lock here
+/// and no `RwLock<HashMap>`: registration is not a runtime operation.
+#[derive(Debug, Default)]
+pub struct Metrics {
+    venues: BTreeMap<VenueId, Arc<VenueCounters>>,
+}
+
+impl Metrics {
+    pub fn new(venues: impl IntoIterator<Item = VenueId>) -> Self {
+        Self {
+            venues: venues
+                .into_iter()
+                .map(|v| (v, Arc::new(VenueCounters::default())))
+                .collect(),
+        }
+    }
+
+    /// Counters for a venue, or `None` if it was not registered at startup.
+    pub fn venue(&self, venue: VenueId) -> Option<Arc<VenueCounters>> {
+        self.venues.get(&venue).cloned()
+    }
+
+    pub fn snapshot(&self) -> BTreeMap<VenueId, VenueCountersSnapshot> {
+        self.venues
+            .iter()
+            .map(|(venue, counters)| (*venue, counters.snapshot()))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counters_start_at_zero_and_count_up() {
+        let c = VenueCounters::default();
+        assert_eq!(c.snapshot(), VenueCountersSnapshot::default());
+
+        c.record_frame(120);
+        c.record_frame(80);
+        c.record_connect();
+        c.record_drop();
+
+        let s = c.snapshot();
+        assert_eq!(s.frames, 2);
+        assert_eq!(s.bytes, 200);
+        assert_eq!(s.connects, 1);
+        assert_eq!(s.dropped, 1);
+    }
+
+    #[test]
+    fn the_first_connection_is_not_a_reconnect() {
+        let c = VenueCounters::default();
+        assert_eq!(c.snapshot().reconnects(), 0, "never connected");
+        c.record_connect();
+        assert_eq!(c.snapshot().reconnects(), 0, "first connect is not a re-");
+        c.record_connect();
+        assert_eq!(c.snapshot().reconnects(), 1);
+    }
+
+    #[test]
+    fn rates_are_a_delta_over_a_stated_interval() {
+        let earlier = VenueCountersSnapshot {
+            frames: 100,
+            bytes: 1_000,
+            dropped: 2,
+            ..Default::default()
+        };
+        let later = VenueCountersSnapshot {
+            frames: 160,
+            bytes: 4_000,
+            dropped: 8,
+            ..Default::default()
+        };
+        let r = Rates::between(earlier, later, Duration::from_secs(2));
+        assert_eq!(r.frames_per_sec, 30.0);
+        assert_eq!(r.bytes_per_sec, 1_500.0);
+        assert_eq!(r.drops_per_sec, 3.0);
+        assert_eq!(r.over_secs, 2.0);
+    }
+
+    #[test]
+    fn a_zero_interval_yields_zero_rather_than_infinity() {
+        let s = VenueCountersSnapshot {
+            frames: 5,
+            ..Default::default()
+        };
+        let r = Rates::between(VenueCountersSnapshot::default(), s, Duration::ZERO);
+        assert_eq!(r, Rates::default());
+        assert!(r.frames_per_sec.is_finite(), "an infinity reached a chart");
+    }
+
+    #[test]
+    fn a_counter_going_backwards_does_not_produce_a_negative_rate() {
+        let earlier = VenueCountersSnapshot {
+            frames: 500,
+            ..Default::default()
+        };
+        let later = VenueCountersSnapshot {
+            frames: 3,
+            ..Default::default()
+        };
+        let r = Rates::between(earlier, later, Duration::from_secs(1));
+        assert_eq!(r.frames_per_sec, 0.0);
+    }
+
+    #[test]
+    fn counters_are_shared_not_copied() {
+        // The ingest task holds one Arc and the metrics endpoint reads
+        // another. If `venue()` handed out a fresh counter set, every metric
+        // would read zero forever while looking perfectly plausible.
+        let metrics = Metrics::new([VenueId::Coinbase, VenueId::Kraken]);
+        let held = metrics.venue(VenueId::Coinbase).expect("registered");
+        held.record_frame(10);
+
+        assert_eq!(metrics.snapshot()[&VenueId::Coinbase].frames, 1);
+        assert_eq!(metrics.snapshot()[&VenueId::Kraken].frames, 0);
+        assert!(metrics.venue(VenueId::Bitstamp).is_none());
+    }
+}

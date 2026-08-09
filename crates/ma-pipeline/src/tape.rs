@@ -43,7 +43,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use ma_core::{Clock, IngestTime, VenueId};
-use ma_venues::RawFrame;
+use ma_venues::{FrameSource, RawFrame};
 use serde::{Deserialize, Serialize};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, Lines,
@@ -70,6 +70,19 @@ struct TapeRecord {
     elapsed_nanos: u64,
     recorded_wall_unix_nanos: u64,
     payload: String,
+    /// Websocket frame or REST snapshot body. Recorded because a Bitstamp
+    /// tape without its snapshot replays into a book that can never leave
+    /// `AwaitingSnapshot` — see [`FrameSource`]. Defaulted on read so the
+    /// field is additive: `WebSocket` is what every record lacking it was.
+    #[serde(default, skip_serializing_if = "is_websocket")]
+    source: FrameSource,
+}
+
+/// Keeps the common case out of the file. Every venue frame but a handful of
+/// Bitstamp snapshots is a websocket frame, and a tape is meant to stay
+/// readable with `less`.
+fn is_websocket(source: &FrameSource) -> bool {
+    matches!(source, FrameSource::WebSocket)
 }
 
 fn nanos(d: Duration) -> u64 {
@@ -120,6 +133,7 @@ impl<W: AsyncWrite + Unpin> TapeWriter<W> {
             elapsed_nanos: nanos(frame.ingest_ts.since(self.start)),
             recorded_wall_unix_nanos: wall_nanos(frame.ingest_ts.wall()),
             payload: payload.to_owned(),
+            source: frame.source,
         };
         let mut line = serde_json::to_vec(&record)?;
         line.push(b'\n');
@@ -144,6 +158,7 @@ pub struct TapedFrame {
     /// Wall clock at original recording time. Informational only — see the
     /// module docs on why replay does not reuse this directly.
     pub recorded_wall: SystemTime,
+    pub source: FrameSource,
 }
 
 impl TapedFrame {
@@ -152,7 +167,11 @@ impl TapedFrame {
     /// produce frames with different wall clocks but identical relative
     /// ordering and spacing — the property that makes replay deterministic.
     pub fn into_raw_frame(self, base: IngestTime) -> RawFrame {
-        RawFrame::new(self.venue, self.payload, base.advanced_by(self.elapsed))
+        let at = base.advanced_by(self.elapsed);
+        match self.source {
+            FrameSource::WebSocket => RawFrame::new(self.venue, self.payload, at),
+            FrameSource::RestSnapshot => RawFrame::rest_snapshot(self.venue, self.payload, at),
+        }
     }
 }
 
@@ -195,6 +214,7 @@ impl<R: AsyncRead + Unpin> TapeReader<R> {
                 elapsed: Duration::from_nanos(record.elapsed_nanos),
                 recorded_wall: SystemTime::UNIX_EPOCH
                     + Duration::from_nanos(record.recorded_wall_unix_nanos),
+                source: record.source,
             }));
         }
     }

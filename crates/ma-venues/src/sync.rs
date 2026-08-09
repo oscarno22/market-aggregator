@@ -14,6 +14,28 @@ use std::fmt;
 use ma_core::{
     Book, DesyncReason, EventKind, IngestTime, Integrity, Level, MarketEvent, Symbol, VenueId,
 };
+use serde::{Deserialize, Serialize};
+
+/// Which network call produced a frame.
+///
+/// Only Bitstamp ever produces the second variant, but it is on the shared
+/// frame type rather than hidden inside that venue for one specific reason:
+/// the tape recorder writes [`RawFrame`]s, so a REST snapshot that is a frame
+/// gets recorded like any other. Fetching it out-of-band instead would leave
+/// Bitstamp tapes permanently unreplayable — the diffs are all there, but the
+/// base state they splice onto never happened, so the book could never leave
+/// `AwaitingSnapshot`. A tape that cannot reproduce a synced book is not a
+/// tape of anything useful.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameSource {
+    /// Read off the venue's websocket.
+    #[default]
+    WebSocket,
+    /// The body of an out-of-band REST depth request, for a
+    /// [`RecoveryStrategy::RestSnapshot`] venue.
+    RestSnapshot,
+}
 
 /// Bytes as they came off the wire, before anything was parsed.
 ///
@@ -25,14 +47,30 @@ pub struct RawFrame {
     pub venue: VenueId,
     pub payload: Vec<u8>,
     pub ingest_ts: IngestTime,
+    pub source: FrameSource,
 }
 
 impl RawFrame {
+    /// A frame read off the websocket — the overwhelmingly common case, which
+    /// is why it gets the short constructor.
     pub fn new(venue: VenueId, payload: impl Into<Vec<u8>>, ingest_ts: IngestTime) -> Self {
         Self {
             venue,
             payload: payload.into(),
             ingest_ts,
+            source: FrameSource::WebSocket,
+        }
+    }
+
+    /// A REST depth response, to be spliced rather than parsed as a diff.
+    pub fn rest_snapshot(
+        venue: VenueId,
+        payload: impl Into<Vec<u8>>,
+        ingest_ts: IngestTime,
+    ) -> Self {
+        Self {
+            source: FrameSource::RestSnapshot,
+            ..Self::new(venue, payload, ingest_ts)
         }
     }
 
@@ -45,9 +83,18 @@ impl fmt::Debug for RawFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Show the payload as text where possible; a hex dump of JSON helps
         // nobody reading a failing test.
+        let source = match self.source {
+            FrameSource::WebSocket => "",
+            FrameSource::RestSnapshot => ", rest",
+        };
         match std::str::from_utf8(&self.payload) {
-            Ok(s) => write!(f, "RawFrame({}, {s:?})", self.venue),
-            Err(_) => write!(f, "RawFrame({}, {} bytes)", self.venue, self.payload.len()),
+            Ok(s) => write!(f, "RawFrame({}{source}, {s:?})", self.venue),
+            Err(_) => write!(
+                f,
+                "RawFrame({}{source}, {} bytes)",
+                self.venue,
+                self.payload.len()
+            ),
         }
     }
 }
@@ -126,6 +173,8 @@ pub enum VenueError {
     WrongVenue { expected: VenueId, got: VenueId },
     #[error("{venue} has no network endpoint; it is driven by a script or a tape")]
     NoEndpoint { venue: VenueId },
+    #[error("{venue} recovers by resubscribing and has no REST snapshot to parse")]
+    NoRestSnapshot { venue: VenueId },
 }
 
 /// A venue's wire protocol and its integrity discipline.
@@ -161,6 +210,21 @@ pub trait VenueSync: fmt::Debug + Send {
 
     /// Return to the pre-subscription state after a reconnect.
     fn reset(&mut self);
+
+    /// Parse this venue's REST depth response body.
+    ///
+    /// Split from [`Self::apply_rest_snapshot`] so that the wire format and
+    /// the splice remain separately testable, and so the ingest task can hand
+    /// over a body it fetched without knowing anything about its shape. The
+    /// default refuses, because a venue whose recovery is
+    /// [`RecoveryStrategy::Resubscribe`] has no REST endpoint to have fetched
+    /// this from — reaching here means a frame was mislabelled upstream.
+    fn parse_rest_snapshot(&self, body: &str) -> Result<RestSnapshot, VenueError> {
+        let _ = body;
+        Err(VenueError::NoRestSnapshot {
+            venue: self.venue(),
+        })
+    }
 
     /// Splice in a REST-fetched snapshot, for [`RecoveryStrategy::RestSnapshot`]
     /// venues. Never called for a [`RecoveryStrategy::Resubscribe`] venue,
@@ -240,8 +304,19 @@ impl VenueBook {
     }
 
     /// Feed one frame; apply whatever it implies.
+    ///
+    /// Dispatches on [`RawFrame::source`], so a REST snapshot recorded onto a
+    /// tape replays through this same entry point and drives the splice
+    /// exactly as it did live. That is the whole reason the discriminator sits
+    /// on the frame — see [`FrameSource`].
     pub fn feed(&mut self, frame: &RawFrame) -> Result<Vec<Outcome>, VenueError> {
-        let actions = self.sync.ingest(frame)?;
+        let actions = match frame.source {
+            FrameSource::WebSocket => self.sync.ingest(frame)?,
+            FrameSource::RestSnapshot => {
+                let snapshot = self.sync.parse_rest_snapshot(frame.as_str()?)?;
+                self.sync.apply_rest_snapshot(snapshot)
+            }
+        };
         Ok(self.apply_actions(actions, frame.ingest_ts))
     }
 
