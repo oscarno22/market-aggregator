@@ -75,7 +75,7 @@ impl<T> std::fmt::Debug for Inner<T> {
 /// `dropped` is the one CLAUDE.md calls out specifically: "a silent drop
 /// policy is a bug." Wiring this into `/metrics` is what keeps it from being
 /// one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ChannelMetrics {
     pub len: usize,
     pub capacity: usize,
@@ -246,6 +246,16 @@ impl<T> Receiver<T> {
 
             notified.await;
         }
+    }
+
+    /// Take an item if one is queued, without waiting.
+    ///
+    /// The aggregator drains with this at the top of every loop turn, so a
+    /// backlog is applied in one batch rather than one `select!` round trip
+    /// per event. It also means nothing sits in the queue longer than the
+    /// aggregator's tick, whatever happens with wakeups.
+    pub fn try_recv(&self) -> Option<T> {
+        self.pop()
     }
 
     pub fn metrics(&self) -> ChannelMetrics {

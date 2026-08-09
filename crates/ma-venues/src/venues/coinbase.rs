@@ -39,10 +39,22 @@ struct L2Event {
     updates: Vec<L2Update>,
 }
 
+/// Coinbase's spelling of the ask side is `"offer"` in the Advanced Trade
+/// `l2_data` payloads, though `"ask"` appears in parts of the documentation
+/// and in this crate's hand-authored fixtures. Both are accepted.
+///
+/// Accepting an alias rather than picking one is the cautious choice for a
+/// field whose only failure mode is total: get it wrong and every ask update
+/// is a parse error, the book holds bids only, and — because a one-sided book
+/// can never cross — nothing detects it. The `parse_errors` counter would
+/// climb, which is the signal that matters, but the book would still be
+/// served. A tape recorded from the live feed is the authority on which
+/// spelling actually arrives; see `tapes/`.
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum CbSide {
     Bid,
+    #[serde(alias = "offer")]
     Ask,
 }
 

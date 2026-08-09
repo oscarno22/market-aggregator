@@ -44,6 +44,8 @@ use std::time::{Duration, SystemTime};
 
 use ma_core::{Clock, IngestTime, VenueId};
 use ma_venues::{FrameSource, RawFrame};
+
+use crate::ingest::{IngestMessage, SessionEnd};
 use serde::{Deserialize, Serialize};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, Lines,
@@ -69,6 +71,8 @@ struct TapeRecord {
     venue: VenueId,
     elapsed_nanos: u64,
     recorded_wall_unix_nanos: u64,
+    /// Empty for a [`RecordKind::SessionEnded`] record, which carries no
+    /// bytes — only the fact that the stream restarted here.
     payload: String,
     /// Websocket frame or REST snapshot body. Recorded because a Bitstamp
     /// tape without its snapshot replays into a book that can never leave
@@ -76,6 +80,28 @@ struct TapeRecord {
     /// field is additive: `WebSocket` is what every record lacking it was.
     #[serde(default, skip_serializing_if = "is_websocket")]
     source: FrameSource,
+    #[serde(default, skip_serializing_if = "RecordKind::is_frame")]
+    kind: RecordKind,
+}
+
+/// Whether a line is bytes from a venue or a session boundary.
+///
+/// Recording the boundaries is what makes a *reconnect* replayable, not just
+/// the data around one. A tape that silently stitched two sessions together
+/// would replay a sequence-number restart as a gap and produce a permanently
+/// desynced book — a bug in the tape presenting as a bug in the parser.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RecordKind {
+    #[default]
+    Frame,
+    SessionEnded,
+}
+
+impl RecordKind {
+    fn is_frame(&self) -> bool {
+        matches!(self, Self::Frame)
+    }
 }
 
 /// Keeps the common case out of the file. Every venue frame but a handful of
@@ -128,14 +154,38 @@ impl<W: AsyncWrite + Unpin> TapeWriter<W> {
     /// fsync per message.
     pub async fn write_frame(&mut self, frame: &RawFrame) -> Result<(), TapeError> {
         let payload = frame.as_str().map_err(|_| TapeError::NonUtf8Payload)?;
-        let record = TapeRecord {
+        self.write_record(&TapeRecord {
             venue: frame.venue,
             elapsed_nanos: nanos(frame.ingest_ts.since(self.start)),
             recorded_wall_unix_nanos: wall_nanos(frame.ingest_ts.wall()),
             payload: payload.to_owned(),
             source: frame.source,
-        };
-        let mut line = serde_json::to_vec(&record)?;
+            kind: RecordKind::Frame,
+        })
+        .await
+    }
+
+    /// Append whatever an ingest task produced — a frame, or the boundary
+    /// where one connection ended and the next began.
+    pub async fn write_message(&mut self, message: &IngestMessage) -> Result<(), TapeError> {
+        match message {
+            IngestMessage::Frame(frame) => self.write_frame(frame).await,
+            IngestMessage::SessionEnded { venue, at, .. } => {
+                self.write_record(&TapeRecord {
+                    venue: *venue,
+                    elapsed_nanos: nanos(at.since(self.start)),
+                    recorded_wall_unix_nanos: wall_nanos(at.wall()),
+                    payload: String::new(),
+                    source: FrameSource::WebSocket,
+                    kind: RecordKind::SessionEnded,
+                })
+                .await
+            }
+        }
+    }
+
+    async fn write_record(&mut self, record: &TapeRecord) -> Result<(), TapeError> {
+        let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
         self.out.write_all(&line).await?;
         Ok(())
@@ -146,11 +196,12 @@ impl<W: AsyncWrite + Unpin> TapeWriter<W> {
     }
 }
 
-/// One frame read off a tape, before its `IngestTime` is reconstructed for
-/// the replay run currently reading it — see [`Self::into_raw_frame`].
+/// One record read off a tape, before its `IngestTime` is reconstructed for
+/// the replay run currently reading it — see [`Self::into_message`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TapedFrame {
     pub venue: VenueId,
+    /// Empty for a session boundary, which carries no bytes.
     pub payload: Vec<u8>,
     /// Offset from the tape's first frame. This, not `recorded_wall`, is
     /// what replay uses for both ordering and pacing.
@@ -159,19 +210,33 @@ pub struct TapedFrame {
     /// module docs on why replay does not reuse this directly.
     pub recorded_wall: SystemTime,
     pub source: FrameSource,
+    /// Whether this record is a frame or the boundary between two sessions.
+    pub session_ended: bool,
 }
 
 impl TapedFrame {
-    /// Reconstruct as a [`RawFrame`] for this replay run, anchored to
+    /// Reconstruct as an [`IngestMessage`] for this replay run, anchored to
     /// `base`. Two replays of the same tape from different `base` readings
-    /// produce frames with different wall clocks but identical relative
+    /// produce messages with different wall clocks but identical relative
     /// ordering and spacing — the property that makes replay deterministic.
-    pub fn into_raw_frame(self, base: IngestTime) -> RawFrame {
+    pub fn into_message(self, base: IngestTime) -> IngestMessage {
         let at = base.advanced_by(self.elapsed);
-        match self.source {
+        if self.session_ended {
+            return IngestMessage::SessionEnded {
+                venue: self.venue,
+                at,
+                // A tape records that the stream restarted, not why. The
+                // aggregator's response is identical for every cause — reset
+                // the sync, distrust the book — so the distinction would be
+                // decoration, and inventing a specific cause on replay would
+                // be worse than admitting the tape does not know.
+                end: SessionEnd::Closed,
+            };
+        }
+        IngestMessage::Frame(match self.source {
             FrameSource::WebSocket => RawFrame::new(self.venue, self.payload, at),
             FrameSource::RestSnapshot => RawFrame::rest_snapshot(self.venue, self.payload, at),
-        }
+        })
     }
 }
 
@@ -215,6 +280,7 @@ impl<R: AsyncRead + Unpin> TapeReader<R> {
                 recorded_wall: SystemTime::UNIX_EPOCH
                     + Duration::from_nanos(record.recorded_wall_unix_nanos),
                 source: record.source,
+                session_ended: record.kind == RecordKind::SessionEnded,
             }));
         }
     }
@@ -249,7 +315,7 @@ pub struct ReplayStats {
 /// [`crate::channel::ChannelMetrics::dropped`] would.
 pub async fn replay<R, C>(
     reader: &mut TapeReader<R>,
-    tx: &Sender<RawFrame>,
+    tx: &Sender<IngestMessage>,
     clock: &C,
     speed: Option<f64>,
 ) -> Result<ReplayStats, TapeError>
@@ -272,9 +338,9 @@ where
         }
         previous_elapsed = elapsed;
 
-        let frame = taped.into_raw_frame(base);
+        let message = taped.into_message(base);
         stats.frames_sent += 1;
-        match tx.send(frame) {
+        match tx.send(message) {
             SendOutcome::Sent => {}
             SendOutcome::DroppedOldest(_) => stats.dropped += 1,
             SendOutcome::Closed(_) => break,
@@ -405,7 +471,7 @@ mod tests {
         drop(writer);
 
         let mut reader = TapeReader::open(&path).await.expect("open");
-        let (tx, rx) = bounded::<RawFrame>(8);
+        let (tx, rx) = bounded::<IngestMessage>(8);
         let replay_clock = TestClock::new();
 
         let stats = replay(&mut reader, &tx, &replay_clock, None)
@@ -418,8 +484,11 @@ mod tests {
 
         let base = replay_clock.now();
         let mut received = Vec::new();
-        while let Some(f) = rx.recv().await {
-            received.push(f);
+        while let Some(message) = rx.recv().await {
+            match message {
+                IngestMessage::Frame(frame) => received.push(frame),
+                IngestMessage::SessionEnded { .. } => panic!("no boundaries on this tape"),
+            }
         }
         assert_eq!(received.len(), 3);
         for (i, f) in received.iter().enumerate() {
@@ -450,7 +519,7 @@ mod tests {
         drop(writer);
 
         let mut reader = TapeReader::open(&path).await.expect("open");
-        let (tx, rx) = bounded::<RawFrame>(2);
+        let (tx, rx) = bounded::<IngestMessage>(2);
 
         let stats = replay(&mut reader, &tx, &TestClock::new(), None)
             .await

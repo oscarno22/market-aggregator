@@ -127,15 +127,53 @@ impl SessionEnd {
     }
 }
 
+/// What an ingest task hands the aggregator.
+///
+/// # Why session boundaries travel in-band
+///
+/// A reconnect is not a pause in the stream, it is a *new* stream, and the
+/// aggregator has to be told. Coinbase makes the consequence concrete: a
+/// resubscribed connection restarts `sequence_num` from a fresh base, so
+/// without this message the sync sees an enormous backwards jump, declares a
+/// gap, and — because the snapshot riding in that same frame is discarded
+/// along with it — never recovers. The book would sit `Desynced` forever while
+/// the socket was perfectly healthy.
+///
+/// Sending it through the same channel as the frames, rather than out of band,
+/// is what keeps the ordering right: the boundary lands exactly where it
+/// happened relative to the frames on either side, even if the channel is
+/// backed up.
+#[derive(Clone, Debug)]
+pub enum IngestMessage {
+    /// Bytes a venue sent.
+    Frame(RawFrame),
+    /// A connection ended. The venue's sync state is reset and its book
+    /// marked `Desynced` until a fresh snapshot lands.
+    SessionEnded {
+        venue: VenueId,
+        at: ma_core::IngestTime,
+        end: SessionEnd,
+    },
+}
+
+impl IngestMessage {
+    pub const fn venue(&self) -> VenueId {
+        match self {
+            Self::Frame(frame) => frame.venue,
+            Self::SessionEnded { venue, .. } => *venue,
+        }
+    }
+}
+
 /// Everything a venue's ingest task needs, assembled once at startup.
 pub struct Ingest<N: Network> {
     net: Arc<N>,
     endpoint: VenueEndpoint,
-    tx: Sender<RawFrame>,
+    tx: Sender<IngestMessage>,
     clock: Arc<dyn Clock>,
     counters: Arc<VenueCounters>,
     policy: BackoffPolicy,
-    tape: Option<mpsc::UnboundedSender<RawFrame>>,
+    tape: Option<mpsc::UnboundedSender<IngestMessage>>,
     shutdown: Shutdown,
 }
 
@@ -155,7 +193,7 @@ impl<N: Network> Ingest<N> {
     pub fn new(
         net: Arc<N>,
         endpoint: VenueEndpoint,
-        tx: Sender<RawFrame>,
+        tx: Sender<IngestMessage>,
         clock: Arc<dyn Clock>,
         counters: Arc<VenueCounters>,
         shutdown: Shutdown,
@@ -195,7 +233,7 @@ impl<N: Network> Ingest<N> {
     /// 2 operation with a human watching, not something the server does in
     /// steady state.
     #[must_use]
-    pub fn recording_to(mut self, tape: mpsc::UnboundedSender<RawFrame>) -> Self {
+    pub fn recording_to(mut self, tape: mpsc::UnboundedSender<IngestMessage>) -> Self {
         self.tape = Some(tape);
         self
     }
@@ -219,6 +257,17 @@ impl<N: Network> Ingest<N> {
                 debug!(%venue, ?end, "ingest task finished");
                 return;
             }
+
+            // Tell the aggregator the stream ended *before* sleeping, so the
+            // book is marked untrustworthy for the whole reconnect window
+            // rather than only once a new socket is up. A book that keeps
+            // reporting `Live` prices through a 60-second outage is precisely
+            // the silent wrongness this project exists to avoid.
+            self.publish(IngestMessage::SessionEnded {
+                venue,
+                at: self.clock.now(),
+                end,
+            });
 
             if backoff.note_session(lasted) {
                 info!(%venue, ?end, ?lasted, "session ended after a stable run");
@@ -365,14 +414,18 @@ impl<N: Network> Ingest<N> {
     /// rather than aspirational.
     fn emit(&self, frame: RawFrame) -> bool {
         self.counters.record_frame(frame.payload.len());
+        self.publish(IngestMessage::Frame(frame))
+    }
 
+    /// Hand any message to the tape and to the aggregator.
+    fn publish(&self, message: IngestMessage) -> bool {
         if let Some(tape) = &self.tape {
             // A closed tape means the recorder finished; that is not a reason
             // to stop ingesting.
-            let _ = tape.send(frame.clone());
+            let _ = tape.send(message.clone());
         }
 
-        match self.tx.send(frame) {
+        match self.tx.send(message) {
             SendOutcome::Sent => true,
             SendOutcome::DroppedOldest(_) => {
                 self.counters.record_drop();
@@ -412,7 +465,7 @@ mod tests {
     struct Harness {
         net: Arc<FakeNetwork>,
         counters: Arc<VenueCounters>,
-        rx: crate::channel::Receiver<RawFrame>,
+        rx: crate::channel::Receiver<IngestMessage>,
         trigger: ShutdownTrigger,
         handle: tokio::task::JoinHandle<()>,
     }
@@ -420,7 +473,7 @@ mod tests {
     impl Harness {
         fn start(venue: VenueId, net: FakeNetwork) -> Self {
             let net = Arc::new(net);
-            let (tx, rx) = bounded::<RawFrame>(64);
+            let (tx, rx) = bounded::<IngestMessage>(64);
             let counters = Arc::new(VenueCounters::default());
             let (trigger, shutdown) = shutdown();
 
@@ -443,10 +496,22 @@ mod tests {
             }
         }
 
-        /// Read the next frame's payload as text.
+        /// Read the next *frame's* payload as text, skipping the session
+        /// boundaries the reconnect tests deliberately provoke.
         async fn next_payload(&self) -> String {
-            let frame = self.rx.recv().await.expect("channel closed early");
-            String::from_utf8(frame.payload).expect("utf8")
+            loop {
+                match self.rx.recv().await.expect("channel closed early") {
+                    IngestMessage::Frame(frame) => {
+                        return String::from_utf8(frame.payload).expect("utf8");
+                    }
+                    IngestMessage::SessionEnded { .. } => {}
+                }
+            }
+        }
+
+        /// Read the next message of any kind.
+        async fn next_message(&self) -> IngestMessage {
+            self.rx.recv().await.expect("channel closed early")
         }
 
         async fn finish(self) {
@@ -586,8 +651,9 @@ mod tests {
 
         let mut saw_snapshot = false;
         for _ in 0..2 {
-            let frame = h.rx.recv().await.expect("frame");
-            if frame.source == FrameSource::RestSnapshot {
+            if let IngestMessage::Frame(frame) = h.next_message().await
+                && frame.source == FrameSource::RestSnapshot
+            {
                 assert_eq!(frame.payload, body.as_bytes());
                 saw_snapshot = true;
             }
@@ -638,7 +704,7 @@ mod tests {
             frames,
             then: FakeEnd::Hang,
         }]));
-        let (tx, rx) = bounded::<RawFrame>(2);
+        let (tx, rx) = bounded::<IngestMessage>(2);
         let counters = Arc::new(VenueCounters::default());
         let (trigger, shut) = shutdown();
 
@@ -670,7 +736,7 @@ mod tests {
     async fn a_closed_channel_stops_the_task_rather_than_reconnecting_forever() {
         let net = FakeNetwork::new([serving(&["{\"a\":1}", "{\"b\":2}"], FakeEnd::Hang)]);
         let net = Arc::new(net);
-        let (tx, rx) = bounded::<RawFrame>(8);
+        let (tx, rx) = bounded::<IngestMessage>(8);
         let counters = Arc::new(VenueCounters::default());
         let (_trigger, shut) = shutdown();
         let probe = Arc::clone(&net);
@@ -737,7 +803,7 @@ mod tests {
             frames,
             then: FakeEnd::Hang,
         }]));
-        let (tx, _rx) = bounded::<RawFrame>(1);
+        let (tx, _rx) = bounded::<IngestMessage>(1);
         let (tape_tx, mut tape_rx) = mpsc::unbounded_channel();
         let (trigger, shut) = shutdown();
 

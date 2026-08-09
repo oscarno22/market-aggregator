@@ -44,6 +44,9 @@ pub struct VenueCounters {
     dropped: AtomicU64,
     rest_fetches: AtomicU64,
     rest_failures: AtomicU64,
+    parse_errors: AtomicU64,
+    heartbeats: AtomicU64,
+    desyncs: AtomicU64,
 }
 
 macro_rules! counter {
@@ -66,6 +69,9 @@ counter! {
     dropped => record_drop,
     rest_fetches => record_rest_fetch,
     rest_failures => record_rest_failure,
+    parse_errors => record_parse_error,
+    heartbeats => record_heartbeat,
+    desyncs => record_desync,
 }
 
 impl VenueCounters {
@@ -89,6 +95,9 @@ impl VenueCounters {
             dropped: load(&self.dropped),
             rest_fetches: load(&self.rest_fetches),
             rest_failures: load(&self.rest_failures),
+            parse_errors: load(&self.parse_errors),
+            heartbeats: load(&self.heartbeats),
+            desyncs: load(&self.desyncs),
         }
     }
 }
@@ -117,6 +126,15 @@ pub struct VenueCountersSnapshot {
     pub dropped: u64,
     pub rest_fetches: u64,
     pub rest_failures: u64,
+    /// Frames the venue's parser rejected. Non-zero means the venue changed
+    /// its wire format, or we misread it — the drift that risk register #2
+    /// says tape fixtures exist to catch.
+    pub parse_errors: u64,
+    pub heartbeats: u64,
+    /// Times this venue's book went from trusted to untrusted. Distinct from
+    /// `disconnects`: a checksum mismatch or a sequence gap desyncs a book on
+    /// a connection that never dropped.
+    pub desyncs: u64,
 }
 
 impl VenueCountersSnapshot {

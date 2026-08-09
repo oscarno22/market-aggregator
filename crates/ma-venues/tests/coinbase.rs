@@ -172,3 +172,32 @@ fn events_for_a_different_product_are_skipped_not_applied() {
         "the foreign product's update must not have touched our book"
     );
 }
+
+#[test]
+fn both_spellings_of_the_ask_side_are_accepted() {
+    // Coinbase's live l2_data uses "offer"; parts of the documentation, and
+    // this crate's hand-authored fixtures, use "ask". Getting this wrong fails
+    // in a nasty way rather than an obvious one: every ask update becomes a
+    // parse error, the book holds bids only, and a one-sided book can never
+    // cross, so the crossed-book detector -- the last-resort correctness check
+    // -- never fires either.
+    let snapshot = |side: &str| {
+        format!(
+            r#"{{"channel":"l2_data","sequence_num":0,"events":[{{"type":"snapshot",
+               "product_id":"BTC-USD","updates":[
+                 {{"side":"bid","price_level":"100.00","new_quantity":"1"}},
+                 {{"side":"{side}","price_level":"101.00","new_quantity":"2"}}]}}]}}"#
+        )
+    };
+
+    for side in ["ask", "offer"] {
+        let mut vb = book();
+        vb.feed(&frame(&snapshot(side)))
+            .unwrap_or_else(|e| panic!("side {side:?} did not parse: {e}"));
+        assert_eq!(
+            levels(vb.book(), Side::Ask),
+            [("101.00".to_owned(), "2".to_owned())],
+            "side {side:?} produced no ask levels"
+        );
+    }
+}
