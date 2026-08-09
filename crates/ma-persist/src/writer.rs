@@ -58,6 +58,7 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use tracing::{debug, info, warn};
 
+use crate::counters::ArchiveCounters;
 use crate::schema::{EVENT_SCHEMA, kind};
 use crate::store::{ObjectStore, StoreError};
 
@@ -137,10 +138,11 @@ pub struct EventWriter {
     /// partition instead of jumping wherever another symbol's rolls left it.
     /// Kept beyond the file's life, which is why it is not on [`OpenFile`].
     parts: BTreeMap<String, u64>,
-    /// Files finished and uploaded, for logs and for the tests that need to
-    /// know a roll actually happened.
-    pub files_written: u64,
-    pub rows_written: u64,
+    /// The one set of tallies for this writer. Shared with `/metrics` when the
+    /// caller passes its own `Arc` via [`EventWriter::with_counters`]; a fresh
+    /// private one otherwise, so every code path counts identically whether
+    /// or not anything is watching.
+    counters: Arc<ArchiveCounters>,
 }
 
 /// The file currently being appended to.
@@ -208,8 +210,7 @@ impl EventWriter {
             event_seq: 0,
             open: BTreeMap::new(),
             parts: BTreeMap::new(),
-            files_written: 0,
-            rows_written: 0,
+            counters: Arc::new(ArchiveCounters::default()),
         }
     }
 
@@ -217,6 +218,26 @@ impl EventWriter {
     pub fn with_config(mut self, config: WriterConfig) -> Self {
         self.config = config;
         self
+    }
+
+    /// Share the writer's tallies with something that reads them — in
+    /// practice, `/metrics`. The writer keeps no private copy: this `Arc` *is*
+    /// the count, so the number scraped and the number logged at shutdown
+    /// cannot disagree.
+    #[must_use]
+    pub fn with_counters(mut self, counters: Arc<ArchiveCounters>) -> Self {
+        self.counters = counters;
+        self
+    }
+
+    /// Files finished and uploaded so far.
+    pub fn files_written(&self) -> u64 {
+        self.counters.files_written()
+    }
+
+    /// Rows in files finished and uploaded so far.
+    pub fn rows_written(&self) -> u64 {
+        self.counters.rows_written()
     }
 
     /// Append one event, rolling its symbol's file first if it belongs to a
@@ -249,6 +270,7 @@ impl EventWriter {
             let file =
                 self.start_file(&partition, window, event.ingest_ts.wall(), event.ingest_ts)?;
             self.open.insert(partition.clone(), file);
+            self.counters.set_open_files(self.open.len() as u64);
         }
 
         self.event_seq += 1;
@@ -281,6 +303,7 @@ impl EventWriter {
         for partition in partitions {
             if let Err(e) = self.roll(&partition).await {
                 warn!(%partition, error = %e, "could not close a partition's file");
+                self.counters.record_failure();
                 first_error.get_or_insert(e);
             }
         }
@@ -367,6 +390,10 @@ impl EventWriter {
         let Some(mut open) = self.open.remove(partition) else {
             return Ok(());
         };
+        // Gauge updated at the moment of removal, not on success: a file that
+        // failed to upload is just as closed, and an open-files gauge that
+        // drifts on failure would overstate what is still at risk.
+        self.counters.set_open_files(self.open.len() as u64);
         Self::flush_row_group(&mut open)?;
 
         let rows = open.rows_total;
@@ -374,8 +401,8 @@ impl EventWriter {
         let size = bytes.len();
 
         self.store.put(&open.key, bytes).await?;
-        self.files_written += 1;
-        self.rows_written += rows;
+        self.counters
+            .record_file(rows, u64::try_from(size).unwrap_or(u64::MAX));
 
         info!(
             key = %open.key,
@@ -611,15 +638,23 @@ pub async fn run(
             // primary product; history is downstream of it, and a process that
             // died because S3 returned a 503 would trade a recoverable gap in
             // the archive for a total outage.
+            //
+            // Swallowed is not silent: the counter is what lets `/metrics`
+            // distinguish a healthy archive from one whose every write is
+            // being rejected.
             warn!(error = %e, "could not append to the parquet writer");
+            writer.counters.record_failure();
         }
     }
     if let Err(e) = writer.close().await {
+        // No counter bump here: `close` already recorded one failure per
+        // partition that could not be finished, and this error is the first
+        // of those, re-surfaced. Counting it again would double-book it.
         warn!(error = %e, "could not close the final parquet file");
     }
     info!(
-        files = writer.files_written,
-        rows = writer.rows_written,
+        files = writer.files_written(),
+        rows = writer.rows_written(),
         "parquet writer finished"
     );
     writer
@@ -768,7 +803,7 @@ mod tests {
         assert_eq!(keys.len(), 2, "the hour boundary did not roll: {keys:?}");
         assert!(keys[0].contains("hour=03"), "{keys:?}");
         assert!(keys[1].contains("hour=04"), "{keys:?}");
-        assert_eq!(writer.files_written, 2);
+        assert_eq!(writer.files_written(), 2);
     }
 
     #[tokio::test]
@@ -792,7 +827,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keys.len(), 1, "one hour produced several files: {keys:?}");
-        assert_eq!(writer.rows_written, 50);
+        assert_eq!(writer.rows_written(), 50);
     }
 
     #[tokio::test]
@@ -879,7 +914,110 @@ mod tests {
             .unwrap();
         let unique: std::collections::BTreeSet<_> = keys.iter().collect();
         assert_eq!(unique.len(), keys.len(), "part keys collided: {keys:?}");
-        assert_eq!(writer.rows_written, 5, "a part overwrote another");
+        assert_eq!(writer.rows_written(), 5, "a part overwrote another");
+    }
+
+    /// A store that refuses every write. What S3 looks like with a broken
+    /// policy, an expired credential, or a deleted bucket — the failure mode
+    /// the archive counters exist to make visible.
+    #[derive(Debug)]
+    struct RejectingStore;
+
+    type TestFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+    impl crate::store::ObjectStore for RejectingStore {
+        fn describe(&self) -> String {
+            "rejecting:everything".to_owned()
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            _bytes: Vec<u8>,
+        ) -> TestFuture<'_, Result<(), crate::store::StoreError>> {
+            let key = key.to_owned();
+            Box::pin(async move {
+                Err(crate::store::StoreError::Rejected {
+                    key,
+                    message: "every write is refused".to_owned(),
+                })
+            })
+        }
+
+        fn get(&self, key: &str) -> TestFuture<'_, Result<Vec<u8>, crate::store::StoreError>> {
+            let key = key.to_owned();
+            Box::pin(async move {
+                Err(crate::store::StoreError::Rejected {
+                    key,
+                    message: "every read is refused".to_owned(),
+                })
+            })
+        }
+
+        fn list(
+            &self,
+            _prefix: &str,
+        ) -> TestFuture<'_, Result<Vec<String>, crate::store::StoreError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_final_upload_is_counted_not_silent() {
+        // `run` swallows the close error by design — a dying store must not
+        // take down ingest. The counter is what keeps that from being a
+        // silent drop policy, which CLAUDE.md calls a bug by name.
+        let counters = Arc::new(ArchiveCounters::default());
+        let writer = EventWriter::new(Arc::new(RejectingStore), "events")
+            .with_counters(Arc::clone(&counters));
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(event(
+            EventKind::Heartbeat { counter: None },
+            at(1_786_247_000),
+        ))
+        .unwrap();
+        drop(tx);
+        let writer = run(rx, writer).await;
+
+        assert_eq!(
+            writer.files_written(),
+            0,
+            "a rejected put counted as written"
+        );
+        assert_eq!(counters.write_failures(), 1, "the failure was not counted");
+    }
+
+    #[tokio::test]
+    async fn a_failed_mid_run_roll_is_counted_not_silent() {
+        // Same policy, different code path: a rotation forced by an hour
+        // boundary fails inside `append`, and `run` drops the event that
+        // triggered it. One counted failure; files_written stays at zero.
+        let counters = Arc::new(ArchiveCounters::default());
+        let writer = EventWriter::new(Arc::new(RejectingStore), "events")
+            .with_counters(Arc::clone(&counters));
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // Two events over an hour apart: the second forces a roll of the
+        // first's file, which the store refuses.
+        tx.send(event(
+            EventKind::Heartbeat { counter: None },
+            at(1_786_247_000),
+        ))
+        .unwrap();
+        tx.send(event(
+            EventKind::Heartbeat { counter: None },
+            at(1_786_251_000),
+        ))
+        .unwrap();
+        drop(tx);
+        let writer = run(rx, writer).await;
+
+        assert_eq!(writer.files_written(), 0);
+        assert!(
+            counters.write_failures() >= 1,
+            "a roll the store refused went uncounted"
+        );
     }
 
     #[tokio::test]
@@ -898,7 +1036,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(writer.files_written, 0);
+        assert_eq!(writer.files_written(), 0);
     }
 
     #[tokio::test]

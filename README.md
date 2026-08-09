@@ -198,7 +198,10 @@ picks the units they are thinking in. Both are why
   drops the *oldest* event, because a stale tick has negative value. This is
   the wrong answer for claims processing, and the code says so — the two places
   that take the opposite policy (the tape tee, and replay) are documented
-  against it. Drops are counted; a silent drop policy is a bug.
+  against it. Drops are counted; a silent drop policy is a bug. The same rule
+  reaches the archive: a failed Parquet upload must not take down ingest, so it
+  is swallowed — and counted, as `ma_archive_write_failures_total`, because a
+  bucket rejecting every write must not scrape like a healthy process.
 - **Reconnect is a resync, not a pause.** Nothing resumes: Coinbase restarts
   its sequence numbers, Kraken resends a snapshot, Bitstamp sends nothing until
   a REST call lands. Session boundaries travel *in-band* so they land in the

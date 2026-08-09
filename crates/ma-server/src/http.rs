@@ -257,6 +257,39 @@ async fn metrics(State(handle): State<PipelineHandle>) -> impl IntoResponse {
         &per_stream(|c| c.audit_failures),
     );
 
+    // The archive's tallies, only when an archive is configured. Absent
+    // rather than zero otherwise: "not archiving" and "archiving nothing"
+    // must not be the same scrape line. No labels — there is one writer per
+    // process, and its files already name their symbol in the key.
+    if let Some(archive) = &handle.archive {
+        out.push_str(&format!(
+            "# HELP ma_archive_rows_written_total Rows in parquet files finished and stored.\n\
+             # TYPE ma_archive_rows_written_total counter\n\
+             ma_archive_rows_written_total {}\n\
+             # HELP ma_archive_files_written_total Parquet files finished and stored.\n\
+             # TYPE ma_archive_files_written_total counter\n\
+             ma_archive_files_written_total {}\n\
+             # HELP ma_archive_bytes_written_total Bytes of finished parquet handed to the store.\n\
+             # TYPE ma_archive_bytes_written_total counter\n\
+             ma_archive_bytes_written_total {}\n\
+             # HELP ma_archive_write_failures_total Appends or uploads the archive could not \
+             complete. Ingest is unaffected by design, which is exactly why this counter exists: \
+             climbing here with flat files_written means the store is rejecting writes and the \
+             archive is accumulating a gap while the process looks healthy.\n\
+             # TYPE ma_archive_write_failures_total counter\n\
+             ma_archive_write_failures_total {}\n\
+             # HELP ma_archive_open_files Parquet files currently open — unwritten footers, \
+             i.e. data at risk until the next roll.\n\
+             # TYPE ma_archive_open_files gauge\n\
+             ma_archive_open_files {}\n",
+            archive.rows_written(),
+            archive.files_written(),
+            archive.bytes_written(),
+            archive.write_failures(),
+            archive.open_files(),
+        ));
+    }
+
     // Book age and time-in-desync live on the aggregator's snapshot rather
     // than in the counters, because they are properties of a book rather than
     // of a connection. Taking one tick's reading keeps this endpoint honest
@@ -612,6 +645,7 @@ mod tests {
                 venues,
                 windows: ma_core::WindowSpec::default(),
                 cluster: None,
+                archive: None,
             },
             agg,
         )
@@ -694,6 +728,38 @@ mod tests {
         .await
         .unwrap();
         String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn archive_series_appear_only_when_an_archive_is_configured() {
+        // Absent, not zero: a node run without --archive must not scrape as
+        // an archive that has written nothing, because the two call for
+        // different responses (nothing vs. panic).
+        let (bare, agg) = handle();
+        let text = scrape(bare, agg).await;
+        assert!(
+            !text.contains("ma_archive_"),
+            "archive series published with no archive configured:\n{text}"
+        );
+
+        let (mut handle, agg) = handle();
+        let counters = Arc::new(ma_persist::ArchiveCounters::default());
+        counters.record_file(120, 4096);
+        counters.record_failure();
+        handle.archive = Some(counters);
+        let text = scrape(handle, agg).await;
+        assert!(
+            text.contains("ma_archive_rows_written_total 120"),
+            "rows counter missing or wrong:\n{text}"
+        );
+        assert!(
+            text.contains("ma_archive_files_written_total 1"),
+            "files counter missing or wrong:\n{text}"
+        );
+        assert!(
+            text.contains("ma_archive_write_failures_total 1"),
+            "the counter this block exists for is missing:\n{text}"
+        );
     }
 
     #[tokio::test]

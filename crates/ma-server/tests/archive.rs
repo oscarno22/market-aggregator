@@ -111,8 +111,8 @@ async fn record_archive(store: Arc<dyn ObjectStore>) -> Snapshot {
         .await
         .expect("the archive writer hung")
         .expect("the archive writer panicked");
-    assert!(written.files_written > 0, "nothing was archived");
-    assert!(written.rows_written > 0);
+    assert!(written.files_written() > 0, "nothing was archived");
+    assert!(written.rows_written() > 0);
 
     last_snapshot(&mut snapshots)
 }

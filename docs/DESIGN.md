@@ -791,6 +791,7 @@ different situations), `/health`.
 | `ma_cluster_last_contact_ms` climbing | Registry round trips are failing. At `ttl - guard` the node stands down. | The early warning for the row above. |
 | `ma_cluster_members` disagreeing between nodes | Normal for one renewal interval after a change; a lasting disagreement means one node cannot read what another can write. | The lease argument tolerates this — it is exactly what holder-side expiry and the settling period cover — but a *persistent* split means the registry is not the shared thing it is assumed to be. |
 | `ma_book_age_ms` large, status still `live` | Nothing has invalidated the book, but nothing is updating it either. | On a live feed the idle watchdog should have fired; if it has not, check that the heartbeat subscription is actually established. |
+| `ma_archive_write_failures_total` climbing, `ma_archive_files_written_total` flat | The store is rejecting every write. Ingest and the live books are unaffected **by design** — which is exactly why this is the only place the failure shows. | The archive is accumulating a gap while the process looks healthy. Check credentials, the bucket policy, and disk space — before the hour rolls, not after. These series only exist when `--archive` is configured: absent means "not archiving", zero means "archiving cleanly". |
 
 ### A note on restarts
 

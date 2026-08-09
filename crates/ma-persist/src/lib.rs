@@ -38,6 +38,7 @@
 //! and the offline suite cannot acquire a dependency on credentials by
 //! accident. See [`store`] and, when the feature is on, [`s3`].
 
+pub mod counters;
 pub mod reader;
 pub mod schema;
 pub mod store;
@@ -46,6 +47,7 @@ pub mod writer;
 #[cfg(feature = "s3")]
 pub mod s3;
 
+pub use counters::ArchiveCounters;
 pub use reader::{EventReader, ReadError, StoredEvent};
 pub use store::{LocalStore, ObjectStore, StoreError};
 pub use writer::{EventWriter, WriteError, WriterConfig, run};

@@ -65,6 +65,15 @@ pub struct PipelineHandle {
     /// "no coordination configured" and "a cluster of one" behave differently
     /// on startup: only the second serves a settling period.
     pub cluster: Option<tokio::sync::watch::Receiver<ClusterView>>,
+    /// The archive writer's tallies, when `--archive` is on. `None` means no
+    /// archive was configured, and `/metrics` emits no `ma_archive_*` series
+    /// at all — absent, not zero, for the same reason the window gauges are:
+    /// "not archiving" and "archiving nothing" must not be the same line.
+    ///
+    /// Set by `main` after the pipeline is spawned rather than plumbed through
+    /// `Pipeline`, because the writer task is created beside the pipeline, not
+    /// by it — the aggregator only ever sees an event sender.
+    pub archive: Option<Arc<ma_persist::ArchiveCounters>>,
 }
 
 impl PipelineHandle {
@@ -293,6 +302,7 @@ impl Pipeline {
             venues: self.venues.clone(),
             windows: self.windows.clone(),
             cluster: self.cluster.clone(),
+            archive: None,
         };
 
         let task = tokio::spawn(aggregator.run(rx, self.shutdown.clone()));

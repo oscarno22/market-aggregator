@@ -117,16 +117,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Attached before the aggregator is spawned, because the aggregator is the
     // only thing that can produce normalised events — see
     // `Aggregator::publishing_events_to`.
-    let archive = match &args.archive {
+    let (archive, archive_counters) = match &args.archive {
         Some(uri) => {
             let store = ma_persist::store_from_uri(uri).await?;
             tracing::info!(store = %store.describe(), prefix = %args.archive_prefix, "archiving");
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let writer = ma_persist::EventWriter::new(store, args.archive_prefix.clone());
+            let counters = std::sync::Arc::new(ma_persist::ArchiveCounters::default());
+            let writer = ma_persist::EventWriter::new(store, args.archive_prefix.clone())
+                .with_counters(std::sync::Arc::clone(&counters));
             pipeline = pipeline.recording_events_to(tx);
-            Some(tokio::spawn(ma_persist::run(rx, writer)))
+            (
+                Some(tokio::spawn(ma_persist::run(rx, writer))),
+                Some(counters),
+            )
         }
-        None => None,
+        None => (None, None),
     };
 
     // Before the aggregator, which reads the ownership channel this creates.
@@ -153,7 +158,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
-    let (handle, aggregator) = pipeline.spawn_aggregator()?;
+    let (mut handle, aggregator) = pipeline.spawn_aggregator()?;
+    handle.archive = archive_counters;
     let ingest = pipeline.spawn_ingest(None)?;
     let shutdown = pipeline.shutdown();
 
@@ -199,8 +205,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(archive) = archive {
         match tokio::time::timeout(Duration::from_secs(30), archive).await {
             Ok(Ok(writer)) => tracing::info!(
-                files = writer.files_written,
-                rows = writer.rows_written,
+                files = writer.files_written(),
+                rows = writer.rows_written(),
                 "archive flushed"
             ),
             Ok(Err(e)) => tracing::error!(error = %e, "the archive writer panicked"),
