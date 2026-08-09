@@ -151,6 +151,24 @@ impl Pipeline {
         })
     }
 
+    /// Replace the clock every part of the pipeline reads.
+    ///
+    /// Exists for replay, and specifically for `--speed`: replay synthesises
+    /// each frame's `IngestTime` as `base + recorded_offset`, so at a speed
+    /// multiplier those timestamps advance faster than the wall clock and an
+    /// aggregator on [`SystemClock`] compares tape time against wall time. See
+    /// [`ma_core::ScaledClock`] for what that looks like from the outside —
+    /// zero book ages and empty windows, none of which reads as a clock
+    /// problem.
+    ///
+    /// Must be called before [`Self::spawn_aggregator`], which takes its own
+    /// handle.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
     #[must_use]
     pub fn with_tick(mut self, tick: Duration) -> Self {
         self.tick = tick;

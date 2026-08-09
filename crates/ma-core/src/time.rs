@@ -107,6 +107,70 @@ impl Clock for SystemClock {
     }
 }
 
+/// A clock that runs at a multiple of the real one, from a fixed base.
+///
+/// # Why replay needs its own clock at all
+///
+/// Replay reconstructs each frame's [`IngestTime`] as `base + recorded_offset`
+/// — see `ma_pipeline::tape`. At a speed multiplier of `n`, those offsets
+/// advance `n` times faster than the wall clock does, so an aggregator reading
+/// [`SystemClock`] is comparing timestamps from *tape time* against a `now`
+/// from *wall time*, and the two diverge without limit.
+///
+/// Every duration the aggregator derives is then wrong, and wrong in the
+/// direction that hides it: `now` is behind the events, so
+/// `now.since(last_update)` saturates to zero and book age reads a healthy
+/// `0ms` while every rolling window, whose buckets are indexed off the event
+/// clock, reads *empty*. A `--speed 5` demo showed full books, zero ages, and
+/// no window data at all — three symptoms of one mismatch, none of which looks
+/// like a clock problem.
+///
+/// A `ScaledClock` closes it by construction: the aggregator's `now` advances
+/// at exactly the rate the tape's offsets do, so a "10-second window" over a
+/// 5× replay means ten seconds *of market*, which is the only reading that
+/// means anything.
+///
+/// At `speed == 1.0` this is [`SystemClock`] with an offset, which is why a
+/// realtime replay was correct before this existed and a fast one was not.
+///
+/// **Full-speed replay (`Pacing::Faithful`) has no meaningful wall-clock
+/// semantics at all** — it consumes a three-minute tape in about a second —
+/// and deliberately does not use this. Its purpose is to prove that the same
+/// tape produces the same *books*, which is a claim about the event sequence
+/// and not about time.
+#[derive(Debug)]
+pub struct ScaledClock {
+    base: IngestTime,
+    origin: Instant,
+    speed: f64,
+}
+
+impl ScaledClock {
+    /// `base` should be the same reading replay uses to anchor its offsets.
+    ///
+    /// A non-positive speed is clamped rather than rejected: it arrives from a
+    /// command line, and the clock stopping dead is a far more confusing
+    /// failure than a run that goes at real time and says so.
+    pub fn new(base: IngestTime, speed: f64) -> Self {
+        Self {
+            base,
+            origin: Instant::now(),
+            speed: if speed > 0.0 { speed } else { 1.0 },
+        }
+    }
+
+    pub fn speed(&self) -> f64 {
+        self.speed
+    }
+}
+
+impl Clock for ScaledClock {
+    fn now(&self) -> IngestTime {
+        self.base
+            .advanced_by(self.origin.elapsed().mul_f64(self.speed))
+    }
+}
+
 /// A clock that only moves when told to.
 ///
 /// Lets a test assert "the book was stale for 30 seconds" without a test that
@@ -151,6 +215,34 @@ impl Clock for TestClock {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scaled_clock_runs_at_its_multiple_of_real_time() {
+        let base = SystemClock.now();
+        let clock = ScaledClock::new(base, 10.0);
+        std::thread::sleep(Duration::from_millis(20));
+        let elapsed = clock.now().since(base);
+
+        // Bounds rather than an equality: this is the one clock in the project
+        // that cannot be driven deterministically, because scaling a real
+        // clock is the whole of its job. Ten times a 20ms sleep is 200ms, and
+        // the window below is wide enough for a loaded machine and far too
+        // narrow to admit an unscaled clock, which would read ~20ms.
+        assert!(
+            elapsed >= Duration::from_millis(150) && elapsed < Duration::from_secs(2),
+            "a 10x clock reported {elapsed:?} over a 20ms sleep"
+        );
+    }
+
+    #[test]
+    fn a_non_positive_speed_falls_back_to_real_time_rather_than_stopping() {
+        // Arrives from a command line. A clock that stopped dead would make
+        // every book age zero and every window empty — the exact symptom this
+        // type exists to prevent.
+        for speed in [0.0, -1.0] {
+            assert_eq!(ScaledClock::new(SystemClock.now(), speed).speed(), 1.0);
+        }
+    }
 
     #[test]
     fn test_clock_moves_only_when_advanced() {

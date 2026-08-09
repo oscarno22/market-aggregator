@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
-use ma_core::Symbol;
+use ma_core::{Clock, Symbol};
 use ma_pipeline::tape::{Pacing, TapeReader, replay};
 use ma_server::{DEFAULT_VENUES, Pipeline, http, init_tracing, parse_symbols, stop_requested};
 
@@ -81,6 +81,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .cloned()
         .unwrap_or_else(|| Symbol::new("BTC-USD"));
     let mut pipeline = Pipeline::new(symbols, DEFAULT_VENUES.to_vec())?;
+
+    // At a speed multiplier the tape's timestamps advance faster than the wall
+    // clock, so the aggregator needs a clock that advances with them. Without
+    // it, `--speed 5` publishes books with zero age and windows with no data —
+    // see `ma_core::ScaledClock`. Full-speed replay keeps the system clock:
+    // it has no meaningful wall-clock semantics to preserve, and its claim is
+    // about the books rather than about time.
+    if let Some(speed) = args.speed {
+        pipeline = pipeline.with_clock(std::sync::Arc::new(ma_core::ScaledClock::new(
+            ma_core::SystemClock.now(),
+            speed,
+        )));
+    }
+
     let (handle, aggregator) = pipeline.spawn_aggregator()?;
     let tx = pipeline.channel();
     let clock = pipeline.clock();

@@ -590,6 +590,30 @@ Venue timestamps are retained but **never** used for ordering. They disagree
 by seconds and some venues are simply wrong; they exist so skew can be
 measured and reported, not trusted.
 
+### Replay needs a clock of its own, and finding out why took v3
+
+Replay reconstructs each frame's `IngestTime` as `base + recorded_offset`. At a
+speed multiplier of `n` those offsets advance `n` times faster than the wall
+clock, so an aggregator reading `SystemClock` compares *tape* time against
+*wall* time and the two diverge without limit.
+
+Every duration the aggregator derives is then wrong, and wrong in the direction
+that hides it: `now` trails the events, `now.since(last_update)` saturates to
+zero, and book age reads a healthy `0ms` while every rolling window — indexed
+off the event clock — reads empty. `--speed 5` showed full books, zero ages and
+no window data at all: three symptoms of one mismatch, none of which looks like
+a clock problem.
+
+`ScaledClock` closes it by construction, so a "10-second window" over a 5×
+replay means ten seconds *of market*. At `speed == 1.0` it is `SystemClock`
+with an offset, which is why a realtime replay was correct before it existed
+and a fast one was not — and why this survived v1 and v2 undetected: nothing
+before v3 published a number derived from a duration.
+
+Full-speed replay (`Pacing::Faithful`) deliberately keeps the system clock. It
+consumes a three-minute tape in about a second and has no wall-clock semantics
+to preserve; its claim is about the *books*, not about time.
+
 Every snapshot published to the UI carries a `clock: "ingest_monotonic"`
 field. The rule that any surfaced comparison must name its clock is enforced
 by shipping the label with the data, rather than documenting it here and
@@ -619,6 +643,7 @@ hoping.
 | Parquet prices as **strings** | Arrow `Decimal128`, or floats | `Decimal128` fixes one scale per column and these venues do not share one. Kraken's checksum covers the digits it sent, trailing zeros included; a column-wide scale would silently rewrite them. |
 | Parquet: one row per **level** | one row per event, levels nested in a `list<struct>` | A file nobody can query is just an expensive tape, and the tape is better at being a tape. Flat rows make "what was on the book at 03:14" a predicate rather than an unnest. |
 | Parquet teed from the **aggregator** | a second consumer of the raw-frame channel | A second consumer would have to duplicate every `VenueSync` and would eventually disagree with the first. Teeing after normalisation means the archive is the same event sequence the live books were built from. |
+| A `ScaledClock` for `--speed` replay | the system clock, as v1 and v2 used | At `n×`, tape timestamps advance `n×` faster than wall time. The aggregator then reads zero book ages and empty windows — symptoms that look like a data problem, not a clock one. |
 | Window coverage as `trusted_ms` + `span_ms` | a single `coverage` fraction | Two integers say *which* of the two is unusual — a young process and a flapping book both read 0.5. A fraction also invites `f64` into a crate that lints against it. |
 | `range_bps` as the volatility figure | realised volatility (stdev of log returns) | Needs a log and a square root, so `f64`, so the exact-decimal discipline breaks at the last step. The range is cruder, exact, and assumes no distribution. |
 | One bucket ring per stream, shared by every span | one sample buffer per configured span | Memory becomes `O(longest / resolution)` instead of `O(updates_per_sec × longest)` — kilobytes rather than megabytes per stream on Coinbase — and a fourth window costs nothing at ingest. |

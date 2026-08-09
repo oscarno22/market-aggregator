@@ -326,6 +326,13 @@ code, both only observable over a long run against real traffic:
    against a fixed origin. **The bug was in the test harness every offline claim
    rests on, and presented as a bug in the system under test.**
 
+3. **Replay had no clock of its own.** Frames carry `base + recorded_offset`,
+   so at `--speed n` they advance `n` times faster than the wall clock the
+   aggregator read. Book ages saturated to `0ms` and every rolling window read
+   empty — and none of that looks like a clock problem. Invisible through v1
+   and v2 because nothing before v3 published a number derived from a duration.
+   `ma_core::ScaledClock` now advances with the tape.
+
 **Next up:** v4 — a cross-node merged view, symbol-partitioned Parquet, a tape
 across a real reconnect. Note the sequencing rule still standing: nothing writes
 to S3 before an IAM user scoped to one bucket prefix replaces the root keys. The

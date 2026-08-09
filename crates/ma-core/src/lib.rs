@@ -39,5 +39,5 @@ pub use cross::{CrossLeg, CrossPolicy, CrossVenue, Exclusion, ExclusionReason, c
 pub use event::{EventKind, Level, MarketEvent, Side, SkewObservation, Symbol, VenueId};
 pub use price::{ParseError, Price, Qty};
 pub use stream::StreamId;
-pub use time::{Clock, IngestTime, SystemClock, TestClock};
+pub use time::{Clock, IngestTime, ScaledClock, SystemClock, TestClock};
 pub use window::{RollingWindows, WindowReading, WindowSpec};
