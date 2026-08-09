@@ -395,8 +395,8 @@ impl VenueBook {
     /// Lifetime audit totals: how many comparisons ran, and how many
     /// disagreed. The audit's primary output is this pair, not the desync —
     /// see [`ma_core::audit`] on why a single finding is not evidence.
-    pub fn audit_trail(&self) -> AuditTrail {
-        self.audit_trail
+    pub fn audit_trail(&self) -> &AuditTrail {
+        &self.audit_trail
     }
 
     /// This book's subscription identity.
@@ -464,7 +464,7 @@ impl VenueBook {
             self.audit_policy,
         );
 
-        if let Some(reason) = self.audit_trail.observe(outcome, self.audit_policy) {
+        if let Some(reason) = self.audit_trail.observe(&outcome, self.audit_policy) {
             self.book.mark_desynced(reason, at);
         }
 

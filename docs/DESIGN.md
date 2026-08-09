@@ -1,7 +1,8 @@
 # market-aggregator — design and operation
 
 Multi-venue crypto market data ingest, normalisation and fan-out, in Rust and
-tokio. Three venues, one symbol, one process.
+tokio. Three venues, any number of symbols, one process — with full L2 depth,
+a periodic integrity audit, and a Parquet archive it can replay itself from.
 
 This document is the reasoning, not the API docs — `cargo doc` has those, and
 the module headers carry the local arguments. What follows is the part that is
@@ -59,6 +60,8 @@ flowchart LR
   agg -- "snapshot every 250ms" --> BC
   BC --> S1["SSE client"]
   BC --> S2["SSE client"]
+  agg -- "normalised events" --> PQ[("Parquet
+  hourly, ObjectStore")]
   TAPE[("tape<br/>unbounded tee")] -.-> CB
   CB -.-> TAPE
   KR -.-> TAPE
@@ -68,6 +71,20 @@ flowchart LR
 **Ingest tasks own a socket and nothing else.** No shared state, no books, no
 knowledge that other venues exist. Each one connects, subscribes, reads,
 reconnects, and pushes bytes into the channel.
+
+**One task per *stream*, not per venue.** A stream is a `(venue, symbol)` pair —
+`StreamId` — and it is the unit that owns a connection, a book, a set of
+counters and a resync signal. All three venues would accept several symbols on
+one socket, and this deliberately does not do that. §4's recovery path is the
+reason: **a resync is a disconnect.** On a multiplexed connection, repairing one
+symbol's sequence gap would tear down every other symbol's healthy subscription
+with it, turning a single-book fault into a venue-wide outage. Per-stream
+connections keep the blast radius of a resync to the book that needed one.
+
+The cost is connections: venues rate-limit, and this multiplies sockets by the
+symbol count. At a handful of symbols that is uninteresting. At fifty it would
+be, and the honest answer there is v3's sharding rather than giving up the
+isolation.
 
 **The aggregator owns every book, exclusively.** One task, no locks. Not
 because a `Mutex` would be slow at three venues — it would not — but because a
@@ -85,10 +102,16 @@ build if an async dependency is ever added.
 
 | Crate | Contains | May use |
 |---|---|---|
-| `ma-core` | `Book`, `MarketEvent`, `Price`, `IngestTime` | nothing async |
+| `ma-core` | `Book`, `MarketEvent`, `Price`, `IngestTime`, `StreamId`, the audit | nothing async |
 | `ma-venues` | wire formats, per-venue sync, endpoints | `serde` only |
 | `ma-pipeline` | channel, ingest, aggregator, tape | `tokio` |
+| `ma-persist` | Arrow schema, Parquet writer, `ObjectStore`, S3 | `arrow`, `parquet` |
 | `ma-server` | axum SSE, `/metrics`, the binaries | everything |
+
+`ma-persist` exists as its own crate for the same reason `ma-core` has no
+`tokio`: `arrow` and `parquet` are a large dependency that the pipeline should
+not need in order to build or be tested, and the persistence layer should be
+replaceable without touching the thing that produces the data.
 
 ---
 
@@ -325,7 +348,145 @@ the schedule assertable in microseconds instead of minutes.
 
 ---
 
-## 5. Backpressure
+## 5. Auditing the venues that prove nothing
+
+§3's table has a hole in it that v1 lived with and v2 closes. Kraken hashes the
+book we actually built and sends the hash with every message. The other two
+publish nothing that checks our book at all:
+
+- **Bitstamp** is `OrderOnly`. A dropped diff leaves no trace anywhere in the
+  protocol. The book is silently wrong from that moment and nothing will ever
+  say so.
+- **Coinbase** is `GapDetectable`, which catches a *lost message* and nothing
+  else. A delta applied to the wrong side, or a level dropped by our own code,
+  leaves `sequence_num` perfectly contiguous.
+
+A periodic REST depth fetch is the only independent evidence either venue can
+produce. Kraken is deliberately **not** audited: a comparison once a minute is
+strictly weaker evidence than a checksum on every message, bought with extra
+requests to a venue that rate-limits.
+
+### Why the obvious implementation would be worse than nothing
+
+A REST snapshot describes the venue's book at instant `T`. Ours, by the time
+the response arrives, is at `T + δ` having applied every delta in between. On a
+liquid pair δ is a hundred milliseconds and the touch moves several times
+inside it. A direct comparison would disagree almost every time — and a check
+that cries wolf continuously is worse than no check, because it trains its
+reader to ignore the one occasion it is right. If it also desynced the book, it
+would produce a permanent reconnect loop against a venue that bans for exactly
+that.
+
+Two properties rescue it, and they are the whole design:
+
+**1. Drift near the touch self-repairs; drift far out does not.**
+A lost delta leaves one price level wrong, and it stays wrong until something
+rewrites that same price. Near the touch that is seconds; far out it can be
+minutes. So the outer book is simultaneously where real corruption
+*accumulates* and where the timing race *does not reach*.
+
+**2. Genuine drift stays at one price; a race does not.** A timing discrepancy
+is at a different level next time, because the book has moved on. A discrepancy
+caused by a lost message is still there, at the *same* price, indefinitely.
+
+### Both properties were wrong in their first implementation
+
+Neither survived contact with live venues, and both failures are worth keeping
+on the record because each looked obviously correct offline and each produced
+the same symptom: every Coinbase and Bitstamp book desynced within two minutes
+of startup, on a system whose books were in fact fine.
+
+**The guard band was counted in levels.** On a dense book that is not a
+distance at all:
+
+| Coinbase BTC-USD | span |
+|---|---|
+| top 50 levels | 2.4 bps |
+| top 1000 levels | 139 bps |
+| 5 levels (the original guard) | 0.2 bps |
+
+The touch moves further than 0.2 bps during the REST round trip, so the guard
+sat entirely inside the churn it existed to exclude. It is now
+`AuditPolicy::guard_bps`, a price distance, and the REST requests ask for
+`limit=1000` so there is anything left to compare beyond it.
+
+**"Two mismatching audits in a row" is not evidence.** Measured against the
+live feed, disagreement by distance from the touch looks like this:
+
+| Band | levels | disagree |
+|---|---|---|
+| 0–1 bps | 30 | 0% |
+| 1–5 bps | 146 | ~2% |
+| 5–10 bps | 150 | ~1.3% |
+| 10–25 bps | 223 | **0%** |
+| 25+ bps | 1451 | **0%** |
+
+Beyond ten basis points the two books agree exactly. But an audit compares
+hundreds of levels, so even a small residual rate means *something* disagrees
+most of the time — at a **different price** each time. Requiring two mismatches
+in a row therefore fired constantly.
+
+The rule is now: **the same price must be wrong on consecutive audits.**
+`AuditTrail` intersects the finding sets of successive audits; churn empties the
+intersection and starts over, while a lost delta keeps its price in it. That is
+what property 2 actually claims, stated precisely enough to act on.
+
+`just audit-probe` prints the table above for any venue. It is how both of these
+were diagnosed, and it is the tool to reach for before touching `AuditPolicy`.
+
+```mermaid
+sequenceDiagram
+  participant R as venue REST
+  participant I as ingest task
+  participant A as aggregator
+  loop every 60s
+    I->>R: GET depth
+    R->>I: snapshot
+    I->>A: frame{source=RestAudit}
+    A->>A: compare levels beyond guard_bps, by price
+    alt agrees
+      A->>A: streak = 0, suspect = {}
+    else disagrees
+      A->>A: audit_mismatches += 1
+      A->>A: suspect ∩= disagreeing prices
+      alt suspect is now empty
+        Note over A: the disagreement moved — churn, not drift.<br/>Start a new streak from this reading.
+      else same price still wrong, streak >= 2
+        A->>A: Desynced{AuditMismatch} → resync (§4)
+      end
+    end
+  end
+```
+
+The audit is **advisory first and authoritative second**. Every comparison
+feeds `ma_audit_mismatches_total`, which is the honest primary output; only a
+repeated finding is allowed to declare the book untrustworthy, and when it does
+it routes into §4's existing recovery, because the repair for drift is the same
+fresh snapshot every other desync needs.
+
+Three details that are easy to get wrong:
+
+- **Comparison is by price, not by index.** One extra level in either window
+  would misalign an index-based comparison and report every subsequent level as
+  wrong — turning one real discrepancy into hundreds of spurious ones and
+  burying the price that mattered.
+- **An inconclusive audit does not clear the streak.** If it did, a book could
+  alternate mismatch/inconclusive forever and never accumulate evidence, while
+  every individual reading looked defensible.
+- **A desynced book is not audited at all.** It is *expected* to disagree —
+  it is mid-recovery — and counting that would manufacture the evidence the
+  audit exists to gather. Same argument as refusing to checksum a book that
+  does not exist yet.
+
+`FrameSource::RestAudit` is a separate variant from `RestSnapshot` because the
+two do opposite things with identical bytes: one replaces the book, the other
+compares against it. Collapsing them would mean every audit silently repaired
+the drift it was meant to detect, and the book would look healthy forever. It
+also means an audit lands on a tape and replays offline like everything else.
+
+---
+
+## 6. Backpressure
 
 ```mermaid
 flowchart LR
@@ -388,7 +549,7 @@ mistake as a silent drop.
 
 ---
 
-## 6. Clocks
+## 7. Clocks
 
 Every event carries both:
 
@@ -400,8 +561,30 @@ Every event carries both:
 
 `IngestTime` deliberately does not implement `Serialize`, because serialising
 an `Instant` is meaningless outside the process that created it. The
-persistence layer must reach for `wall()` explicitly and answer the question
+persistence layer must reach for a clock explicitly and answer the question
 "which clock is this column?" in writing.
+
+v2 pays that debt, and it turns out **one column is not enough**. The Parquet
+schema carries three:
+
+| Column | Clock | Used for |
+|---|---|---|
+| `ingest_wall_unix_nanos` | `SystemTime` at ingest | joins, humans. Can jump backwards under NTP, which is why it is not the ordering column |
+| `ingest_elapsed_nanos` | monotonic, since the writer's first event | **ordering and replay pacing** |
+| `venue_ts_unix_nanos` | the venue's own claim, nullable | skew measurement only |
+
+`ingest_elapsed_nanos` is not an `Instant` — it is an *elapsed duration*, which
+is meaningful in any process. That is exactly the answer the raw-frame tape
+already gave with `elapsed_nanos`, and the two agreeing is deliberate: a second
+answer to a solved question would have been the mistake.
+
+**`venue_ts` was a v1 hole.** The field existed on `MarketEvent` and was never
+populated, so clock skew was structurally unmeasurable and the Parquet column
+would have been entirely null. v2 parses it — Coinbase and Kraken send RFC 3339,
+Bitstamp's `microtimestamp` doubles as its clock. It is still never used to
+order anything, which is what makes a hand-rolled RFC 3339 reader in `ma-venues`
+an acceptable trade against pulling in a calendar library: the worst a bug there
+can do is misreport skew.
 
 Venue timestamps are retained but **never** used for ordering. They disagree
 by seconds and some venues are simply wrong; they exist so skew can be
@@ -414,7 +597,7 @@ hoping.
 
 ---
 
-## 7. Decisions, and what was rejected
+## 8. Decisions, and what was rejected
 
 | Decision | Rejected alternative | Why |
 |---|---|---|
@@ -429,6 +612,14 @@ hoping.
 | Raw-frame tape | Recording normalised events | Recording after parsing means a session can never reproduce a parser bug or a venue schema change — the two failures most likely to happen unattended. All three bugs found so far were of exactly that kind. |
 | SplitMix64 for jitter | the `rand` crate | Jitter has no cryptographic requirement, and an explicit seed makes a failing schedule reproducible by pasting it back. |
 | No Kafka | Kafka | Ops burden without payoff at single-node scale. Revisit at v3 sharding. |
+| One connection per `(venue, symbol)` | one connection per venue, multiplexed | A resync *is* a disconnect. Multiplexing would tear down every other symbol's healthy subscription to repair one book. See §2. |
+| Depth served ≠ depth retained | pruning every venue to the served depth | Pruning is only safe where the venue publishes a depth-limited feed (Kraken). On a full-depth feed a delete inside the retained window exposes a level that can never be recovered from deltas. |
+| Audit requires the **same price** wrong twice running | any two consecutive mismatches | Measured: ~2% of levels in the 1–10 bps band disagree at any instant, so *some* level is nearly always wrong. Only a price that stays wrong is drift. See §5. |
+| Audit guard measured in **basis points** | a level count | On a dense book a level count is not a distance: 50 levels of Coinbase BTC-USD span 2.4 bps. The level-counted guard sat inside the churn it existed to exclude. |
+| Parquet prices as **strings** | Arrow `Decimal128`, or floats | `Decimal128` fixes one scale per column and these venues do not share one. Kraken's checksum covers the digits it sent, trailing zeros included; a column-wide scale would silently rewrite them. |
+| Parquet: one row per **level** | one row per event, levels nested in a `list<struct>` | A file nobody can query is just an expensive tape, and the tape is better at being a tape. Flat rows make "what was on the book at 03:14" a predicate rather than an unnest. |
+| Parquet teed from the **aggregator** | a second consumer of the raw-frame channel | A second consumer would have to duplicate every `VenueSync` and would eventually disagree with the first. Teeing after normalisation means the archive is the same event sequence the live books were built from. |
+| S3 behind a default-off feature | always compiled | Makes CLAUDE.md's "nothing touches AWS before v2" structural rather than remembered: the offline suite cannot acquire a dependency on credentials. |
 
 ### What the live tape found that fixtures did not
 
@@ -449,13 +640,16 @@ messages they are thinking about.
 
 ---
 
-## 8. Operating it
+## 9. Operating it
 
 ```bash
 just test                       # full offline suite; passes in airplane mode
 just serve                      # connect to all three venues, http://127.0.0.1:8080
+just serve coinbase,kraken,bitstamp BTC-USD,ETH-USD   # several symbols
+just archive /var/lib/market-data                     # serve, and keep the history
 just demo tapes/<tape>.jsonl.gz # replay a recording at its original pace, with the page
-just record coinbase,kraken,bitstamp BTC-USD 60   # capture a new tape (needs network)
+just replay-archive /var/lib/market-data              # replay the Parquet archive
+just record coinbase,kraken,bitstamp BTC-USD 60       # capture a new tape (needs network)
 ```
 
 Endpoints: `/` the page, `/events` SSE, `/metrics` Prometheus text,
@@ -475,6 +669,10 @@ Endpoints: `/` the page, `/events` SSE, `/metrics` Prometheus text,
 | `ma_idle_timeouts_total` climbing, `connect_failures_total` flat | The venue accepts connections and then goes silent. | Nothing below the application layer will report this. Usually a venue-side problem; the watchdog is already reconnecting. |
 | `connect_failures_total` climbing fast | Often a rate limit. | **Do not restart in a loop.** The backoff is already capped at 60s. Restarting the process resets the schedule and is how a temporary block becomes a lasting one. |
 | `ma_parse_errors_total` non-zero | The venue changed its wire format, or we misread it. | Record a tape and replay it. This is what the tape recorder is for. |
+| `ma_audit_mismatches_total` climbing, book still `live` | **The most interesting reading v2 adds.** The book disagrees with the venue's REST depth repeatedly, but never twice in a row — so no single comparison could prove it. | Real. A book that races cleanly would disagree at random, not persistently. Pull the archive for that hour and diff the deep levels; suspect a delta being applied to the wrong side. |
+| status `desynced`, reason `depth audit disagreed` | Two consecutive audits found the same book wrong. On Bitstamp this is the *only* loss signal that exists. | The resync has already been requested. If it recurs after a fresh snapshot, the fault is in our application logic, not the venue's stream. |
+| `ma_audit_failures_total` climbing, `ma_audits_total` flat | The audit endpoint is unreachable. The book is **unchecked**, not wrong. | Nothing is broken yet, but the venue's weakest guarantee is now the only one in force. Check the REST host before assuming the feed is fine. |
+| `ma_book_levels` far larger than the served depth | Normal, and worth understanding. Coinbase holds five figures of depth while serving ten levels. | Nothing. A *small* number here on Coinbase or Bitstamp would be the surprise — it would mean the book is being pruned, which is unsafe on a full-depth feed. |
 | `ma_book_age_ms` large, status still `live` | Nothing has invalidated the book, but nothing is updating it either. | On a live feed the idle watchdog should have fired; if it has not, check that the heartbeat subscription is actually established. |
 
 ### A note on restarts
@@ -486,7 +684,7 @@ erases the evidence. Take a `/api/snapshot` and a `/metrics` scrape first.
 
 ---
 
-## 9. Where this stops
+## 10. Where this stops
 
 v1 is complete: three venues, one symbol, reconnect with gap-fill, the three
 book states, SSE and a page, metrics, and a committed tape the whole thing

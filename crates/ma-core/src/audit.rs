@@ -35,24 +35,62 @@
 //! **1. Drift near the touch self-repairs; drift deep in the book does not.**
 //! A lost delta leaves one price level wrong. That level stays wrong until
 //! something else updates that same price. Near the touch, prices are
-//! rewritten constantly, so damage there is erased within seconds. Ten levels
-//! out on a major pair, a price can sit untouched for minutes. So the deep
-//! book is both where real corruption *accumulates* and where the timing race
-//! *doesn't reach* — which is why [`AuditPolicy::guard`] skips the levels
-//! nearest the touch rather than trying to compare them cleverly.
+//! rewritten constantly, so damage there is erased within seconds. Far enough
+//! out, a price can sit untouched for minutes. So the deep book is both where
+//! real corruption *accumulates* and where the timing race *doesn't reach* —
+//! which is why [`AuditPolicy::guard_bps`] excludes the region nearest the
+//! touch rather than trying to compare it cleverly.
 //!
-//! **2. Genuine drift is permanent; a race is not.** A discrepancy caused by
-//! timing is gone by the next fetch, because the book has moved on. A
-//! discrepancy caused by a lost message is still there, at the same price,
-//! forever. So a single disagreement proves nothing and consecutive
-//! disagreements prove a great deal — see
-//! [`AuditPolicy::consecutive_before_desync`].
+//! ## "Deep" means price distance, not level count — measured, not assumed
+//!
+//! The first version of this guard counted *levels*, and it was wrong in a way
+//! only live data revealed: it declared every Coinbase and Bitstamp book
+//! untrustworthy within two minutes of going live.
+//!
+//! On a dense book with a small tick, a level count is not a distance. The top
+//! fifty levels of Coinbase BTC-USD span **2.4 basis points** — about $15 on a
+//! $64,000 book — and five levels in is 0.2 bps. The touch moves further than
+//! that during the REST round trip, so a level-counted guard of five was
+//! entirely inside the churn it was meant to exclude.
+//!
+//! The numbers that settled it, taken against the live venues:
+//!
+//! | Measurement | Result |
+//! |---|---|
+//! | Two REST fetches 150 ms apart, 5–100 bps band | 0 of 668 levels disagreed |
+//! | Our websocket book vs REST, ask side, top 12 | 0 of 12 disagreed |
+//! | Our websocket book vs REST, bid side, top 12 | 1 disagreed — a level 0.2 bps out |
+//!
+//! So the book was never wrong; the window was. Beyond a few basis points the
+//! book is genuinely quiet, and that is where the comparison belongs. The guard
+//! is therefore expressed in basis points from the touch, and the REST requests
+//! ask for enough depth to reach past it.
+//!
+//! **2. Genuine drift is permanent *and stays at one price*; a race is not.**
+//! This is the property that actually does the work, and the first
+//! implementation used a weaker version of it that live data disproved.
+//!
+//! Requiring merely "two mismatching audits in a row" is not enough, because
+//! *some* level disagreeing is the normal state of affairs. The measured churn
+//! is ~2% of levels in the 1–10 bps band, and an audit comparing several
+//! hundred levels will therefore find a disagreement somewhere nearly every
+//! time — at a **different price each time**. Two such audits in a row prove
+//! nothing at all, and the first version desynced every book on schedule
+//! because of it.
+//!
+//! A lost delta is different in kind: it corrupts *one specific price*, and
+//! that price stays wrong until something rewrites it. So the test is not "did
+//! two audits disagree" but **"did two consecutive audits disagree about the
+//! same price"**. Noise moves; damage does not. [`AuditTrail`] intersects the
+//! finding sets of successive audits and acts only on a survivor.
 //!
 //! Together these make the audit **advisory first and authoritative second**:
 //! every comparison feeds a counter, which is the honest primary output, and
 //! only a repeated finding is allowed to declare the book untrustworthy.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+use rust_decimal::Decimal;
 
 use crate::book::{Book, DesyncReason};
 use crate::event::{Level, Side};
@@ -61,20 +99,19 @@ use crate::price::{Price, Qty};
 /// How strict an audit is, and how much evidence it needs before it acts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuditPolicy {
-    /// Levels nearest the touch to ignore, per side.
+    /// Ignore levels within this many **basis points** of the touch.
     ///
-    /// These are the levels the fetch/apply race actually reaches. Skipping
-    /// them removes nearly every false positive and costs nearly no real
-    /// coverage, because damage this close to the touch is overwritten within
-    /// seconds anyway — see the module docs.
-    pub guard: usize,
-    /// Levels per side to consider in total, including the guarded ones.
+    /// Basis points rather than a level count, because on a dense book those
+    /// are wildly different quantities — see the module docs. `10` puts the
+    /// compared region an order of magnitude beyond the churn measured against
+    /// the live venues, while still leaving hundreds of levels to compare.
+    pub guard_bps: u32,
+    /// Cap on levels compared per side, counted from the guard outwards.
     ///
-    /// The compared window is therefore `guard..depth`. Bounded because a
-    /// full-book comparison on Coinbase would be tens of thousands of levels
-    /// four times a minute, and the deep tail adds no signal the near-deep
+    /// Pure cost control: Bitstamp's REST returns its entire book, which is
+    /// thousands of levels, and the far tail adds no signal the near-deep
     /// levels do not already carry.
-    pub depth: usize,
+    pub max_levels: usize,
     /// How many audits in a row must find a disagreement before the book is
     /// declared untrustworthy.
     ///
@@ -86,15 +123,10 @@ pub struct AuditPolicy {
 
 impl AuditPolicy {
     pub const DEFAULT: Self = Self {
-        guard: 5,
-        depth: 50,
+        guard_bps: 10,
+        max_levels: 500,
         consecutive_before_desync: 2,
     };
-
-    /// The window actually compared, as `(skip, take)`.
-    const fn window(&self) -> (usize, usize) {
-        (self.guard, self.depth.saturating_sub(self.guard))
-    }
 }
 
 impl Default for AuditPolicy {
@@ -116,8 +148,15 @@ pub struct AuditFinding {
     pub theirs: Option<Qty>,
 }
 
+/// How many disagreeing prices one audit will carry forward.
+///
+/// Bounded because the interesting question is which prices *recur*, and a
+/// wholesale disagreement — a genuinely broken book — is answered by the first
+/// handful as well as by ten thousand.
+pub const MAX_FINDINGS: usize = 64;
+
 /// What one comparison concluded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuditOutcome {
     /// Nothing comparable. Either book was too shallow to reach past the
     /// guard, or their price ranges did not overlap — which happens on a
@@ -125,11 +164,14 @@ pub enum AuditOutcome {
     Inconclusive,
     /// Every compared level agreed.
     Match { compared: usize },
-    /// At least one level disagreed. The first finding, in book order, is
-    /// carried; there is no value in listing all of them, because one wrong
-    /// level already means the book cannot be trusted.
+    /// Some levels disagreed.
+    ///
+    /// **All** of them are carried, up to [`MAX_FINDINGS`], rather than just
+    /// the first. That is what lets [`AuditTrail`] ask the question that
+    /// matters — whether the *same price* is still wrong next time — instead of
+    /// the much weaker "did something disagree again".
     Mismatch {
-        finding: AuditFinding,
+        findings: Vec<AuditFinding>,
         compared: usize,
     },
 }
@@ -144,6 +186,14 @@ impl AuditOutcome {
         match self {
             Self::Inconclusive => 0,
             Self::Match { compared } | Self::Mismatch { compared, .. } => *compared,
+        }
+    }
+
+    /// The disagreeing prices, as a set.
+    fn prices(&self) -> BTreeSet<Price> {
+        match self {
+            Self::Mismatch { findings, .. } => findings.iter().map(|f| f.price).collect(),
+            _ => BTreeSet::new(),
         }
     }
 }
@@ -161,21 +211,35 @@ pub fn audit(
     policy: AuditPolicy,
 ) -> AuditOutcome {
     let mut compared = 0;
-    let mut first: Option<AuditFinding> = None;
+    let mut findings = Vec::new();
 
     for (side, theirs) in [(Side::Bid, snapshot_bids), (Side::Ask, snapshot_asks)] {
-        let (outcome, n) = audit_side(book, side, theirs, policy);
+        let (mut found, n) = audit_side(book, side, theirs, policy);
         compared += n;
-        if first.is_none() {
-            first = outcome;
-        }
+        findings.append(&mut found);
     }
+    findings.truncate(MAX_FINDINGS);
 
-    match (first, compared) {
-        (Some(finding), _) => AuditOutcome::Mismatch { finding, compared },
-        (None, 0) => AuditOutcome::Inconclusive,
-        (None, _) => AuditOutcome::Match { compared },
+    match (findings.is_empty(), compared) {
+        (false, _) => AuditOutcome::Mismatch { findings, compared },
+        (true, 0) => AuditOutcome::Inconclusive,
+        (true, _) => AuditOutcome::Match { compared },
     }
+}
+
+/// The price at which the guard band ends, on one side.
+///
+/// Anchored on **our** best level, so both windows are cut at the same absolute
+/// price and the comparison stays apples-to-apples. Anchoring each book on its
+/// own touch would shift the two windows relative to one another exactly when
+/// the books disagree about the touch — which is when the audit matters most.
+fn guard_edge(best: Price, side: Side, guard_bps: u32) -> Price {
+    let best = best.as_decimal();
+    let offset = best * Decimal::from(guard_bps) / Decimal::from(10_000_u32);
+    Price::from_decimal(match side {
+        Side::Bid => best - offset,
+        Side::Ask => best + offset,
+    })
 }
 
 fn audit_side(
@@ -183,19 +247,26 @@ fn audit_side(
     side: Side,
     theirs: &[Level],
     policy: AuditPolicy,
-) -> (Option<AuditFinding>, usize) {
-    let (skip, take) = policy.window();
+) -> (Vec<AuditFinding>, usize) {
+    let Some(best) = book.best(side) else {
+        return (Vec::new(), 0);
+    };
+    let edge = guard_edge(best.price, side, policy.guard_bps);
+    let beyond = |price: Price| match side {
+        Side::Bid => price <= edge,
+        Side::Ask => price >= edge,
+    };
 
     let ours: BTreeMap<Price, Qty> = book
-        .top_levels(side, policy.depth)
+        .top_levels(side, usize::MAX)
         .into_iter()
-        .skip(skip)
-        .take(take)
+        .filter(|l| beyond(l.price))
+        .take(policy.max_levels)
         .map(|l| (l.price, l.qty))
         .collect();
 
     // The venue's own ordering is not guaranteed to be ours, so sort into
-    // best-first order before applying the same window.
+    // best-first order before applying the same band.
     let mut sorted: Vec<Level> = theirs
         .iter()
         .copied()
@@ -207,13 +278,13 @@ fn audit_side(
     }
     let theirs: BTreeMap<Price, Qty> = sorted
         .into_iter()
-        .skip(skip)
-        .take(take)
+        .filter(|l| beyond(l.price))
+        .take(policy.max_levels)
         .map(|l| (l.price, l.qty))
         .collect();
 
     if ours.is_empty() || theirs.is_empty() {
-        return (None, 0);
+        return (Vec::new(), 0);
     }
 
     // Only the price range both windows cover can be compared. Outside it, one
@@ -235,13 +306,13 @@ fn audit_side(
         .min(theirs.keys().next_back().copied())
         .unwrap_or_else(|| Price::from_decimal(rust_decimal::Decimal::ZERO));
     if lo > hi {
-        return (None, 0);
+        return (Vec::new(), 0);
     }
 
     let mut compared = 0;
-    let mut finding = None;
+    let mut findings = Vec::new();
 
-    let prices: std::collections::BTreeSet<Price> = ours
+    let prices: BTreeSet<Price> = ours
         .range(lo..=hi)
         .map(|(p, _)| *p)
         .chain(theirs.range(lo..=hi).map(|(p, _)| *p))
@@ -251,8 +322,8 @@ fn audit_side(
         compared += 1;
         let ours_qty = ours.get(&price).copied();
         let theirs_qty = theirs.get(&price).copied();
-        if ours_qty != theirs_qty && finding.is_none() {
-            finding = Some(AuditFinding {
+        if ours_qty != theirs_qty && findings.len() < MAX_FINDINGS {
+            findings.push(AuditFinding {
                 side,
                 price,
                 ours: ours_qty,
@@ -261,16 +332,22 @@ fn audit_side(
         }
     }
 
-    (finding, compared)
+    (findings, compared)
 }
 
 /// Tracks consecutive findings so a single race cannot desync a book.
 ///
 /// See the module docs: one disagreement is not evidence, because the fetch
 /// races the stream. Two in a row is, because a race would have resolved.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AuditTrail {
     consecutive: u32,
+    /// Prices that have disagreed on every audit of the current streak.
+    ///
+    /// Intersected rather than replaced, which is the whole mechanism: churn
+    /// picks a different price each time and empties this set, while a lost
+    /// delta keeps the same price in it indefinitely.
+    suspect: BTreeSet<Price>,
     /// Lifetime totals, for the metrics that are the audit's primary output.
     pub audits: u64,
     pub mismatches: u64,
@@ -279,7 +356,7 @@ pub struct AuditTrail {
 impl AuditTrail {
     /// Fold in one outcome, returning a desync reason if the evidence is now
     /// strong enough to distrust the book.
-    pub fn observe(&mut self, outcome: AuditOutcome, policy: AuditPolicy) -> Option<DesyncReason> {
+    pub fn observe(&mut self, outcome: &AuditOutcome, policy: AuditPolicy) -> Option<DesyncReason> {
         match outcome {
             // An inconclusive audit is not a clean bill of health, so it must
             // not reset the streak — otherwise a book could alternate
@@ -293,18 +370,41 @@ impl AuditTrail {
             AuditOutcome::Match { .. } => {
                 self.audits += 1;
                 self.consecutive = 0;
+                self.suspect.clear();
                 None
             }
-            AuditOutcome::Mismatch { finding, .. } => {
+            AuditOutcome::Mismatch { .. } => {
                 self.audits += 1;
                 self.mismatches += 1;
+
+                let now = outcome.prices();
+                if self.consecutive == 0 {
+                    self.suspect = now;
+                    self.consecutive = 1;
+                    return None;
+                }
+
+                // Only prices wrong in *both* audits survive. A book whose
+                // disagreements move around — which is what the fetch racing
+                // the stream produces — empties this set and starts over.
+                self.suspect.retain(|p| now.contains(p));
+                if self.suspect.is_empty() {
+                    self.suspect = now;
+                    self.consecutive = 1;
+                    return None;
+                }
+
                 self.consecutive += 1;
-                (self.consecutive >= policy.consecutive_before_desync).then_some(
-                    DesyncReason::AuditMismatch {
-                        price: finding.price,
+                if self.consecutive < policy.consecutive_before_desync {
+                    return None;
+                }
+                self.suspect
+                    .iter()
+                    .next()
+                    .map(|price| DesyncReason::AuditMismatch {
+                        price: *price,
                         consecutive: self.consecutive,
-                    },
-                )
+                    })
             }
         }
     }
@@ -313,6 +413,13 @@ impl AuditTrail {
     /// longer exists, so the evidence against it does not carry over.
     pub fn reset(&mut self) {
         self.consecutive = 0;
+        self.suspect.clear();
+    }
+
+    /// Prices currently wrong on every audit of the streak. The thing to look
+    /// at first when a book is desynced by an audit.
+    pub fn suspect_prices(&self) -> impl Iterator<Item = &Price> {
+        self.suspect.iter()
     }
 
     pub const fn consecutive(&self) -> u32 {
@@ -333,6 +440,12 @@ mod tests {
     }
 
     /// A book with `n` levels a side, one unit apart, centred on 1000/1001.
+    ///
+    /// One unit is 10 bps of 1000, so with `guard_bps = 20` the first two
+    /// levels a side fall inside the guard and the rest are compared. Chosen so
+    /// the arithmetic is legible rather than realistic: a real book is far
+    /// denser, which is the whole reason the guard is a distance and not a
+    /// level count.
     fn ladder(n: usize) -> (Vec<Level>, Vec<Level>) {
         let bids = (0..n)
             .map(|i| lv(&format!("{}", 1000 - i as i64), "1"))
@@ -350,10 +463,12 @@ mod tests {
         b
     }
 
+    /// 20 bps of a 1000 book is 2 units, so levels 1000 and 999 (and 1001,
+    /// 1002) sit inside the guard and everything further out is compared.
     fn policy() -> AuditPolicy {
         AuditPolicy {
-            guard: 2,
-            depth: 10,
+            guard_bps: 20,
+            max_levels: 8,
             consecutive_before_desync: 2,
         }
     }
@@ -375,16 +490,17 @@ mod tests {
         let (bids, asks) = ladder(10);
         let book = book_of(&bids, &asks);
 
-        // Level index 4 on the bid side: outside a guard of 2.
+        // 996 is 40 bps below the touch, outside the 20 bps guard.
         let mut theirs = bids.clone();
         theirs[4] = lv("996", "7");
 
         match audit(&book, &theirs, &asks, policy()) {
-            AuditOutcome::Mismatch { finding, .. } => {
-                assert_eq!(finding.side, Side::Bid);
-                assert_eq!(finding.price, "996".parse().unwrap());
-                assert_eq!(finding.ours, Some("1".parse().unwrap()));
-                assert_eq!(finding.theirs, Some("7".parse().unwrap()));
+            AuditOutcome::Mismatch { findings, .. } => {
+                assert_eq!(findings.len(), 1, "{findings:?}");
+                assert_eq!(findings[0].side, Side::Bid);
+                assert_eq!(findings[0].price, "996".parse().unwrap());
+                assert_eq!(findings[0].ours, Some("1".parse().unwrap()));
+                assert_eq!(findings[0].theirs, Some("7".parse().unwrap()));
             }
             other => panic!("expected a mismatch, got {other:?}"),
         }
@@ -394,7 +510,8 @@ mod tests {
     fn disagreement_inside_the_guard_band_is_deliberately_ignored() {
         // The levels nearest the touch are where the fetch races the stream,
         // and where real damage is overwritten within seconds anyway. Flagging
-        // them would make the audit cry wolf on every liquid pair.
+        // them would make the audit cry wolf on every liquid pair — which is
+        // exactly what a level-counted guard did against the live venues.
         let (bids, asks) = ladder(10);
         let book = book_of(&bids, &asks);
 
@@ -412,6 +529,64 @@ mod tests {
     }
 
     #[test]
+    fn the_guard_is_a_price_distance_not_a_level_count() {
+        // The bug live data found. On a dense book a level count is not a
+        // distance: fifty levels of Coinbase BTC-USD span 2.4 bps, so a guard
+        // of "five levels" sat entirely inside the churn it was meant to
+        // exclude and every audit mismatched.
+        //
+        // A dense book here: 200 levels a penny apart on a 1000 book, so 200
+        // levels span only 20 bps. A 10 bps guard must therefore exclude
+        // roughly the first hundred *levels* — something no fixed level count
+        // could express, because the same guard on the sparse ladder above
+        // excludes one.
+        let dense_bids: Vec<Level> = (0..200)
+            .map(|i| lv(&format!("{:.2}", 1000.0 - f64::from(i) * 0.01), "1"))
+            .collect();
+        let dense_asks: Vec<Level> = (0..200)
+            .map(|i| lv(&format!("{:.2}", 1000.01 + f64::from(i) * 0.01), "1"))
+            .collect();
+        let book = book_of(&dense_bids, &dense_asks);
+
+        let policy = AuditPolicy {
+            guard_bps: 10,
+            max_levels: 500,
+            consecutive_before_desync: 2,
+        };
+
+        // 10 bps of 1000 is 1.00, i.e. 100 penny levels. Corrupting level 50 —
+        // well inside that — must be ignored...
+        let mut near = dense_bids.clone();
+        near[50] = lv(&format!("{:.2}", 1000.0 - 0.50), "99");
+        assert!(
+            !audit(&book, &near, &dense_asks, policy).is_mismatch(),
+            "a difference 5 bps out was flagged despite a 10 bps guard"
+        );
+
+        // ...while corrupting level 150, which is 15 bps out, must be caught.
+        let mut far = dense_bids.clone();
+        far[150] = lv(&format!("{:.2}", 1000.0 - 1.50), "99");
+        match audit(&book, &far, &dense_asks, policy) {
+            AuditOutcome::Mismatch { findings, .. } => {
+                assert_eq!(findings[0].price, "998.50".parse().unwrap());
+            }
+            other => panic!("a difference 15 bps out went unnoticed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_guard_edge_is_anchored_on_our_own_touch() {
+        // Both windows must be cut at the same absolute price. Anchoring each
+        // book on its own touch would slide the two windows relative to each
+        // other exactly when the books disagree about the touch — which is
+        // when the audit matters most.
+        let edge = guard_edge("1000".parse().unwrap(), Side::Bid, 10);
+        assert_eq!(edge, "999".parse().unwrap());
+        let edge = guard_edge("1000".parse().unwrap(), Side::Ask, 10);
+        assert_eq!(edge, "1001".parse().unwrap());
+    }
+
+    #[test]
     fn a_level_we_hold_that_the_venue_does_not_is_a_mismatch() {
         // The signature of a delete we never applied — the exact damage an
         // OrderOnly venue cannot otherwise reveal.
@@ -425,16 +600,20 @@ mod tests {
             .collect();
 
         match audit(&book, &theirs, &asks, policy()) {
-            AuditOutcome::Mismatch { finding, .. } => {
-                assert_eq!(finding.price, "996".parse().unwrap());
-                assert!(finding.ours.is_some());
-                assert!(finding.theirs.is_none(), "we should hold a phantom level");
+            AuditOutcome::Mismatch { findings, .. } => {
+                assert_eq!(findings[0].price, "996".parse().unwrap());
+                assert!(findings[0].ours.is_some());
+                assert!(
+                    findings[0].theirs.is_none(),
+                    "we should hold a phantom level"
+                );
             }
             other => panic!("expected a mismatch, got {other:?}"),
         }
     }
 
     #[test]
+    #[allow(clippy::float_arithmetic)]
     fn comparison_is_by_price_so_one_extra_level_is_one_finding() {
         // Indexing would misalign both windows after the inserted level and
         // report every subsequent level as wrong. One real discrepancy must
@@ -449,36 +628,35 @@ mod tests {
         assert!(outcome.is_mismatch());
 
         // Count how many prices actually disagree, rather than trusting the
-        // first finding alone.
-        let disagreements = {
-            let ours: BTreeMap<Price, Qty> = book
-                .top_levels(Side::Bid, 10)
-                .into_iter()
-                .skip(2)
-                .map(|l| (l.price, l.qty))
-                .collect();
-            let mut sorted = theirs.clone();
-            sorted.sort_by(|a, b| b.price.cmp(&a.price));
-            let t: BTreeMap<Price, Qty> = sorted
-                .into_iter()
-                .skip(2)
-                .take(8)
-                .map(|l| (l.price, l.qty))
-                .collect();
-            let lo = *ours.keys().next().unwrap().max(t.keys().next().unwrap());
-            let hi = *ours
-                .keys()
-                .next_back()
-                .unwrap()
-                .min(t.keys().next_back().unwrap());
-            ours.range(lo..=hi)
-                .map(|(p, _)| *p)
-                .chain(t.range(lo..=hi).map(|(p, _)| *p))
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .filter(|p| ours.get(p) != t.get(p))
-                .count()
-        };
+        // first finding alone. An index-based comparison would report every
+        // level after the insertion as wrong.
+        let ours: BTreeMap<Price, Qty> = book
+            .top_levels(Side::Bid, usize::MAX)
+            .into_iter()
+            .filter(|l| l.price <= guard_edge("1000".parse().unwrap(), Side::Bid, 20))
+            .map(|l| (l.price, l.qty))
+            .collect();
+        let mut sorted = theirs.clone();
+        sorted.sort_by(|a, b| b.price.cmp(&a.price));
+        let t: BTreeMap<Price, Qty> = sorted
+            .into_iter()
+            .filter(|l| l.price <= guard_edge("1000".parse().unwrap(), Side::Bid, 20))
+            .map(|l| (l.price, l.qty))
+            .collect();
+        let lo = *ours.keys().next().unwrap().max(t.keys().next().unwrap());
+        let hi = *ours
+            .keys()
+            .next_back()
+            .unwrap()
+            .min(t.keys().next_back().unwrap());
+        let disagreements = ours
+            .range(lo..=hi)
+            .map(|(p, _)| *p)
+            .chain(t.range(lo..=hi).map(|(p, _)| *p))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|p| ours.get(p) != t.get(p))
+            .count();
         assert_eq!(
             disagreements, 1,
             "an inserted level misaligned the comparison"
@@ -514,83 +692,119 @@ mod tests {
         );
     }
 
-    #[test]
-    fn one_finding_is_not_enough_to_desync_but_two_in_a_row_are() {
-        // The core rule. A disagreement caused by the fetch racing the stream
-        // is gone by the next fetch; one caused by a lost message is still
-        // there, at the same price, forever.
-        let mut trail = AuditTrail::default();
-        let finding = AuditFinding {
-            side: Side::Bid,
-            price: "996".parse().unwrap(),
-            ours: Some("1".parse().unwrap()),
-            theirs: Some("7".parse().unwrap()),
-        };
-        let mismatch = AuditOutcome::Mismatch {
-            finding,
-            compared: 8,
-        };
+    fn mismatch_at(prices: &[&str]) -> AuditOutcome {
+        AuditOutcome::Mismatch {
+            findings: prices
+                .iter()
+                .map(|p| AuditFinding {
+                    side: Side::Bid,
+                    price: p.parse().unwrap(),
+                    ours: Some("1".parse().unwrap()),
+                    theirs: Some("7".parse().unwrap()),
+                })
+                .collect(),
+            compared: 400,
+        }
+    }
 
-        assert_eq!(trail.observe(mismatch, policy()), None, "acted on one race");
-        match trail.observe(mismatch, policy()) {
+    #[test]
+    fn the_same_price_wrong_twice_running_is_what_desyncs_a_book() {
+        // The rule the live venues forced. A lost delta corrupts one price and
+        // that price stays wrong; nothing else about "a mismatch happened"
+        // carries information, because on a real book something is almost
+        // always mid-flight somewhere.
+        let mut trail = AuditTrail::default();
+        assert_eq!(
+            trail.observe(&mismatch_at(&["996"]), policy()),
+            None,
+            "acted on a single observation"
+        );
+        match trail.observe(&mismatch_at(&["996", "997"]), policy()) {
             Some(DesyncReason::AuditMismatch { price, consecutive }) => {
                 assert_eq!(price, "996".parse().unwrap());
                 assert_eq!(consecutive, 2);
             }
-            other => panic!("persistent drift went unreported: {other:?}"),
+            other => panic!("persistent drift at one price went unreported: {other:?}"),
         }
-        assert_eq!(trail.mismatches, 2);
-        assert_eq!(trail.audits, 2);
+    }
+
+    #[test]
+    fn disagreements_that_move_around_never_desync_anything() {
+        // This is what the fetch racing the stream actually looks like, and it
+        // is why "two mismatching audits in a row" was not a sufficient rule:
+        // against the live venues *some* level disagreed almost every time, so
+        // that rule desynced every book on schedule. A different price each
+        // time is noise, however many times in a row it happens.
+        let mut trail = AuditTrail::default();
+        for prices in [
+            &["996"][..],
+            &["1002"][..],
+            &["994", "993"][..],
+            &["1010"][..],
+            &["991"][..],
+            &["1004"][..],
+        ] {
+            assert_eq!(
+                trail.observe(&mismatch_at(prices), policy()),
+                None,
+                "churn at {prices:?} was mistaken for drift"
+            );
+        }
+        assert_eq!(trail.mismatches, 6, "every finding is still counted");
+        assert_eq!(
+            trail.suspect_prices().count(),
+            1,
+            "only the newest observation should be retained"
+        );
+    }
+
+    #[test]
+    fn one_persistent_price_is_found_underneath_moving_noise() {
+        // The realistic case: a genuinely lost delta at 996, plus a different
+        // racing level on each audit. The intersection strips the noise and
+        // leaves the real one.
+        let mut trail = AuditTrail::default();
+        assert_eq!(
+            trail.observe(&mismatch_at(&["996", "1002"]), policy()),
+            None
+        );
+        match trail.observe(&mismatch_at(&["996", "1011"]), policy()) {
+            Some(DesyncReason::AuditMismatch { price, .. }) => {
+                assert_eq!(price, "996".parse().unwrap(), "the wrong price was blamed");
+            }
+            other => panic!("a persistent price hidden under churn was missed: {other:?}"),
+        }
     }
 
     #[test]
     fn a_clean_audit_clears_the_streak() {
-        // Which is exactly what a timing race produces: disagree, then agree.
         let mut trail = AuditTrail::default();
-        let mismatch = AuditOutcome::Mismatch {
-            finding: AuditFinding {
-                side: Side::Bid,
-                price: "996".parse().unwrap(),
-                ours: None,
-                theirs: Some("1".parse().unwrap()),
-            },
-            compared: 8,
-        };
-
-        assert_eq!(trail.observe(mismatch, policy()), None);
+        assert_eq!(trail.observe(&mismatch_at(&["996"]), policy()), None);
         assert_eq!(
-            trail.observe(AuditOutcome::Match { compared: 8 }, policy()),
+            trail.observe(&AuditOutcome::Match { compared: 400 }, policy()),
             None
         );
         assert_eq!(trail.consecutive(), 0);
-        // A third audit disagreeing is now the *first* of a new streak, not
-        // the second of the old one.
-        assert_eq!(trail.observe(mismatch, policy()), None);
+        assert_eq!(trail.suspect_prices().count(), 0);
+        assert_eq!(
+            trail.observe(&mismatch_at(&["996"]), policy()),
+            None,
+            "a clean audit in between must break the chain"
+        );
         assert_eq!(trail.audits, 3);
         assert_eq!(trail.mismatches, 2);
     }
 
     #[test]
     fn an_inconclusive_audit_does_not_launder_a_streak() {
-        // If Inconclusive reset the counter, a book could alternate
-        // mismatch/inconclusive indefinitely and never reach two in a row —
-        // genuine drift would go unreported forever, while every individual
-        // reading looked defensible.
+        // If it reset the streak, a book could alternate
+        // mismatch/inconclusive indefinitely and never accumulate evidence,
+        // while every individual reading looked defensible.
         let mut trail = AuditTrail::default();
-        let mismatch = AuditOutcome::Mismatch {
-            finding: AuditFinding {
-                side: Side::Ask,
-                price: "1005".parse().unwrap(),
-                ours: Some("1".parse().unwrap()),
-                theirs: None,
-            },
-            compared: 8,
-        };
-
-        assert_eq!(trail.observe(mismatch, policy()), None);
-        assert_eq!(trail.observe(AuditOutcome::Inconclusive, policy()), None);
+        assert_eq!(trail.observe(&mismatch_at(&["1005"]), policy()), None);
+        assert_eq!(trail.observe(&AuditOutcome::Inconclusive, policy()), None);
         assert!(
-            trail.observe(mismatch, policy()).is_some(),
+            trail.observe(&mismatch_at(&["1005"]), policy()).is_some(),
             "an inconclusive reading cleared evidence it had no bearing on"
         );
         assert_eq!(
@@ -604,20 +818,11 @@ mod tests {
         // The book that disagreed no longer exists after a resync, so the case
         // against it does not carry over to its replacement.
         let mut trail = AuditTrail::default();
-        let mismatch = AuditOutcome::Mismatch {
-            finding: AuditFinding {
-                side: Side::Bid,
-                price: "996".parse().unwrap(),
-                ours: None,
-                theirs: None,
-            },
-            compared: 8,
-        };
-        trail.observe(mismatch, policy());
+        trail.observe(&mismatch_at(&["996"]), policy());
         trail.reset();
         assert_eq!(trail.consecutive(), 0);
         assert_eq!(
-            trail.observe(mismatch, policy()),
+            trail.observe(&mismatch_at(&["996"]), policy()),
             None,
             "a fresh book was desynced by its predecessor's evidence"
         );

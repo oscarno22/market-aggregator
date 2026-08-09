@@ -2042,6 +2042,7 @@ dependencies = [
  "ma-persist",
  "ma-pipeline",
  "ma-venues",
+ "rust_decimal",
  "serde",
  "serde_json",
  "tempfile",

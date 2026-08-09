@@ -41,11 +41,26 @@ const KRAKEN_DEPTH: usize = 10;
 
 /// Levels per side to request for a periodic audit.
 ///
-/// Matches [`AuditPolicy::depth`](ma_core::AuditPolicy::depth): asking for less
-/// than we compare would make every audit inconclusive past the response's
-/// depth, and asking for much more would pay for levels the comparison window
-/// discards.
-const AUDIT_DEPTH: usize = 50;
+/// Sized from measurement, not intuition. The audit's guard band is expressed
+/// in basis points ([`AuditPolicy::guard_bps`](ma_core::AuditPolicy::guard_bps)),
+/// so the request has to reach *past* it or every audit is inconclusive — and on
+/// a dense book that takes far more levels than it looks like it should.
+/// Coinbase BTC-USD:
+///
+/// | `limit` | price span |
+/// |---|---|
+/// | 50 | 2.4 bps |
+/// | 1000 | 139 bps |
+///
+/// At the 10 bps default guard, `limit=50` reaches nowhere near the compared
+/// region; `limit=1000` leaves ~825 levels beyond it. Bitstamp ignores this and
+/// returns its whole book regardless.
+const AUDIT_DEPTH: usize = 1000;
+
+// A basis-point guard on a dense book is hundreds of levels in. Requesting
+// fewer than this makes every audit inconclusive, which reads as "nothing to
+// report" — the audit failing silently in the direction that looks fine.
+const _: () = assert!(AUDIT_DEPTH >= 500);
 
 /// Everything needed to open and drive one venue connection, as plain data.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -366,16 +381,27 @@ mod tests {
                 "{venue} audit url does not name the symbol: {}",
                 audit.url
             );
-            // Requesting less depth than the comparison window would make
-            // every audit inconclusive past the response's depth.
+            // The guard is a price distance, so the request must reach past
+            // it. A level count cannot express that directly; what it can do
+            // is refuse to be small enough that the question never arises —
+            // `limit=50` on Coinbase spans 2.4 bps and would make every audit
+            // at a 10 bps guard inconclusive.
             assert!(
-                audit.policy.depth <= AUDIT_DEPTH,
-                "{venue} compares deeper than it fetches"
+                audit.policy.guard_bps > 0,
+                "{venue} audits right up to the touch, where the fetch races \
+                 the stream"
             );
-            assert!(
-                audit.policy.guard < audit.policy.depth,
-                "{venue}'s guard band swallows the whole window"
-            );
+            // Coinbase caps its response at `limit`; Bitstamp ignores the
+            // question and returns its whole book. Only the former can be got
+            // wrong, so only the former is checked.
+            if venue == VenueId::Coinbase {
+                assert!(
+                    audit.url.contains(&format!("limit={AUDIT_DEPTH}")),
+                    "coinbase's audit url does not request a depth: {}",
+                    audit.url
+                );
+            }
+            assert!(audit.policy.max_levels > 0);
             assert!(
                 audit.interval >= Duration::from_secs(30),
                 "{venue} audits often enough to matter to a rate limiter"

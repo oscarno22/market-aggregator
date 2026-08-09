@@ -6,7 +6,7 @@ throughput benchmarks.
 
 ## Design constraints
 
-- Long-lived websocket connections to multiple venues, one task per venue.
+- Long-lived websocket connections, one task per `(venue, symbol)` stream.
 - All venue-specific wire formats normalize to a single internal event type at
   the edge. Nothing downstream knows which venue an event came from except by
   an explicit field.
@@ -18,17 +18,23 @@ throughput benchmarks.
 ## Architecture
 
 ```
-venue ws ──┐
-venue ws ──┼── normalize ──> mpsc ──> aggregator ──> broadcast ──> SSE clients
-venue ws ──┘   (per-task)   (bounded)  (books,         (lagging      (browser)
-                                        windows)        subs drop)
-                                           │
-                                           └──> writer ──> Parquet ──> S3
+stream ws ──┐                                         ┌──> SSE clients
+stream ws ──┼── normalize ──> mpsc ──> aggregator ────┤    (lagging subs skip)
+stream ws ──┘   (per-task)   (bounded)  (books,       │
+   ▲                                     depth)       └──> writer ──> Parquet
+   │                                        │                          ──> S3
+   └── REST depth audit ─────────────────────┘
 ```
 
-**Ingest tasks.** One `tokio` task per venue connection. Owns reconnect,
-heartbeat/ping, and deserialization. Emits `MarketEvent` into the shared
-bounded channel. Never touches shared state.
+A **stream** is one `(venue, symbol)` pair. It owns a connection, a book, a set
+of counters and a resync signal. Three venues × two symbols is six streams and
+six sockets — deliberately not multiplexed, because a resync *is* a disconnect
+and multiplexing would make one book's gap tear down every other symbol on that
+venue.
+
+**Ingest tasks.** One `tokio` task per stream. Owns reconnect, heartbeat/ping,
+deserialization, and the periodic REST depth audit. Emits `MarketEvent` into the
+shared bounded channel. Never touches shared state.
 
 **Aggregator.** Single task owning all mutable state (order books, rolling
 windows). Because it's single-owner, no locks. Reads from the mpsc, applies
@@ -38,8 +44,11 @@ updates, publishes snapshots to a `broadcast` channel on a tick.
 `RecvError::Lagged`; correct handling is to skip forward to the latest snapshot,
 not to error the connection.
 
-**Persistence.** Separate consumer writing normalized events to Parquet, rolled
-hourly, uploaded to S3. Feeds replay mode.
+**Persistence.** A task consuming normalized events *teed from the aggregator*,
+writing Parquet rolled hourly behind an `ObjectStore`. Teed from the aggregator
+rather than reading the raw channel, because normalizing is the venue layer's
+job and a second consumer would have to duplicate every `VenueSync` — and would
+eventually disagree with the first. Feeds Parquet replay mode.
 
 ## The hard parts (do these deliberately)
 
@@ -62,7 +71,36 @@ Book must expose a `Desynced` state. Downstream consumers must be able to tell
 Reconnect backoff: exponential with jitter, capped. Venues will rate-limit or
 ban on reconnect storms.
 
-### 2. Backpressure
+### 2. Auditing the venues that can't prove anything
+
+Kraken checksums the book we built, on every message. Coinbase detects a *lost
+message* and nothing else. Bitstamp detects nothing at all. So for two of three
+venues a periodic REST depth fetch is the only independent evidence that exists,
+and v2 added one.
+
+The subtlety is that a naive version is worse than none, because the REST
+snapshot and our book are from different instants and will disagree almost
+every time. Two properties make it work, and both had to be corrected against
+live data before they did:
+
+- **Compare only levels far enough from the touch** — measured in **basis
+  points**, not levels. On a dense book those are wildly different quantities:
+  fifty levels of Coinbase BTC-USD span 2.4 bps.
+- **Require the *same price* to disagree on consecutive audits.** Something is
+  almost always mid-flight somewhere, so "two mismatching audits" is not
+  evidence. A lost delta corrupts one price and leaves it wrong; churn picks a
+  new price each time.
+
+The audit is advisory first: every comparison feeds a counter, and only a
+persistent finding is allowed to desync a book — into the same recovery path
+every other desync uses. Kraken is deliberately not audited, because a periodic
+comparison is strictly weaker than a per-message checksum.
+
+`just audit-probe` prints the disagreement profile by distance from the touch.
+That tool is how both corrections above were found; reach for it before
+changing `AuditPolicy`.
+
+### 3. Backpressure
 
 Bounded mpsc. When full, ingest drops the oldest event and increments a
 counter, rather than awaiting send. Rationale: for market data, a stale tick
@@ -73,14 +111,14 @@ where every message matters.
 
 Expose drop counts as a metric. A silent drop policy is a bug.
 
-### 3. Clock skew
+### 4. Clock skew
 
 Venue timestamps disagree, sometimes by seconds, and some venues lie. Every
 event carries both `venue_ts` and `ingest_ts` (local monotonic + wall). All
 windowing uses `ingest_ts`. Any cross-venue comparison surfaced in the UI must
 label which clock it's using.
 
-### 4. Replay
+### 5. Replay
 
 Replay feeds the *same* aggregator through the *same* channel, with an
 optional speed multiplier. This makes the whole pipeline deterministically
@@ -117,14 +155,23 @@ Neither layer replaces the other.
       count, reconnect count, book age, **time-in-Desynced**
 - [x] First live connection, tape recorded and committed
 
-**v2 — depth and durability**
-- Full L2 order books with depth-limited pruning
-- Parquet writer + S3 upload, hourly rolls
-- Replay mode over normalized/Parquet events (raw-frame tape replay is a v1
-  deliverable and is already done — see §4 and Status)
-- Multi-symbol
+**v2 — depth and durability** — **complete**
+- [x] Full L2 order books. Depth **served** and depth **retained** are
+      deliberately different numbers: pruning is only safe where the venue
+      publishes a depth-limited feed (Kraken), so Coinbase and Bitstamp retain
+      everything and the ladder is a projection. `ma_book_levels` publishes the
+      gap.
+- [x] Periodic REST re-snapshot audit for Bitstamp and Coinbase, with a
+      **basis-point** guard band and a same-price persistence rule. Both of
+      those were corrections forced by live data — see Status.
+- [x] Parquet writer behind an `ObjectStore` trait, hourly rolls, `ma-persist`
+- [x] Replay mode over normalized/Parquet events (raw-frame tape replay is a
+      v1 deliverable and was already done — see §4)
+- [x] Multi-symbol, one connection per `(venue, symbol)` stream
+- [x] S3 store **written and compiled, never run** — gated per the sequencing
+      rule below
 
-**v3 — only if v1 and v2 are solid**
+**v3 — next**
 - Shard venues across nodes with a coordination layer
 - Rolling indicators over configurable windows
 - Cross-venue spread / arbitrage view (careful with the clock caveat above)
@@ -134,39 +181,65 @@ Neither layer replaces the other.
 Snapshot as of the last session; update this when a milestone item lands or
 a design decision changes.
 
-**v1 is complete.** Four-crate workspace, **149 tests passing, clippy-clean
-(`-D warnings`), `cargo fmt` clean**, pushed to `main`. The full suite runs
-offline; `just demo tapes/2026-08-09-btc-usd.jsonl.gz` plays a real recording
-through the real pipeline with the network unplugged.
+**v1 and v2 are complete.** Five-crate workspace, **233 tests passing,
+clippy-clean (`-D warnings`), `cargo fmt` clean**. The full suite runs offline;
+`just demo tapes/2026-08-09-btc-usd.jsonl.gz` plays a real recording through
+the real pipeline with the network unplugged.
 
-Read `docs/DESIGN.md` first — it carries the reasoning, the gap-fill sequence
-diagrams, and the operating runbook. This section is only the current state.
+Read `docs/DESIGN.md` first — it carries the reasoning, the gap-fill and audit
+sequence diagrams, and the operating runbook. This section is only the current
+state.
 
 - **`ma-core`** — no I/O, no async deps (enforced by a manifest test).
   `Decimal`-based `Price`/`Qty`, `IngestTime` carrying both clocks,
-  `Book`/`BookState` with the three-way `Integrity` model.
+  `Book`/`BookState` with the three-way `Integrity` model, `StreamId`, and the
+  depth-audit comparison.
 - **`ma-venues`** — `VenueSync` state machines and golden fixtures for all
-  three venues, plus `endpoint.rs`: URLs, subscribe payloads and REST
-  snapshot URLs as data, so this crate still opens no sockets.
+  three venues, plus `endpoint.rs`: URLs, subscribe payloads, REST snapshot and
+  audit URLs as data, so this crate still opens no sockets.
 - **`ma-pipeline`** — bounded drop-oldest channel (plus `send_lossless` for
-  replay, which must not drop), reconnect backoff, per-venue ingest tasks
+  replay, which must not drop), reconnect backoff, per-stream ingest tasks
   behind a `Network` trait, the single-owner aggregator, counters, and the
   raw-frame tape recorder/replay.
+- **`ma-persist`** — Arrow schema, Parquet writer with hourly rolls, the
+  `ObjectStore` trait with a local implementation, and S3 behind a default-off
+  feature. The only crate that sees `arrow`/`parquet`.
 - **`ma-server`** — axum SSE with correct `Lagged` handling, `/metrics`,
-  a self-contained chart page, and three binaries: `ma-server` (serve),
-  `record`, `replay`.
+  a self-contained chart page with L2 ladders, three binaries (`ma-server`,
+  `record`, `replay`) and the `audit_probe` diagnostic example.
 
 **Three bugs the first live tape found, that every hand-written fixture
 missed** — the argument for the tape recorder, recorded here so it is not
 re-learned: Coinbase's `sequence_num` is connection-scoped rather than
 per-channel (every heartbeat read as a gap); Coinbase says `offer`, not
 `ask`; Kraken's `status` frame has no `symbol` and broke an eagerly-typed
-envelope. See `docs/DESIGN.md` §7.
+envelope. See `docs/DESIGN.md` §8.
 
-**Next up:** v2 — full L2 depth, the periodic REST re-snapshot audit for
-Bitstamp and Coinbase, Parquet behind an `ObjectStore` trait, then S3. Note
-the sequencing rule: **nothing touches AWS before v2**, and nothing writes to
-S3 before an IAM user scoped to one bucket prefix replaces the root keys.
+**Two more the live venues found in v2, both in the depth audit** — same
+lesson, different layer, and worth recording because both looked obviously
+correct offline:
+
+1. **A guard band counted in *levels* is not a distance.** The top fifty levels
+   of Coinbase BTC-USD span 2.4 basis points; five levels in is 0.2 bps. The
+   touch moves further than that during the REST round trip, so the guard sat
+   entirely inside the churn it existed to exclude. It is now measured in basis
+   points, and the REST requests ask for enough depth to reach past it.
+2. **"Two mismatching audits in a row" is not evidence.** Measured churn is
+   ~2% of levels in the 1–10 bps band, so an audit comparing hundreds of levels
+   finds *something* wrong nearly every time — at a different price each time.
+   The rule is now "the same price wrong on consecutive audits", which is what
+   the physical argument actually supports: noise moves, a lost delta does not.
+
+Both were caught by running against live venues and diagnosed with
+`just audit-probe`, which prints the disagreement profile by distance from the
+touch. Neither was reachable from a fixture.
+
+**Next up:** v3 — sharding, rolling indicators, cross-venue spread. Note the
+sequencing rule still standing: nothing writes to S3 before an IAM user scoped
+to one bucket prefix replaces the root keys. The S3 store is written and
+compiles under `--features s3`, and has **never been run against a bucket**;
+`MA_S3_ACK_SCOPED_IAM=1` is the interlock, and it asserts the scoping rather
+than verifying it.
 
 ## Non-goals
 

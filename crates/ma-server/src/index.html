@@ -28,12 +28,6 @@
   .sub { color: var(--muted); font-size: 0.8rem; }
   .num { font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 
-  #banner {
-    margin: 0.75rem 0 1.25rem; padding: 0.6rem 0.85rem; border-radius: 8px;
-    border: 1px solid var(--line); background: var(--card); font-size: 0.85rem;
-  }
-  #banner.warn { border-color: var(--desync); }
-
   .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); }
   .card { border: 1px solid var(--line); border-radius: 10px; padding: 0.9rem 1rem; background: var(--card); }
   .card h2 { font-size: 0.95rem; margin: 0 0 0.1rem; display: flex; align-items: center; gap: 0.5rem; }
@@ -63,6 +57,24 @@
   td:last-child { text-align: right; }
   .bad { color: var(--desync); font-weight: 600; }
 
+  section.symbol { margin-top: 1.5rem; }
+  .symbol-name { font-size: 1rem; margin: 0 0 0.4rem; letter-spacing: 0.02em; }
+  .banner > div { border: 1px solid var(--line); border-radius: 8px; padding: 0.5rem 0.7rem;
+                  font-size: 0.8rem; margin-bottom: 0.7rem; background: var(--card); }
+  .banner .warn { border-color: var(--desync); }
+
+  /* The depth ladder. Asks above bids, best of each nearest the middle, so the
+     touch sits where a reader's eye already expects the market to be. */
+  table.ladder { margin: 0.5rem 0 0.6rem; font-size: 0.72rem; }
+  table.ladder th { color: var(--muted); font-weight: 400; text-align: right; padding-bottom: 0.2rem; }
+  table.ladder th:first-child { text-align: left; }
+  table.ladder td { padding: 0.06rem 0; }
+  table.ladder td:first-child { text-align: left; }
+  table.ladder td:last-child { text-align: right; color: var(--muted); }
+  tr.ask td:first-child { color: var(--desync); }
+  tr.bid td:first-child { color: var(--live); }
+  tr.touch td { border-top: 1px solid var(--line); padding: 0.1rem 0; }
+
   #chartwrap { margin-top: 1.25rem; border: 1px solid var(--line); border-radius: 10px; padding: 0.9rem 1rem; background: var(--card); }
   #chartwrap h2 { font-size: 0.9rem; margin: 0 0 0.15rem; }
   canvas { width: 100%; height: 220px; display: block; }
@@ -80,24 +92,24 @@
 
 <header>
   <h1>market-aggregator</h1>
-  <span class="sub"><span id="symbol">—</span> · <span id="conn">connecting…</span></span>
+  <span class="sub"><span id="streams">—</span> · <span id="conn">connecting…</span></span>
 </header>
 
 <!--
-  The banner is not decoration. Integrity is per-venue and a combined view is
-  only ever as strong as its weakest input, so any statement spanning venues
-  has to say so, or it is claiming more than the data supports.
+  One section per symbol, each with its own integrity banner. The grouping is
+  not cosmetic: "weakest integrity" is only meaningful *within* a symbol, and a
+  single banner spanning symbols would let a desynced ETH book quietly downgrade
+  the claim made about a perfectly healthy BTC one, or vice versa.
 -->
-<div id="banner">…</div>
-
-<div class="grid" id="venues"></div>
+<div id="symbols"></div>
 
 <div id="chartwrap">
-  <h2>Mid price</h2>
+  <h2>Mid price · <span id="charted">—</span></h2>
   <div class="sub">
-    Plotted against <strong>ingest time</strong> — when we received each update, not when a venue
-    says it sent it. Venue clocks disagree by seconds and some are simply wrong.
-    Gaps are periods with no trusted book.
+    One symbol at a time — overlaying two on one price axis would compress both into
+    flat lines. Plotted against <strong>ingest time</strong> — when we received each update,
+    not when a venue says it sent it. Venue clocks disagree by seconds and some are simply
+    wrong. Gaps are periods with no trusted book.
   </div>
   <canvas id="chart"></canvas>
   <div class="legend">
@@ -139,6 +151,7 @@ const HISTORY = 240; // ~1 minute at 4Hz
 // chart would otherwise extend forever off a single frozen quote.
 const STALE_MS = 5000;
 const series = new Map();  // venue -> [{ t, mid } | { t, gap: true }]
+let charted = null;        // which symbol the chart is currently plotting
 let lagged = 0;
 
 const $ = (id) => document.getElementById(id);
@@ -146,27 +159,24 @@ const fmt = (n, d = 0) => n === null || n === undefined ? "—" : Number(n).toFi
 const ms = (v) => v === null || v === undefined ? "—" : v < 1000 ? `${v} ms` : `${(v / 1000).toFixed(1)} s`;
 
 function render(snap) {
-  $("symbol").textContent = snap.symbol;
+  const streams = snap.symbols.reduce((n, g) => n + g.venues.length, 0);
+  $("streams").textContent =
+    `${snap.symbols.map((g) => g.symbol).join(", ")} · ${streams} stream(s)`;
   $("conn").textContent = `live · seq ${snap.seq}`;
 
-  const weakest = snap.weakest_integrity;
-  const banner = $("banner");
-  if (!weakest) {
-    banner.className = "warn";
-    banner.innerHTML = "<strong>No venue has a book worth trusting right now.</strong> " +
-      "That is a statement about data quality, not about whether the process is running — " +
-      "each card below says why.";
-  } else {
-    banner.className = "";
-    banner.innerHTML = `<strong>Any cross-venue comparison here is ${CLAIM_SHORT[weakest]} at best.</strong> ` +
-      `A combined view is only as strong as its weakest live input, which is currently ` +
-      `<em>${CLAIM[weakest]}</em>.`;
+  // The chart plots one symbol — the first — because overlaying BTC and ETH on
+  // one price axis would compress both into flat lines. Which one is charted is
+  // said out loud rather than left to be inferred from the numbers.
+  if (!charted || !snap.symbols.some((g) => g.symbol === charted)) {
+    charted = snap.symbols.length ? snap.symbols[0].symbol : null;
   }
+  $("charted").textContent = charted ?? "—";
 
-  $("venues").innerHTML = snap.venues.map(card).join("");
+  $("symbols").innerHTML = snap.symbols.map(group).join("");
 
   const now = snap.wall_unix_ms;
-  for (const v of snap.venues) {
+  const plotted = snap.symbols.find((g) => g.symbol === charted);
+  for (const v of plotted ? plotted.venues : []) {
     if (!series.has(v.venue)) series.set(v.venue, []);
     const s = series.get(v.venue);
     // A desynced book contributes a gap, not a flat line. Carrying the last
@@ -177,6 +187,45 @@ function render(snap) {
     if (s.length > HISTORY) s.shift();
   }
   draw();
+}
+
+// One symbol: its own integrity banner, then a card per venue.
+function group(g) {
+  const weakest = g.weakest_integrity;
+  const banner = !weakest
+    ? `<div class="warn"><strong>No venue has a book worth trusting for
+       ${escapeHtml(g.symbol)} right now.</strong> That is a statement about data
+       quality, not about whether the process is running — each card below says why.</div>`
+    : `<div><strong>Any cross-venue comparison for ${escapeHtml(g.symbol)} is
+       ${CLAIM_SHORT[weakest]} at best.</strong> A combined view is only as strong as its
+       weakest live input, which is currently <em>${CLAIM[weakest]}</em>.</div>`;
+
+  return `
+  <section class="symbol">
+    <h2 class="symbol-name">${escapeHtml(g.symbol)}</h2>
+    <div class="banner">${banner}</div>
+    <div class="grid">${g.venues.map(card).join("")}</div>
+  </section>`;
+}
+
+// The L2 ladder: asks above bids, the best of each nearest the middle. That is
+// the conventional orientation and it puts the touch where a reader's eye
+// already expects the market to be, rather than at the top of one list and the
+// top of another.
+function ladder(v) {
+  if (!v.bids.length && !v.asks.length) return "";
+  const row = (l, side) => `
+    <tr class="lv ${side}">
+      <td class="num">${l.price}</td>
+      <td class="num">${l.qty}</td>
+    </tr>`;
+  const asks = v.asks.slice().reverse().map((l) => row(l, "ask")).join("");
+  const bids = v.bids.map((l) => row(l, "bid")).join("");
+  return `
+    <table class="ladder">
+      <thead><tr><th>price</th><th>size</th></tr></thead>
+      <tbody>${asks}<tr class="touch"><td colspan="2"></td></tr>${bids}</tbody>
+    </table>`;
 }
 
 function card(v) {
@@ -203,13 +252,17 @@ function card(v) {
       <div><span class="label">Ask</span><span class="value num">${v.ask ? v.ask.price : "—"}</span></div>
       <div><span class="label">Spread</span><span class="value num">${v.spread ?? "—"}</span></div>
     </div>
+    ${ladder(v)}
     <table>
       <tr><td>Book age</td><td${aged ? ' class="bad"' : ""}><span class="num">${ms(v.age_ms)}</span></td></tr>
       <tr><td>${v.status} for</td><td class="num">${ms(v.status_for_ms)}</td></tr>
       <tr><td>Time untrusted (total)</td><td class="num"${v.desynced_total_ms > 0 ? ' class="bad"' : ""}>${ms(v.desynced_total_ms)}</td></tr>
       ${v.last_verified_ms !== null && v.last_verified_ms !== undefined
         ? `<tr><td>Last checksum match</td><td class="num">${ms(v.last_verified_ms)} ago</td></tr>` : ""}
-      <tr><td>Depth (bid/ask)</td><td class="num">${v.depth[0]} / ${v.depth[1]}</td></tr>
+      <tr><td>Levels held (bid/ask)</td><td class="num">${v.levels_held[0]} / ${v.levels_held[1]}</td></tr>
+      ${v.audits > 0
+        ? `<tr><td>Depth audits</td><td${problem(v.audit_mismatches)}><span class="num">${v.audits} run, ${v.audit_mismatches} disagreed</span></td></tr>`
+        : ""}
       <tr><td>Frames/sec</td><td class="num">${fmt(v.rates.frames_per_sec, 1)}</td></tr>
       <tr><td>Frames received</td><td class="num">${c.frames}</td></tr>
       <tr><td>Messages applied</td><td class="num">${c.applied}</td></tr>
