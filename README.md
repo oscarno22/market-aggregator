@@ -17,13 +17,20 @@ So the whole system is organised around one question:
 
 ## Try it without a network
 
-The repository ships a real 60-second recording of all three venues. It replays
-through the actual pipeline — the same parsers, books, aggregator, metrics and
-web page a live run uses — with the network unplugged.
+The repository ships real recordings of all three venues. They replay through
+the actual pipeline — the same parsers, books, aggregator, metrics and web page
+a live run uses — with the network unplugged.
 
 ```bash
-just demo tapes/2026-08-09-btc-usd.jsonl.gz
+just demo tapes/2026-08-09-btc-usd-live.jsonl.gz
 ```
+
+Two tapes, for different jobs:
+
+| Tape | Length | What it is good for |
+|---|---|---|
+| `2026-08-09-btc-usd-live.jsonl.gz` | 3 min, 5827 frames | The default. Its touch moves — 114 distinct top-of-book states, 1.8 bps of range — so rolling indicators and the cross-venue view show real numbers. |
+| `2026-08-09-btc-usd.jsonl.gz` | 60 s, 1503 frames | The original, kept because it is the recording that found the three parser bugs below. Its Coinbase touch never moves once across 49,940 level updates, so it exercises parsing and books but not anything derived over time. |
 
 Then open <http://127.0.0.1:8080>. To connect to the live venues instead:
 
@@ -205,8 +212,10 @@ Deliberately unfinished, and stated rather than hidden:
   default, a prefix is mandatory, and `MA_S3_ACK_SCOPED_IAM=1` is required to
   start — an assertion by the operator, not a verification, and its own error
   message says so.
-- **No tape has been recorded across a real reconnect.** The committed one is a
-  clean 60 seconds.
+- **No tape has been recorded across a real reconnect.** Both committed tapes
+  are clean runs; every recorded session boundary count is zero. The reconnect
+  path is proven against the scripted fake venue and, for the audit, against
+  live venues — but not yet from a recording of a real outage.
 
 Next: v3 — sharding across nodes, rolling indicators, and a cross-venue spread
 view that must surface `Integrity` beside every number it derives, or it will
