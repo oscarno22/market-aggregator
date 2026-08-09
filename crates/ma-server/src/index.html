@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>market-aggregator</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff; --fg: #17181c; --muted: #6b7280; --line: #e3e5ea;
+    --card: #f7f8fa; --live: #17803d; --desync: #b42318; --unin: #6b7280;
+    --cb: #2563eb; --kr: #7c3aed; --bs: #ea7317;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --fg: #e6e8ee; --muted: #9aa1ad; --line: #262a33;
+      --card: #171a21; --live: #4ade80; --desync: #f87171; --unin: #9aa1ad;
+      --cb: #60a5fa; --kr: #a78bfa; --bs: #fb923c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  h1 { font-size: 1.05rem; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+  header { display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; margin-bottom: 0.25rem; }
+  .sub { color: var(--muted); font-size: 0.8rem; }
+  .num { font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+  #banner {
+    margin: 0.75rem 0 1.25rem; padding: 0.6rem 0.85rem; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--card); font-size: 0.85rem;
+  }
+  #banner.warn { border-color: var(--desync); }
+
+  .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); }
+  .card { border: 1px solid var(--line); border-radius: 10px; padding: 0.9rem 1rem; background: var(--card); }
+  .card h2 { font-size: 0.95rem; margin: 0 0 0.1rem; display: flex; align-items: center; gap: 0.5rem; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .venue-coinbase .dot { background: var(--cb); }
+  .venue-kraken   .dot { background: var(--kr); }
+  .venue-bitstamp .dot { background: var(--bs); }
+
+  .badge {
+    margin-left: auto; font-size: 0.7rem; font-weight: 650; text-transform: uppercase;
+    letter-spacing: 0.04em; padding: 0.15rem 0.45rem; border-radius: 5px; border: 1px solid currentColor;
+  }
+  .live { color: var(--live); } .desynced { color: var(--desync); } .uninitialized { color: var(--unin); }
+
+  .claim { font-size: 0.75rem; color: var(--muted); margin: 0.15rem 0 0.7rem; }
+  .reason { font-size: 0.78rem; color: var(--desync); margin: 0.15rem 0 0.7rem; }
+
+  .quote { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.5rem; margin-bottom: 0.7rem; }
+  .quote div { display: flex; flex-direction: column; }
+  .quote .label { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+  .quote .value { font-size: 1.05rem; }
+  .stale .value { opacity: 0.45; text-decoration: line-through; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
+  td { padding: 0.14rem 0; vertical-align: baseline; }
+  td:first-child { color: var(--muted); }
+  td:last-child { text-align: right; }
+  .bad { color: var(--desync); font-weight: 600; }
+
+  #chartwrap { margin-top: 1.25rem; border: 1px solid var(--line); border-radius: 10px; padding: 0.9rem 1rem; background: var(--card); }
+  #chartwrap h2 { font-size: 0.9rem; margin: 0 0 0.15rem; }
+  canvas { width: 100%; height: 220px; display: block; }
+  .legend { display: flex; gap: 1rem; flex-wrap: wrap; font-size: 0.75rem; color: var(--muted); margin-top: 0.4rem; }
+  .legend span::before { content: "—"; margin-right: 0.3rem; font-weight: 700; }
+  .legend .coinbase::before { color: var(--cb); }
+  .legend .kraken::before { color: var(--kr); }
+  .legend .bitstamp::before { color: var(--bs); }
+
+  footer { margin-top: 1.25rem; color: var(--muted); font-size: 0.75rem; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>market-aggregator</h1>
+  <span class="sub"><span id="symbol">—</span> · <span id="conn">connecting…</span></span>
+</header>
+
+<!--
+  The banner is not decoration. Integrity is per-venue and a combined view is
+  only ever as strong as its weakest input, so any statement spanning venues
+  has to say so, or it is claiming more than the data supports.
+-->
+<div id="banner">…</div>
+
+<div class="grid" id="venues"></div>
+
+<div id="chartwrap">
+  <h2>Mid price</h2>
+  <div class="sub">
+    Plotted against <strong>ingest time</strong> — when we received each update, not when a venue
+    says it sent it. Venue clocks disagree by seconds and some are simply wrong.
+    Gaps are periods with no trusted book.
+  </div>
+  <canvas id="chart"></canvas>
+  <div class="legend">
+    <span class="coinbase">Coinbase</span>
+    <span class="kraken">Kraken</span>
+    <span class="bitstamp">Bitstamp</span>
+  </div>
+</div>
+
+<footer>
+  <code>/events</code> SSE · <code>/metrics</code> Prometheus · <code>/api/snapshot</code> JSON ·
+  lagged clients skip forward, they are not disconnected.
+  <span id="lag"></span>
+</footer>
+
+<script>
+"use strict";
+
+// What each venue's protocol can actually prove about a synced book. Shown on
+// every card because "live" alone would make a Bitstamp book — which cannot
+// detect a dropped message at all — look exactly as sound as a Kraken book
+// verified by checksum on every update.
+const CLAIM = {
+  verified: "checksum-verified against the venue on every update",
+  gap_detectable: "contiguous sequence numbers — a loss is detected, but not repairable",
+  order_only: "ordering only — a dropped message leaves no trace",
+};
+const CLAIM_SHORT = { verified: "verified", gap_detectable: "gap-detectable", order_only: "order-only" };
+
+const COLOUR = { coinbase: "--cb", kraken: "--kr", bitstamp: "--bs" };
+const HISTORY = 240; // ~1 minute at 4Hz
+const series = new Map();  // venue -> [{ t, mid } | { t, gap: true }]
+let lagged = 0;
+
+const $ = (id) => document.getElementById(id);
+const fmt = (n, d = 0) => n === null || n === undefined ? "—" : Number(n).toFixed(d);
+const ms = (v) => v === null || v === undefined ? "—" : v < 1000 ? `${v} ms` : `${(v / 1000).toFixed(1)} s`;
+
+function render(snap) {
+  $("symbol").textContent = snap.symbol;
+  $("conn").textContent = `live · seq ${snap.seq}`;
+
+  const weakest = snap.weakest_integrity;
+  const banner = $("banner");
+  if (!weakest) {
+    banner.className = "warn";
+    banner.innerHTML = "<strong>No venue has a book worth trusting right now.</strong> " +
+      "That is a statement about data quality, not about whether the process is running — " +
+      "each card below says why.";
+  } else {
+    banner.className = "";
+    banner.innerHTML = `<strong>Any cross-venue comparison here is ${CLAIM_SHORT[weakest]} at best.</strong> ` +
+      `A combined view is only as strong as its weakest live input, which is currently ` +
+      `<em>${CLAIM[weakest]}</em>.`;
+  }
+
+  $("venues").innerHTML = snap.venues.map(card).join("");
+
+  const now = snap.wall_unix_ms;
+  for (const v of snap.venues) {
+    if (!series.has(v.venue)) series.set(v.venue, []);
+    const s = series.get(v.venue);
+    // A desynced book contributes a gap, not a flat line. Carrying the last
+    // known price forward would draw a confident chart out of data we have
+    // explicitly said we do not trust.
+    s.push(v.status === "live" && v.mid !== null ? { t: now, mid: parseFloat(v.mid) } : { t: now, gap: true });
+    if (s.length > HISTORY) s.shift();
+  }
+  draw();
+}
+
+function card(v) {
+  const stale = v.status !== "live";
+  const claim = v.integrity
+    ? `<div class="claim">Trust: ${CLAIM[v.integrity]}</div>`
+    : "";
+  const reason = v.desync_reason ? `<div class="reason">${escapeHtml(v.desync_reason)}</div>` : "";
+  const c = v.counters;
+  const problem = (n) => n > 0 ? ' class="bad"' : "";
+
+  return `
+  <div class="card venue-${v.venue}">
+    <h2><span class="dot"></span>${v.venue}<span class="badge ${v.status}">${v.status}</span></h2>
+    ${claim}${reason}
+    <div class="quote ${stale ? "stale" : ""}">
+      <div><span class="label">Bid</span><span class="value num">${v.bid ? v.bid.price : "—"}</span></div>
+      <div><span class="label">Ask</span><span class="value num">${v.ask ? v.ask.price : "—"}</span></div>
+      <div><span class="label">Spread</span><span class="value num">${v.spread ?? "—"}</span></div>
+    </div>
+    <table>
+      <tr><td>Book age</td><td class="num">${ms(v.age_ms)}</td></tr>
+      <tr><td>${v.status} for</td><td class="num">${ms(v.status_for_ms)}</td></tr>
+      <tr><td>Time untrusted (total)</td><td class="num"${v.desynced_total_ms > 0 ? ' class="bad"' : ""}>${ms(v.desynced_total_ms)}</td></tr>
+      ${v.last_verified_ms !== null && v.last_verified_ms !== undefined
+        ? `<tr><td>Last checksum match</td><td class="num">${ms(v.last_verified_ms)} ago</td></tr>` : ""}
+      <tr><td>Depth (bid/ask)</td><td class="num">${v.depth[0]} / ${v.depth[1]}</td></tr>
+      <tr><td>Frames/sec</td><td class="num">${fmt(v.rates.frames_per_sec, 1)}</td></tr>
+      <tr><td>Frames received</td><td class="num">${c.frames}</td></tr>
+      <tr><td>Messages applied</td><td class="num">${c.applied}</td></tr>
+      <tr><td>Reconnects</td><td class="num"${problem(c.connects > 1 ? 1 : 0)}>${Math.max(0, c.connects - 1)}</td></tr>
+      <tr><td>Idle timeouts</td><td${problem(c.idle_timeouts)}><span class="num">${c.idle_timeouts}</span></td></tr>
+      <tr><td>Dropped (backpressure)</td><td${problem(c.dropped)}><span class="num">${c.dropped}</span></td></tr>
+      <tr><td>Desyncs</td><td${problem(c.desyncs)}><span class="num">${c.desyncs}</span></td></tr>
+      <tr><td>Parse errors</td><td${problem(c.parse_errors)}><span class="num">${c.parse_errors}</span></td></tr>
+    </table>
+  </div>`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (ch) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+}
+
+function draw() {
+  const canvas = $("chart");
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  const points = [...series.values()].flat().filter((p) => !p.gap);
+  if (points.length < 2) return;
+
+  const style = getComputedStyle(document.documentElement);
+  let lo = Math.min(...points.map((p) => p.mid));
+  let hi = Math.max(...points.map((p) => p.mid));
+  if (hi === lo) { hi += 1; lo -= 1; }
+  const pad = (hi - lo) * 0.12; lo -= pad; hi += pad;
+  const t0 = Math.min(...points.map((p) => p.t));
+  const t1 = Math.max(...points.map((p) => p.t));
+  const span = Math.max(1, t1 - t0);
+
+  const x = (t) => 44 + ((t - t0) / span) * (w - 56);
+  const y = (m) => h - 18 - ((m - lo) / (hi - lo)) * (h - 34);
+
+  // Axis
+  ctx.strokeStyle = style.getPropertyValue("--line").trim();
+  ctx.fillStyle = style.getPropertyValue("--muted").trim();
+  ctx.font = "10px ui-monospace, Menlo, monospace";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 3; i++) {
+    const v = lo + ((hi - lo) * i) / 3;
+    const py = Math.round(y(v)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(44, py); ctx.lineTo(w - 12, py); ctx.stroke();
+    ctx.fillText(v.toFixed(1), 2, py + 3);
+  }
+
+  for (const [venue, pts] of series) {
+    ctx.strokeStyle = style.getPropertyValue(COLOUR[venue] || "--fg").trim();
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    let drawing = false;
+    for (const p of pts) {
+      if (p.gap) { drawing = false; continue; }
+      const px = x(p.t), py = y(p.mid);
+      if (drawing) ctx.lineTo(px, py); else { ctx.moveTo(px, py); drawing = true; }
+    }
+    ctx.stroke();
+  }
+}
+
+window.addEventListener("resize", draw);
+
+function connect() {
+  const source = new EventSource("/events");
+
+  source.addEventListener("snapshot", (e) => render(JSON.parse(e.data)));
+
+  // Falling behind is expected and is not an error. The server has already
+  // skipped this client to the latest snapshot; all that is left is to say so
+  // rather than pretend the chart is continuous.
+  source.addEventListener("lagged", (e) => {
+    lagged += JSON.parse(e.data).missed;
+    $("lag").textContent = ` · skipped ${lagged} snapshot(s) after falling behind`;
+    for (const s of series.values()) s.push({ t: Date.now(), gap: true });
+  });
+
+  source.onerror = () => {
+    $("conn").textContent = "reconnecting…";
+    // EventSource retries on its own; nothing to do but say so.
+  };
+}
+connect();
+</script>
+</body>
+</html>

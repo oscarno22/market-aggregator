@@ -142,15 +142,29 @@ impl VenueSync for CoinbaseSync {
         let envelope: Envelope = serde_json::from_slice(&frame.payload)
             .map_err(|e| VenueError::Malformed(e.to_string()))?;
 
+        // `sequence_num` counts every message on the *connection*, not the
+        // messages on any one channel, so the check has to happen before the
+        // channel is even looked at.
+        //
+        // Getting this wrong is not a subtle degradation, and it is invisible
+        // until you subscribe to a second channel — which this project must,
+        // because Coinbase closes a sparse subscription after 60–90s and
+        // `heartbeats` is what keeps it open. Counting only `l2_data` means
+        // every heartbeat and every subscription ack reads as a hole:
+        // against a real 25-second recording the book desynced within two
+        // messages and then re-desynced continuously, reporting gaps that
+        // were not there while a genuine gap would have looked identical.
+        //
+        // Found by replaying a live tape — precisely the failure the tape
+        // recorder exists for, and one no hand-written fixture would have
+        // produced, because a fixture author writes the messages they are
+        // thinking about.
+        if let Some(reason) = self.check_seq(envelope.sequence_num) {
+            return Ok(vec![SyncAction::Desync(reason)]);
+        }
+
         match envelope.channel.as_str() {
             "l2_data" => {
-                // The gap check covers the whole message, not each event
-                // inside it: sequence_num is a property of the envelope Coinbase
-                // sent, not of any individual product's data within it.
-                if let Some(reason) = self.check_seq(envelope.sequence_num) {
-                    return Ok(vec![SyncAction::Desync(reason)]);
-                }
-
                 let mut actions = Vec::with_capacity(envelope.events.len());
                 for raw in envelope.events {
                     let event: L2Event = serde_json::from_value(raw)

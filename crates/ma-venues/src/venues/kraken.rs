@@ -41,6 +41,23 @@ where
         .map_err(|e| DeError::custom(format!("bad decimal {:?}: {e}", raw.get())))
 }
 
+/// `data` is captured as unparsed source text rather than typed here, and the
+/// choice is forced from two directions at once.
+///
+/// **Correctness:** it must not be a `serde_json::Value`. `Value` stores
+/// numbers as `f64`, which discards exactly the trailing zeros Kraken's
+/// checksum is computed over — the failure `exact_decimal` exists to prevent
+/// would simply move one level up and become invisible again. `RawValue`
+/// keeps the literal bytes, so the second parse sees the digits the venue
+/// sent.
+///
+/// **Robustness:** it must not be `Vec<BookData>` either. Kraken sends a
+/// `status` message on every connection whose `data` has no `symbol` field,
+/// so typing the envelope eagerly failed the whole frame before `channel` was
+/// ever looked at — one parse error per connection, on a counter whose entire
+/// job is to signal venue schema drift. Found by replaying a live tape;
+/// Bitstamp's envelope already defers its `data` parse for the same reason,
+/// against its own subscription acks.
 #[derive(Deserialize)]
 struct Envelope {
     #[serde(default)]
@@ -48,7 +65,7 @@ struct Envelope {
     #[serde(rename = "type", default)]
     kind: Option<String>,
     #[serde(default)]
-    data: Vec<BookData>,
+    data: Option<Box<serde_json::value::RawValue>>,
 }
 
 #[derive(Deserialize)]
@@ -165,8 +182,20 @@ impl VenueSync for KrakenSync {
                     ));
                 };
 
+                let entries: Vec<BookData> = match &envelope.data {
+                    // Re-parsed from the captured source text, so the price
+                    // and quantity digits are the ones Kraken actually sent.
+                    Some(raw) => serde_json::from_str(raw.get())
+                        .map_err(|e| VenueError::Malformed(e.to_string()))?,
+                    None => {
+                        return Err(VenueError::Malformed(
+                            "book message carried no \"data\"".to_owned(),
+                        ));
+                    }
+                };
+
                 let mut actions = Vec::new();
-                for entry in envelope.data {
+                for entry in entries {
                     // A shared connection subscribed to more than one pair
                     // would interleave other pairs' data here; skip what
                     // isn't ours rather than treating it as an error.

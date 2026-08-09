@@ -43,6 +43,9 @@ struct Inner<T> {
     capacity: usize,
     queue: Mutex<VecDeque<T>>,
     notify: Notify,
+    /// Woken when the receiver takes an item. Only [`Sender::send_lossless`]
+    /// waits on it; the drop-oldest path never needs to know about space.
+    space: Notify,
     dropped: AtomicU64,
     sender_count: AtomicUsize,
     closed: AtomicBool,
@@ -96,6 +99,7 @@ pub fn bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
         capacity,
         queue: Mutex::new(VecDeque::with_capacity(capacity)),
         notify: Notify::new(),
+        space: Notify::new(),
         dropped: AtomicU64::new(0),
         sender_count: AtomicUsize::new(1),
         closed: AtomicBool::new(false),
@@ -107,6 +111,19 @@ pub fn bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
         Receiver { inner },
     )
 }
+
+/// The channel was closed, so the item could not be queued. Carries the item
+/// back rather than dropping it, matching [`SendOutcome::Closed`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct Closed<T>(pub T);
+
+impl<T> std::fmt::Display for Closed<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("channel closed")
+    }
+}
+
+impl<T: std::fmt::Debug> std::error::Error for Closed<T> {}
 
 /// What happened to the item just sent.
 #[derive(Debug, PartialEq, Eq)]
@@ -162,6 +179,56 @@ impl<T> Sender<T> {
                 SendOutcome::DroppedOldest(old)
             }
             None => SendOutcome::Sent,
+        }
+    }
+
+    /// Queue `item`, waiting for room rather than evicting anything.
+    ///
+    /// # This is the opposite policy to [`Self::send`], on purpose
+    ///
+    /// Everything in this module's header argues that a stale market tick has
+    /// negative value and should be dropped. That argument is about a *live*
+    /// producer, where the alternative to dropping is delivering something
+    /// misleading. Replay is not a live producer. A tape is a record of what a
+    /// venue actually sent, and reproducing it is the entire point: the plan
+    /// asks that the same tape replayed twice yield the same snapshot
+    /// sequence, and a producer that outruns the consumer and silently loses
+    /// whichever frames happened to lose the race makes that impossible.
+    ///
+    /// The consequence of getting this wrong is not subtle. Replaying a real
+    /// tape flat-out dropped Kraken's opening snapshot, so every subsequent
+    /// update applied to a book that did not exist — and the run "reproduced"
+    /// a desync the recording never contained.
+    ///
+    /// So: [`Self::send`] for anything reading a socket, this for anything
+    /// reading a file. Same channel, same consumer, and the choice is made by
+    /// whether the producer is delivering an opinion about now or a record of
+    /// then.
+    ///
+    /// # Errors
+    /// If the channel closes while waiting, the item comes back.
+    pub async fn send_lossless(&self, item: T) -> Result<(), Closed<T>> {
+        loop {
+            if self.inner.closed.load(Ordering::Acquire) {
+                return Err(Closed(item));
+            }
+            // Subscribe before re-checking, so a `pop` between the check and
+            // the await cannot be missed.
+            let space = self.inner.space.notified();
+            tokio::pin!(space);
+
+            if self.lock().len() < self.inner.capacity {
+                // Re-checked under the same lock discipline `send` uses. A
+                // racing sender could still fill the last slot, in which case
+                // `send` would evict — but there is only ever one replay
+                // producer, and mixing replay with a live venue on one channel
+                // is not a thing this system does.
+                return match self.send(item) {
+                    SendOutcome::Closed(item) => Err(Closed(item)),
+                    _ => Ok(()),
+                };
+            }
+            space.await;
         }
     }
 
@@ -267,7 +334,12 @@ impl<T> Receiver<T> {
     }
 
     fn pop(&self) -> Option<T> {
-        self.lock().pop_front()
+        let item = self.lock().pop_front();
+        if item.is_some() {
+            // Wake anything waiting for room. Only `send_lossless` ever is.
+            self.inner.space.notify_waiters();
+        }
+        item
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<T>> {

@@ -2,7 +2,7 @@
   "channel": "heartbeats",
   "client_id": "",
   "timestamp": "2026-08-08T12:00:00.500000000Z",
-  "sequence_num": 0,
+  "sequence_num": 1,
   "events": [
     { "current_time": "2026-08-08 12:00:00.500000000 +0000 UTC", "heartbeat_counter": 42 }
   ]

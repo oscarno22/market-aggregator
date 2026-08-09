@@ -16,4 +16,4 @@ pub use channel::{ChannelMetrics, Receiver, SendOutcome, Sender, bounded};
 pub use ingest::{Ingest, IngestMessage, SessionEnd, Shutdown, ShutdownTrigger, shutdown};
 pub use metrics::{Metrics, Rates, VenueCounters, VenueCountersSnapshot};
 pub use net::{LiveNetwork, NetError, Network, Transport};
-pub use tape::{ReplayStats, TapeError, TapeReader, TapeWriter, TapedFrame, replay};
+pub use tape::{Pacing, ReplayStats, TapeError, TapeReader, TapeWriter, TapedFrame, replay};

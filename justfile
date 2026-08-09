@@ -34,3 +34,14 @@ record venue symbol="BTC-USD" secs="120":
 # Replay a recorded tape through the full pipeline. No network.
 replay tape:
     cargo run -p ma-server --bin replay -- --tape {{tape}}
+
+# Replay a tape *and* serve the chart page, at the recording's original pace.
+# This is the demo that works on a plane.
+demo tape speed="1.0":
+    cargo run -p ma-server --bin replay -- --tape {{tape}} --speed {{speed}} --serve
+
+# ------------------------------------------------------- Tier 2: live venues
+
+# Connect to the venues and serve the chart page at http://127.0.0.1:8080.
+serve venues="coinbase,kraken,bitstamp" symbol="BTC-USD":
+    cargo run -p ma-server -- --venues {{venues}} --symbol {{symbol}}

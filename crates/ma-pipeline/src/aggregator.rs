@@ -332,6 +332,8 @@ impl Aggregator {
             return;
         };
 
+        state.counters.record_applied();
+
         match message {
             IngestMessage::Frame(frame) => {
                 let before = state.book.book().state();

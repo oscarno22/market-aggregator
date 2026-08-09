@@ -286,6 +286,49 @@ impl<R: AsyncRead + Unpin> TapeReader<R> {
     }
 }
 
+/// How fast to replay, and — inseparably — what to do when the consumer
+/// cannot keep up.
+///
+/// The two decisions are one decision, which is why they are one type. Pacing
+/// determines whether the producer can outrun the consumer at all, and that in
+/// turn determines whether dropping means "this consumer is too slow for the
+/// market" or merely "this file reads faster than a CPU applies it".
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pacing {
+    /// As fast as the consumer will accept, losing nothing
+    /// ([`Sender::send_lossless`]).
+    ///
+    /// What the offline suite wants, and what makes "the same tape produces
+    /// the same snapshot sequence" achievable. Reading a file with no sleeps
+    /// outruns any consumer, so a drop-oldest producer here would discard
+    /// whichever frames happened to lose the race and the run would
+    /// "reproduce" events the recording never contained.
+    ///
+    /// Not a hypothetical: the first full-speed replay of a real three-venue
+    /// tape dropped Kraken's opening snapshot, and every update after it
+    /// applied to a book that did not exist — hundreds of checksum failures
+    /// that never happened live.
+    Faithful,
+    /// Reproduce the recording's own spacing, scaled by `speed`, and drop the
+    /// oldest event when the consumer falls behind — exactly as a live venue
+    /// would ([`Sender::send`]).
+    ///
+    /// `1.0` is the recording's original pace. This is the honest mode for a
+    /// demo and the only one where [`ReplayStats::dropped`] means what it
+    /// means live: the consumer could not keep up with the market.
+    Realtime { speed: f64 },
+}
+
+impl Pacing {
+    /// Map a CLI `--speed` flag: absent or non-positive means [`Self::Faithful`].
+    pub fn from_speed(speed: Option<f64>) -> Self {
+        match speed {
+            Some(speed) if speed > 0.0 => Self::Realtime { speed },
+            _ => Self::Faithful,
+        }
+    }
+}
+
 /// Outcome of a full replay run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReplayStats {
@@ -301,27 +344,23 @@ pub struct ReplayStats {
 /// `IngestTime` from `clock`'s current reading plus the tape's recorded
 /// offsets.
 ///
-/// `speed`: `None` reads and sends every frame back-to-back with no
-/// sleeping — how the offline test suite runs replay, and how a demo with no
-/// network gets through a whole tape immediately instead of over the
-/// recording's original wall-clock duration. `Some(x)` sleeps between frames
-/// scaled by the tape's recorded spacing divided by `x`: `Some(1.0)`
-/// reproduces the original pacing, `Some(4.0)` runs four times faster than
-/// the recording. A non-positive speed is treated as `None`.
+/// [`Pacing`] chooses both the timing and the loss policy — see its variants
+/// for why those two decisions belong together.
 ///
-/// Frames arrive at `tx` exactly as a live ingest task would deliver them —
-/// through the same bounded, drop-oldest [`Sender`] — so a slow consumer
-/// loses the same stale ticks it would lose live, reported the same way
-/// [`crate::channel::ChannelMetrics::dropped`] would.
+/// Either way the frames arrive at the *same* channel the same aggregator
+/// reads, which is the property that matters: nothing downstream can tell
+/// replay from a socket.
 pub async fn replay<R, C>(
     reader: &mut TapeReader<R>,
     tx: &Sender<IngestMessage>,
     clock: &C,
-    speed: Option<f64>,
+    pacing: Pacing,
 ) -> Result<ReplayStats, TapeError>
 where
     R: AsyncRead + Unpin,
-    C: Clock,
+    // `?Sized` so a caller holding an `Arc<dyn Clock>` — which is how the
+    // pipeline passes its clock around — can hand over `&*clock` directly.
+    C: Clock + ?Sized,
 {
     let base = clock.now();
     let mut previous_elapsed = Duration::ZERO;
@@ -329,9 +368,9 @@ where
 
     while let Some(taped) = reader.next_frame().await? {
         let elapsed = taped.elapsed;
-        if let Some(speed) = speed.filter(|s| *s > 0.0) {
+        if let Pacing::Realtime { speed } = pacing {
             let gap = elapsed.saturating_sub(previous_elapsed);
-            let scaled = gap.div_f64(speed);
+            let scaled = gap.div_f64(speed.max(f64::MIN_POSITIVE));
             if scaled > Duration::ZERO {
                 tokio::time::sleep(scaled).await;
             }
@@ -340,10 +379,18 @@ where
 
         let message = taped.into_message(base);
         stats.frames_sent += 1;
-        match tx.send(message) {
-            SendOutcome::Sent => {}
-            SendOutcome::DroppedOldest(_) => stats.dropped += 1,
-            SendOutcome::Closed(_) => break,
+
+        match pacing {
+            Pacing::Faithful => {
+                if tx.send_lossless(message).await.is_err() {
+                    break;
+                }
+            }
+            Pacing::Realtime { .. } => match tx.send(message) {
+                SendOutcome::Sent => {}
+                SendOutcome::DroppedOldest(_) => stats.dropped += 1,
+                SendOutcome::Closed(_) => break,
+            },
         }
     }
 
@@ -474,7 +521,7 @@ mod tests {
         let (tx, rx) = bounded::<IngestMessage>(8);
         let replay_clock = TestClock::new();
 
-        let stats = replay(&mut reader, &tx, &replay_clock, None)
+        let stats = replay(&mut reader, &tx, &replay_clock, Pacing::Faithful)
             .await
             .expect("replay");
         drop(tx);
@@ -521,9 +568,19 @@ mod tests {
         let mut reader = TapeReader::open(&path).await.expect("open");
         let (tx, rx) = bounded::<IngestMessage>(2);
 
-        let stats = replay(&mut reader, &tx, &TestClock::new(), None)
-            .await
-            .expect("replay");
+        // Realtime pacing keeps the live drop-oldest policy. `Faithful` would
+        // wait for room here and never finish, which is the whole point of
+        // the two modes being different: the frames a *live* venue sends into
+        // a full buffer are stale opinions to be discarded, and the frames a
+        // *file* holds are a record to be reproduced.
+        let stats = replay(
+            &mut reader,
+            &tx,
+            &TestClock::new(),
+            Pacing::Realtime { speed: 1e9 },
+        )
+        .await
+        .expect("replay");
 
         assert_eq!(stats.frames_sent, 5);
         assert_eq!(

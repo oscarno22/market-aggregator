@@ -383,6 +383,22 @@ impl VenueBook {
     }
 
     fn verify(&mut self, expected: u32, at: IngestTime) {
+        // A checksum can only confirm or refute a book we actually have. On a
+        // book that is not live it would hash an empty or distrusted set of
+        // levels, always mismatch, and report `ChecksumMismatch` — which reads
+        // as "the venue and we disagree about the book" when the truth is "we
+        // have no book". Found against a real Kraken tape whose snapshot was
+        // dropped by the channel: every subsequent update produced a fresh
+        // mismatch against `computed: 0`, burying the actual problem under
+        // hundreds of misleading ones.
+        //
+        // Staying `Uninitialized` here is the honest answer, and it is exactly
+        // the distinction `BookState` exists to preserve: no data, rather than
+        // data I do not trust.
+        if !self.book.state().is_live() {
+            return;
+        }
+
         let Some(computed) = self.sync.checksum(&self.book) else {
             // A venue that sends a checksum but has no way to compute one over
             // our book is a bug in that venue's implementation, not a desync.

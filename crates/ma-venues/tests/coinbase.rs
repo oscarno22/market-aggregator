@@ -201,3 +201,44 @@ fn both_spellings_of_the_ask_side_are_accepted() {
         );
     }
 }
+
+#[test]
+fn sequence_numbers_count_every_message_on_the_connection() {
+    // Not just the ones on l2_data. Coinbase numbers the *connection*, and
+    // this project necessarily subscribes to two channels — heartbeats is not
+    // optional, because Coinbase closes a sparse subscription after 60-90s.
+    //
+    // Counting only l2_data meant every heartbeat and every subscription ack
+    // read as a hole. Against a real 25-second recording the book desynced
+    // within two messages and then kept re-desyncing, so a genuine gap and a
+    // perfectly healthy connection produced identical output. No hand-written
+    // fixture caught it, because a fixture author numbers the messages they
+    // are thinking about; replaying a live tape did.
+    let mut vb = book();
+    vb.feed(&frame(fixture!("snapshot.json"))).unwrap(); // seq 0, l2_data
+    vb.feed(&frame(fixture!("heartbeat.json"))).unwrap(); // seq 1, heartbeats
+
+    assert!(
+        vb.book().state().is_live(),
+        "a heartbeat consuming a sequence number must not read as a gap: {:?}",
+        vb.book().state()
+    );
+
+    // ...and the numbering must still be enforced across channels: an
+    // l2_data at 3 after a heartbeat at 1 has skipped 2, whatever channel 2
+    // was on.
+    let mut vb = book();
+    vb.feed(&frame(fixture!("snapshot.json"))).unwrap(); // 0
+    vb.feed(&frame(fixture!("heartbeat.json"))).unwrap(); // 1
+    vb.feed(&frame(fixture!("update_gap.json"))).unwrap(); // 3
+
+    match vb.book().state() {
+        BookState::Desynced {
+            reason: DesyncReason::SequenceGap { expected, got },
+            ..
+        } => {
+            assert_eq!((expected, got), (2, 3));
+        }
+        other => panic!("expected a SequenceGap across channels, got {other:?}"),
+    }
+}

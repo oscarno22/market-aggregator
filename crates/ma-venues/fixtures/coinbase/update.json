@@ -9,7 +9,7 @@
       "product_id": "BTC-USD",
       "updates": [
         { "side": "bid", "event_time": "2026-08-08T12:00:01Z", "price_level": "60000.00", "new_quantity": "0.90000000" },
-        { "side": "ask", "event_time": "2026-08-08T12:00:01Z", "price_level": "60010.00", "new_quantity": "0" }
+        { "side": "offer", "event_time": "2026-08-08T12:00:01Z", "price_level": "60010.00", "new_quantity": "0" }
       ]
     }
   ]

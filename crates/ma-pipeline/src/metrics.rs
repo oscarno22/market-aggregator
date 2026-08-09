@@ -47,6 +47,7 @@ pub struct VenueCounters {
     parse_errors: AtomicU64,
     heartbeats: AtomicU64,
     desyncs: AtomicU64,
+    applied: AtomicU64,
 }
 
 macro_rules! counter {
@@ -72,6 +73,7 @@ counter! {
     parse_errors => record_parse_error,
     heartbeats => record_heartbeat,
     desyncs => record_desync,
+    applied => record_applied,
 }
 
 impl VenueCounters {
@@ -98,6 +100,7 @@ impl VenueCounters {
             parse_errors: load(&self.parse_errors),
             heartbeats: load(&self.heartbeats),
             desyncs: load(&self.desyncs),
+            applied: load(&self.applied),
         }
     }
 }
@@ -135,6 +138,18 @@ pub struct VenueCountersSnapshot {
     /// `disconnects`: a checksum mismatch or a sequence gap desyncs a book on
     /// a connection that never dropped.
     pub desyncs: u64,
+    /// Messages the aggregator actually processed.
+    ///
+    /// Deliberately not the same number as `frames`, which counts what ingest
+    /// *received*. The gap between them is `dropped` — what the bounded
+    /// channel discarded on the way — so publishing both makes backpressure
+    /// legible instead of inferable.
+    ///
+    /// It is also what makes replay honest: a replayed tape has no ingest
+    /// task, so `frames` is genuinely zero while `applied` climbs. Folding the
+    /// two together would have meant either lying about what was received or
+    /// showing a page full of zeroes beside a visibly updating book.
+    pub applied: u64,
 }
 
 impl VenueCountersSnapshot {
