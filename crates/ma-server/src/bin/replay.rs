@@ -16,7 +16,7 @@ use std::time::Duration;
 use clap::Parser;
 use ma_core::Symbol;
 use ma_pipeline::tape::{Pacing, TapeReader, replay};
-use ma_server::{DEFAULT_VENUES, Pipeline, http, init_tracing, parse_symbols};
+use ma_server::{DEFAULT_VENUES, Pipeline, http, init_tracing, parse_symbols, stop_requested};
 
 #[derive(Parser, Debug)]
 #[command(about = "Replay a recorded tape through the full pipeline (no network)")]
@@ -137,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(server) = server {
         tracing::info!("tape exhausted; still serving the final state — ctrl-c to stop");
-        tokio::signal::ctrl_c().await?;
+        stop_requested().await;
         drop(pipeline.into_trigger());
         let _ = tokio::time::timeout(Duration::from_secs(3), server).await;
     } else {

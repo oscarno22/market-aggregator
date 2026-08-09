@@ -181,7 +181,7 @@ Neither layer replaces the other.
 Snapshot as of the last session; update this when a milestone item lands or
 a design decision changes.
 
-**v1 and v2 are complete.** Five-crate workspace, **233 tests passing,
+**v1 and v2 are complete.** Five-crate workspace, **235 tests passing,
 clippy-clean (`-D warnings`), `cargo fmt` clean**. The full suite runs offline;
 `just demo tapes/2026-08-09-btc-usd.jsonl.gz` plays a real recording through
 the real pipeline with the network unplugged.
@@ -233,6 +233,14 @@ correct offline:
 Both were caught by running against live venues and diagnosed with
 `just audit-probe`, which prints the disagreement profile by distance from the
 touch. Neither was reachable from a fixture.
+
+**And one in the archive, found by killing a live run:** hourly *partitioning*
+is not hourly *durability*. A Parquet file is unreadable until its footer is
+written, and the process only handled Ctrl-C — so `pkill` (i.e. what any
+orchestrator sends on deploy) discarded everything since the last roll. Fixed
+in two places: `SIGTERM` is handled, and `WriterConfig::max_open` closes a part
+every five minutes regardless, so the hour decides the partition and that
+decides how much is ever at risk.
 
 **Next up:** v3 — sharding, rolling indicators, cross-venue spread. Note the
 sequencing rule still standing: nothing writes to S3 before an IAM user scoped

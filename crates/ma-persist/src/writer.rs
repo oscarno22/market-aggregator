@@ -65,6 +65,25 @@ pub struct WriterConfig {
     /// waiting out an hour, which is the difference between the roll logic
     /// being tested and being hoped about.
     pub roll_every: Duration,
+    /// Longest a file stays open before being closed and stored anyway.
+    ///
+    /// # Why hourly partitioning is not the same as hourly durability
+    ///
+    /// A Parquet file is only readable once its footer is written, so an open
+    /// file is worth nothing to anyone but this process. With hourly rolls
+    /// alone, a process killed at minute 59 loses fifty-nine minutes — and
+    /// "killed" is the normal case, not the exceptional one: a container gets
+    /// `SIGTERM` on every deploy.
+    ///
+    /// So the hour decides the *partition* and this decides how much is ever at
+    /// risk. Files land as `part-00000`, `part-00001`, … inside the same
+    /// `hour=HH/` directory, which every query engine reads as one hour
+    /// regardless of how many parts it took.
+    ///
+    /// Five minutes trades a bounded loss window against small-file count: at
+    /// three venues that is a handful of megabytes per part, comfortably above
+    /// the size where Parquet's own overhead starts to matter.
+    pub max_open: Duration,
 }
 
 impl Default for WriterConfig {
@@ -72,6 +91,7 @@ impl Default for WriterConfig {
         Self {
             row_group_rows: 8192,
             roll_every: Duration::from_secs(3600),
+            max_open: Duration::from_secs(300),
         }
     }
 }
@@ -101,6 +121,10 @@ struct OpenFile {
     /// arithmetic makes "did we cross a boundary?" a single integer compare,
     /// and makes a sub-hour `roll_every` work identically for tests.
     window: i64,
+    /// When this file was opened, on the ingest clock. Monotonic, so a
+    /// mid-session NTP step cannot make a file look hours old and roll it, nor
+    /// make an old one look fresh and keep it open.
+    opened_at: IngestTime,
     key: String,
     writer: ArrowWriter<Vec<u8>>,
     rows: Vec<Row>,
@@ -173,13 +197,21 @@ impl EventWriter {
         let base = *self.base.get_or_insert(event.ingest_ts);
         let window = self.window_of(event.ingest_ts.wall());
 
+        // Two independent reasons to close a file: it belongs to a different
+        // hour, or it has simply been open long enough that the unwritten
+        // footer represents more risk than it is worth. See
+        // `WriterConfig::max_open`.
+        let stale = self
+            .open
+            .as_ref()
+            .is_some_and(|open| event.ingest_ts.since(open.opened_at) >= self.config.max_open);
         match &self.open {
-            Some(open) if open.window == window => {}
+            Some(open) if open.window == window && !stale => {}
             Some(_) => self.roll().await?,
             None => {}
         }
         if self.open.is_none() {
-            self.open = Some(self.start_file(window, event.ingest_ts.wall())?);
+            self.open = Some(self.start_file(window, event.ingest_ts.wall(), event.ingest_ts)?);
         }
 
         self.event_seq += 1;
@@ -220,7 +252,12 @@ impl EventWriter {
         i64::try_from(secs / per).unwrap_or(i64::MAX)
     }
 
-    fn start_file(&self, window: i64, at: SystemTime) -> Result<OpenFile, WriteError> {
+    fn start_file(
+        &self,
+        window: i64,
+        at: SystemTime,
+        opened_at: IngestTime,
+    ) -> Result<OpenFile, WriteError> {
         let props = WriterProperties::builder()
             // zstd over snappy: these files are written once, read rarely, and
             // kept. Compression ratio is worth more than decode speed, and the
@@ -232,6 +269,7 @@ impl EventWriter {
         debug!(%key, window, "opening a new parquet file");
         Ok(OpenFile {
             window,
+            opened_at,
             key,
             writer,
             rows: Vec::with_capacity(self.config.row_group_rows),
@@ -672,6 +710,93 @@ mod tests {
             .unwrap();
         assert_eq!(keys.len(), 1, "one hour produced several files: {keys:?}");
         assert_eq!(writer.rows_written, 50);
+    }
+
+    #[tokio::test]
+    async fn a_long_quiet_hour_still_lands_parts_on_disk() {
+        // The gap a live run found: hourly *partitioning* is not hourly
+        // *durability*. A Parquet file is unreadable until its footer is
+        // written, so an hour-long open file means an hour of data that only
+        // this process can see — and a container gets SIGTERM on every deploy.
+        //
+        // `max_open` bounds that. Several parts inside one `hour=HH/`
+        // directory read as one hour to any query engine.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::LocalStore::new(dir.path()));
+        let mut writer = EventWriter::new(store.clone(), "events").with_config(WriterConfig {
+            roll_every: Duration::from_secs(3600),
+            max_open: Duration::from_secs(60),
+            ..WriterConfig::default()
+        });
+
+        // Twenty minutes of events from the top of an hour, so they all fall
+        // inside one partition and only `max_open` can split them.
+        let origin = at(1_786_244_400);
+        for i in 0..20_u64 {
+            writer
+                .append(&MarketEvent {
+                    ingest_ts: origin.advanced_by(Duration::from_secs(i * 60)),
+                    ..event(EventKind::Heartbeat { counter: Some(i) }, origin)
+                })
+                .await
+                .unwrap();
+        }
+
+        // Deliberately *not* closed: this is the state a killed process leaves
+        // behind, and the point is that most of the data is already safe.
+        let keys = crate::store::ObjectStore::list(&*store, "events/")
+            .await
+            .unwrap();
+        assert!(
+            keys.len() >= 15,
+            "twenty minutes at a one-minute bound produced only {} parts: {keys:?}",
+            keys.len()
+        );
+        assert!(
+            keys.iter().all(|k| k.contains("hour=")),
+            "parts escaped their hour partition: {keys:?}"
+        );
+        // All in the same hour, as distinct parts.
+        let hours: std::collections::BTreeSet<&str> = keys
+            .iter()
+            .filter_map(|k| k.split("/part-").next())
+            .collect();
+        assert_eq!(
+            hours.len(),
+            1,
+            "one hour was split across partitions: {keys:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parts_within_an_hour_have_distinct_keys() {
+        // If they collided, each part would overwrite the last and the bound
+        // above would silently protect nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::LocalStore::new(dir.path()));
+        let mut writer = EventWriter::new(store.clone(), "events").with_config(WriterConfig {
+            max_open: Duration::from_secs(1),
+            ..WriterConfig::default()
+        });
+
+        let origin = at(1_786_247_000);
+        for i in 0..5_u64 {
+            writer
+                .append(&MarketEvent {
+                    ingest_ts: origin.advanced_by(Duration::from_secs(i * 2)),
+                    ..event(EventKind::Heartbeat { counter: Some(i) }, origin)
+                })
+                .await
+                .unwrap();
+        }
+        writer.close().await.unwrap();
+
+        let keys = crate::store::ObjectStore::list(&*store, "events/")
+            .await
+            .unwrap();
+        let unique: std::collections::BTreeSet<_> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len(), "part keys collided: {keys:?}");
+        assert_eq!(writer.rows_written, 5, "a part overwrote another");
     }
 
     #[tokio::test]

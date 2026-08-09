@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
             () = &mut deadline => break,
-            () = async { let _ = tokio::signal::ctrl_c().await; } => {
+            () = ma_server::stop_requested() => {
                 tracing::info!("interrupted; flushing what we have");
                 break;
             }

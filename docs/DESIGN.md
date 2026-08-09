@@ -677,29 +677,86 @@ Endpoints: `/` the page, `/events` SSE, `/metrics` Prometheus text,
 
 ### A note on restarts
 
-There is no persistent state. Restarting loses every book and every counter,
-and each venue resyncs from scratch — a few seconds for Coinbase and Kraken, a
-REST round trip for Bitstamp. That is cheap, but it also means restarting
-erases the evidence. Take a `/api/snapshot` and a `/metrics` scrape first.
+There is no persistent *book* state. Restarting loses every book and every
+counter, and each stream resyncs from scratch — a few seconds for Coinbase and
+Kraken, a REST round trip for Bitstamp. That is cheap, but it also means
+restarting erases the evidence. Take a `/api/snapshot` and a `/metrics` scrape
+first.
+
+The **archive** is a different matter, and v2 had a real gap here that only
+showed up by killing a live run. A Parquet file is unreadable until its footer
+is written, so an open file is worth nothing to anyone but the writing process.
+Two things bound the loss:
+
+- The process handles `SIGTERM` as well as Ctrl-C, and the shutdown path waits
+  for the writer to finish and store its open file. Before that, a `pkill`
+  discarded everything since the last roll — which on hourly rolls could be
+  fifty-nine minutes. An orchestrator sends `SIGTERM` on every deploy, so this
+  was the common case, not the exceptional one.
+- `WriterConfig::max_open` (5 minutes) closes a part regardless. The hour
+  decides the *partition*; this decides how much is ever at risk. Several
+  `part-NNNNN.parquet` files inside one `hour=HH/` directory read as one hour
+  to any query engine.
+
+A hard kill (`SIGKILL`, OOM, power) still loses up to `max_open` of history.
+That is the deliberate floor, not an oversight: the alternative is fsyncing per
+event, which would put the durability layer on the ingest hot path — the exact
+coupling the bounded channel exists to prevent.
 
 ---
 
 ## 10. Where this stops
 
-v1 is complete: three venues, one symbol, reconnect with gap-fill, the three
-book states, SSE and a page, metrics, and a committed tape the whole thing
-replays from with no network.
+v1 and v2 are complete: three venues, any number of symbols, full L2 depth,
+reconnect with gap-fill, a periodic integrity audit, the three book states, SSE
+and a page, metrics, a Parquet archive the process can replay itself from, and
+a committed tape the whole thing replays from with no network.
 
-Not built yet, in the order the plan puts them:
+What v2 added, and what each piece is actually worth:
 
-- **v2** — full L2 depth with pruning; a periodic REST re-snapshot audit for
-  Bitstamp and Coinbase, which is the only way to catch the drift their weaker
-  guarantees allow; Parquet with hourly rolls behind an `ObjectStore` trait;
-  real S3 behind a scoped IAM user; multi-symbol.
-- **v3**, and only if v2 is solid — sharding across nodes, rolling indicators,
-  and a cross-venue spread view. That last one must surface `Integrity` beside
-  every number it derives, or it will lie.
+| | Status |
+|---|---|
+| Multi-symbol, one connection per stream | Done, run live against two symbols across three venues |
+| Full L2 depth, served ≠ retained | Done |
+| Periodic REST depth audit | Done, and **corrected twice against live venues** — see §5 |
+| Parquet, hourly rolls, `ObjectStore` | Done, with an end-to-end round-trip test through the real pipeline |
+| Parquet replay | Done, and still checksum-verified against Kraken |
+| S3 | **Written, compiled, never run.** See below |
 
-AWS is deliberately untouched so far. Nothing here writes to S3, and nothing
-should until there is an IAM user scoped to one bucket prefix — a long-running
-ingest process holding root credentials is fine until it is not.
+### The one thing that is written and unproven
+
+`ma-persist`'s S3 store compiles under `--features s3` and has never been
+pointed at a bucket. That is deliberate and it is the sequencing rule in
+CLAUDE.md: nothing writes to S3 before an IAM user scoped to one bucket prefix
+replaces any root credentials.
+
+Three things make that structural rather than remembered — the feature is off
+by default so the offline suite cannot acquire a dependency on credentials; a
+prefix is mandatory, because a writer that can address a bucket root is not
+"scoped" whatever the policy says; and `MA_S3_ACK_SCOPED_IAM=1` is required to
+start. That last one is a weak control and its own error message says so:
+nothing in the process can distinguish a scoped key from a root one. It stops a
+long-running process from silently inheriting whatever was in its environment,
+which is the failure actually worth preventing.
+
+**What remains unproven is this file against real S3 semantics** — pagination
+past the first page, error shapes, and whether `PutObject`'s atomicity holds up
+the way `LocalStore`'s rename does. No amount of local testing establishes any
+of that. The first run against a real bucket is a Tier 3 exercise and should be
+treated as one.
+
+### Not built yet, in the order the plan puts them
+
+- **v3** — sharding venues across nodes with a coordination layer; rolling
+  indicators over configurable windows; a cross-venue spread view. That last
+  one must surface `Integrity` beside every number it derives, or it will lie —
+  the machinery for that already exists (`SymbolView::weakest_integrity`) and
+  the page already uses it per symbol.
+- **Symbol-partitioned Parquet.** Today symbol is a column, not a partition,
+  which is right at this volume and stops being right once one symbol's hour is
+  large enough to be worth skipping whole.
+- **A tape recorded across a real reconnect.** The committed tape is a clean
+  60 seconds. The reconnect and audit paths are proven against the fake venue
+  and, for the audit, against live venues — but not yet from a recording of a
+  real outage, which is the artefact that would make those paths as
+  well-evidenced as the parsers now are.

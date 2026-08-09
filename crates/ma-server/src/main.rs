@@ -8,7 +8,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use clap::Parser;
-use ma_server::{DEFAULT_VENUES, Pipeline, http, init_tracing, parse_symbols, parse_venues};
+use ma_server::{
+    DEFAULT_VENUES, Pipeline, http, init_tracing, parse_symbols, parse_venues, stop_requested,
+};
 
 #[derive(Parser, Debug)]
 #[command(about = "Multi-venue crypto market data aggregator")]
@@ -86,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let server = tokio::spawn(http::serve(args.addr, handle, shutdown));
 
-    tokio::signal::ctrl_c().await?;
+    stop_requested().await;
     tracing::info!("shutting down");
 
     // Holding the trigger until here is what has kept everything running;

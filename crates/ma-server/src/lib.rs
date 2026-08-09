@@ -20,6 +20,47 @@ pub const DEFAULT_VENUES: [ma_core::VenueId; 3] = [
     ma_core::VenueId::Bitstamp,
 ];
 
+/// Resolve when the process is asked to stop, by either signal that means it.
+///
+/// # Why `SIGTERM` and not just Ctrl-C
+///
+/// v1 waited on `ctrl_c()` alone, which is correct for a terminal and wrong
+/// everywhere else: an orchestrator sends `SIGTERM`, and an unhandled
+/// `SIGTERM` kills the process outright. That was harmless while the process
+/// held no state worth flushing. v2's Parquet writer changes that — a file is
+/// only readable once its footer is written, so dying without running the
+/// shutdown path discards everything since the last part roll.
+///
+/// Found by killing a live run with `pkill` and discovering the archive was
+/// empty. `WriterConfig::max_open` bounds how much that can ever cost;
+/// handling the signal is what makes the common case cost nothing.
+///
+/// On non-Unix targets this waits on Ctrl-C alone, which is all that exists.
+pub async fn stop_requested() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(term) => term,
+            Err(e) => {
+                // Registering the handler failed, which is not a reason to
+                // refuse to run — fall back to Ctrl-C and say so.
+                tracing::warn!(error = %e, "could not listen for SIGTERM; Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("interrupted"),
+            _ = term.recv() => tracing::info!("SIGTERM received"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 /// Install `tracing` with `RUST_LOG` support, defaulting to something useful.
 pub fn init_tracing(default: &str) {
     use tracing_subscriber::{EnvFilter, fmt};
