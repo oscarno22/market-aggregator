@@ -677,6 +677,9 @@ hoping.
 | Parquet prices as **strings** | Arrow `Decimal128`, or floats | `Decimal128` fixes one scale per column and these venues do not share one. Kraken's checksum covers the digits it sent, trailing zeros included; a column-wide scale would silently rewrite them. |
 | Parquet: one row per **level** | one row per event, levels nested in a `list<struct>` | A file nobody can query is just an expensive tape, and the tape is better at being a tape. Flat rows make "what was on the book at 03:14" a predicate rather than an unnest. |
 | Parquet teed from the **aggregator** | a second consumer of the raw-frame channel | A second consumer would have to duplicate every `VenueSync` and would eventually disagree with the first. Teeing after normalisation means the archive is the same event sequence the live books were built from. |
+| Partition `symbol=` **above** `date=` | date first, symbol below it | The symbol set is small and near-static; the date set grows forever. Symbol first prunes a single-symbol query to one subtree, date first makes it walk every hour in the range and prune inside each. |
+| Symbol kept as a **column** as well as a partition | drop the column, recover it from the path | The path is a physical layout a reader may or may not understand: Hive-aware engines recover it, a plain `ParquetRecordBatchReader` opening one file does not. Dropping it makes a file's contents unidentifiable outside its directory. |
+| Archive reader **merges partitions** on wall clock | `event_seq`, or `elapsed` | Both restart at zero in every writer run, and an archive holds one run per process restart. Merging two runs by `event_seq` interleaves run B's tenth event with run A's tenth. |
 | A `ScaledClock` for `--speed` replay | the system clock, as v1 and v2 used | At `n×`, tape timestamps advance `n×` faster than wall time. The aggregator then reads zero book ages and empty windows — symptoms that look like a data problem, not a clock one. |
 | Window coverage as `trusted_ms` + `span_ms` | a single `coverage` fraction | Two integers say *which* of the two is unusual — a young process and a flapping book both read 0.5. A fraction also invites `f64` into a crate that lints against it. |
 | `range_bps` as the volatility figure | realised volatility (stdev of log returns) | Needs a log and a square root, so `f64`, so the exact-decimal discipline breaks at the last step. The range is cruder, exact, and assumes no distribution. |
@@ -812,6 +815,14 @@ Two things bound the loss:
   `part-NNNNN.parquet` files inside one `hour=HH/` directory read as one hour
   to any query engine.
 
+Since v4 both of those are **per symbol**, because the partition is
+`symbol=X/date=D/hour=H/` and each symbol holds its own open file. One symbol
+crossing an hour must not close another's file, whose hour has not ended and
+whose `max_open` deadline is nowhere near; a global roll would make every
+partition's part boundaries a function of whichever symbol ticked first. The
+cost is that a run over *n* symbols holds *n* row-group buffers and produces
+*n* times the files.
+
 A hard kill (`SIGKILL`, OOM, power) still loses up to `max_open` of history.
 That is the deliberate floor, not an oversight: the alternative is fsyncing per
 event, which would put the durability layer on the ingest hot path — the exact
@@ -881,7 +892,7 @@ Run against `s3://…/events` as the scoped user, then read back:
 | | Result |
 |---|---|
 | Scope probe against real IAM | Refused ambient root; passed the scoped profile |
-| Hourly partitioning | `events/live/date=2026-08-09/hour=08/part-00000.parquet` |
+| Hourly partitioning | `events/live/date=2026-08-09/hour=08/part-00000.parquet` — the v2 layout; v4 puts `symbol=BTC-USD/` above the date, and `EventReader` still reads both |
 | `SIGTERM` flush (the v2 fix) | 58,574 rows, one file, no loss |
 | Replay **out of S3** | 1578 events, 0 dropped; all three books rebuilt to `Live` at their correct per-venue `Integrity` |
 
@@ -1083,9 +1094,6 @@ v1, v2 and v3 are complete. What v3 added:
   opened §10's gate for the Parquet store opens this one too, and `Registry`
   was designed for it — `PutObject`, `ListObjects`, `DeleteObject`, and
   deliberately no conditional write.
-- **Symbol-partitioned Parquet.** Today symbol is a column, not a partition,
-  which is right at this volume and stops being right once one symbol's hour is
-  large enough to be worth skipping whole.
 - **A cross-node view.** Each node serves its own page and its own share of the
   streams; nothing merges them. A gateway subscribing to every node's SSE and
   re-consolidating is the obvious shape, and it inherits §12's whole problem

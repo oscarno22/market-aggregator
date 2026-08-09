@@ -245,10 +245,14 @@ async fn kraken_is_still_checksum_verified_when_rebuilt_from_parquet() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_archive_is_partitioned_by_hour_and_readable_key_first() {
-    // The layout is load-bearing rather than cosmetic: replay reads files in
-    // lexicographic key order and relies on that being chronological, which is
-    // true only because the keys are zero-padded and big-endian.
+async fn the_archive_is_partitioned_by_symbol_then_hour() {
+    // The layout is load-bearing rather than cosmetic.
+    //
+    // Symbol is the outermost partition so that a query for one symbol prunes
+    // to one subtree instead of walking every hour in the range; date and hour
+    // below it stay zero-padded and big-endian so that *within* a symbol,
+    // lexicographic key order is chronological — which is what lets a reader
+    // stream one partition without sorting anything.
     let dir = tempfile::tempdir().expect("tempdir");
     let store: Arc<dyn ObjectStore> = Arc::new(LocalStore::new(dir.path()));
     record_archive(Arc::clone(&store)).await;
@@ -256,7 +260,8 @@ async fn the_archive_is_partitioned_by_hour_and_readable_key_first() {
     let keys = store.list("events").await.expect("list");
     assert!(!keys.is_empty(), "nothing was archived");
     for key in &keys {
-        assert!(key.starts_with("events/date="), "{key}");
+        assert!(key.starts_with("events/symbol="), "{key}");
+        assert!(key.contains("/date="), "{key}");
         assert!(key.contains("/hour="), "{key}");
         assert!(key.ends_with(".parquet"), "{key}");
     }

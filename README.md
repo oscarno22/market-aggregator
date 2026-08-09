@@ -266,6 +266,12 @@ Deliberately unfinished, and stated rather than hidden:
   What it does not prove is *detection*: the socket was closed by us, so the
   idle watchdog and mid-stream socket errors stay proven against the fake venue.
 
+- ~~Symbol is a Parquet column, not a partition.~~ **Done.** The archive is
+  now `events/symbol=X/date=D/hour=H/part-N.parquet`, so a query for one symbol
+  prunes to one subtree. That broke an assumption the reader had never written
+  down — key order stopped being time order — so it now merges one cursor per
+  partition. Archives written under the old layout still read.
+
 - **A cluster registry backed by S3 is not implemented.** The trait needs only
   `PutObject`, `ListObjects` and `DeleteObject` — deliberately no conditional
   write — so it is a small addition, and no longer a blocked one.
@@ -275,8 +281,7 @@ Deliberately unfinished, and stated rather than hidden:
   hop instead of a socket, which makes it a separate piece of work rather than
   a flag.
 
-Next: v4 — a cross-node view, symbol-partitioned Parquet, and an S3-backed
-cluster registry.
+Next: v4 — a cross-node view, and an S3-backed cluster registry.
 
 ## Non-goals
 

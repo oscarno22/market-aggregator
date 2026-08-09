@@ -236,7 +236,12 @@ Neither layer replaces the other.
       **detection**, since we closed the socket. See `docs/DESIGN.md` §4
 - A cross-node view: a gateway merging every node's snapshot. It inherits
   the whole of §12's problem across a network hop rather than a socket
-- Symbol-partitioned Parquet, once one symbol's hour is worth skipping whole
+- [x] Symbol-partitioned Parquet. `events/symbol=X/date=D/hour=H/part-N`, one
+      open file per symbol, rolled per partition. Partitioning by symbol broke
+      the reader's unstated assumption that key order is time order, so
+      `EventReader` now merges one cursor per partition on the wall clock —
+      the only column comparable across writer runs. Old-layout archives still
+      read
 - An S3-backed cluster registry — unblocked by the IAM user that opened the
   Parquet store's gate, and the payoff for `Registry` having no
   compare-and-swap
@@ -359,8 +364,8 @@ a root login session.
 An S3-backed cluster registry is now unblocked. It needs only PutObject,
 ListObjects and DeleteObject — deliberately no conditional write.
 
-**Next up:** v4 — a cross-node merged view, symbol-partitioned Parquet, a tape
-across a real reconnect.
+**Next up:** the rest of v4 — a cross-node merged view, and an S3-backed
+cluster registry.
 
 ## Non-goals
 

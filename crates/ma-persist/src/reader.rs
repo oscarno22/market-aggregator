@@ -27,6 +27,41 @@
 //! that: consecutive rows sharing an `event_seq` are one event. "Consecutive"
 //! is safe because the writer appends in order and never interleaves — the
 //! single-owner discipline that applies to the books applies to the writer too.
+//!
+//! # Partitioning by symbol broke "key order is chronological", and this is
+//! the repair
+//!
+//! Before v4 this reader listed every key, sorted, and read straight through.
+//! That was correct for a reason it never stated: with `date=/hour=` as the
+//! only partitions, lexicographic key order *is* time order, because the
+//! layout is zero-padded and big-endian.
+//!
+//! Partitioning by symbol puts `symbol=` above `date=`, so the same walk now
+//! yields all of BTC-USD, then all of ETH-USD. Nothing errors. The archive
+//! simply replays as two recordings laid end to end — and because
+//! [`crate::replay_archive`] paces on the gap between consecutive `elapsed`
+//! values, the second symbol's whole history arrives in one burst with every
+//! gap clamped to zero. A partitioning change presenting as a pacing bug, in
+//! the layer that exists to make history trustworthy.
+//!
+//! So the reader now keeps one cursor per partition and merges them. Two
+//! properties, kept apart deliberately:
+//!
+//! - **Within a partition, order is exact** — key order, then row order,
+//!   unchanged from before. This is the order that matters, because a book
+//!   only ever sees events for its own symbol. Nothing merges two symbols into
+//!   one book.
+//! - **Between partitions, order is by wall clock**, ties broken by partition
+//!   so a given archive always replays identically. Wall is used rather than
+//!   `event_seq` or `elapsed` because those two restart at zero in every
+//!   writer run, and an archive is expected to contain several — one per
+//!   process restart. Merging two runs by `event_seq` would interleave run
+//!   B's tenth event with run A's tenth.
+//!
+//! The residue is a clock step inside one run reordering *independent*
+//! symbols relative to each other. That is visible to nothing: it cannot
+//! reorder a book's own input, which is the only ordering any consumer here
+//! depends on.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -75,52 +110,87 @@ pub struct StoredEvent {
     pub elapsed: Duration,
 }
 
-/// Reads events back from a store, file by file, in key order.
-#[derive(Debug)]
-pub struct EventReader {
-    store: Arc<dyn ObjectStore>,
+/// One partition's files, read in key order.
+#[derive(Debug, Default)]
+struct Cursor {
     keys: VecDeque<String>,
     pending: VecDeque<StoredEvent>,
 }
 
+/// Reads events back from a store, merging its partitions into one stream.
+#[derive(Debug)]
+pub struct EventReader {
+    store: Arc<dyn ObjectStore>,
+    /// In partition-name order, which is what makes the tie-break between two
+    /// equally-timestamped events stable across runs.
+    cursors: Vec<Cursor>,
+}
+
 impl EventReader {
-    /// Open every file under `prefix`, in lexicographic key order.
+    /// Open every file under `prefix`, merged across partitions.
     ///
-    /// Key order is chronological by construction: `date=YYYY-MM-DD/hour=HH`
-    /// sorts correctly as text precisely because it is zero-padded and
-    /// big-endian. That is why the layout looks the way it does.
+    /// Within one partition, key order is chronological by construction:
+    /// `date=YYYY-MM-DD/hour=HH` sorts correctly as text precisely because it
+    /// is zero-padded and big-endian. Across partitions it is not — see the
+    /// module docs.
     ///
     /// # Errors
     /// If the store cannot be listed.
     pub async fn open(store: Arc<dyn ObjectStore>, prefix: &str) -> Result<Self, ReadError> {
-        let keys = store
-            .list(prefix)
-            .await?
-            .into_iter()
-            .filter(|k| k.ends_with(".parquet"))
-            .collect();
+        let mut by_partition: std::collections::BTreeMap<String, VecDeque<String>> =
+            std::collections::BTreeMap::new();
+        for key in store.list(prefix).await? {
+            if !key.ends_with(".parquet") {
+                continue;
+            }
+            by_partition
+                .entry(partition_of(&key).to_owned())
+                .or_default()
+                .push_back(key);
+        }
         Ok(Self {
             store,
-            keys,
-            pending: VecDeque::new(),
+            cursors: by_partition
+                .into_values()
+                .map(|keys| Cursor {
+                    keys,
+                    pending: VecDeque::new(),
+                })
+                .collect(),
         })
     }
 
-    /// The next event, or `None` when every file is exhausted.
+    /// The next event, or `None` when every partition is exhausted.
     ///
     /// # Errors
     /// If a file cannot be read or a row is malformed.
     pub async fn next_event(&mut self) -> Result<Option<StoredEvent>, ReadError> {
-        loop {
-            if let Some(event) = self.pending.pop_front() {
-                return Ok(Some(event));
+        // Make sure every partition that still has data has its head decoded,
+        // so the comparison below sees all of them. A partition whose current
+        // file is exhausted loads its next one here.
+        for i in 0..self.cursors.len() {
+            while self.cursors[i].pending.is_empty() {
+                let Some(key) = self.cursors[i].keys.pop_front() else {
+                    break;
+                };
+                let bytes = self.store.get(&key).await?;
+                self.cursors[i].pending = decode(bytes)?.into();
             }
-            let Some(key) = self.keys.pop_front() else {
-                return Ok(None);
-            };
-            let bytes = self.store.get(&key).await?;
-            self.pending = decode(bytes)?.into();
         }
+
+        // Earliest wall clock wins; the first cursor wins a tie. Linear rather
+        // than a heap on purpose: the number of partitions is the number of
+        // symbols, and a binary heap over three elements is a slower way to
+        // scan three elements.
+        let pick = self
+            .cursors
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.pending.front().map(|e| (i, e.event.ingest_ts.wall())))
+            .min_by_key(|(i, wall)| (*wall, *i))
+            .map(|(i, _)| i);
+
+        Ok(pick.and_then(|i| self.cursors[i].pending.pop_front()))
     }
 
     /// Read everything. Convenient for tests and for a whole-session replay,
@@ -134,6 +204,24 @@ impl EventReader {
             out.push(event);
         }
         Ok(out)
+    }
+}
+
+/// Which partition a key belongs to: everything before its `date=` component.
+///
+/// Written as a prefix rule rather than as "parse out `symbol=`" so that an
+/// archive written before v4 — no `symbol=` in the path at all — is one
+/// partition rather than an error or a misparse. That matters: files already
+/// sitting in S3 under the old layout must keep replaying, the same reason the
+/// raw-frame tape's `symbol` field is optional. It also means adding a further
+/// partition column later needs no change here.
+fn partition_of(key: &str) -> &str {
+    match key.rsplit_once("/date=") {
+        Some((head, _)) => head,
+        // No date component at all: fall back to the containing directory, so
+        // an unrecognised layout still groups rather than interleaving files
+        // that may have nothing to do with each other.
+        None => key.rsplit_once('/').map_or("", |(head, _)| head),
     }
 }
 

@@ -28,7 +28,24 @@
 //! obligation to keep up here rather than on the sender. Batching is how that
 //! obligation is met: the cost per event is an append to a `Vec`, and the
 //! expensive part happens once per few thousand.
+//!
+//! # Symbol is a partition, and that costs one open file per symbol
+//!
+//! Through v3 symbol was a *column*. That was the right call at one symbol and
+//! the wrong one the moment a query wants an hour of ETH-USD and has to read
+//! BTC-USD's rows to find out they are not ETH-USD's. Now the key carries
+//! `symbol=`, so a reader filtering on a symbol skips the rest by path alone,
+//! before opening a file.
+//!
+//! The price is real and paid here: one open [`ArrowWriter`] per symbol, each
+//! with its own row-group buffer and its own `max_open` clock, so a run over
+//! *n* symbols holds *n* buffers and produces *n* times the files. At the
+//! handful of symbols this project runs that is a few megabytes and a few
+//! files; it is also why the partition is symbol and not `(venue, symbol)`,
+//! which would multiply it again to separate the venues a book is compared
+//! across.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -105,9 +122,21 @@ pub struct EventWriter {
     /// Anchors [`INGEST_ELAPSED`](crate::schema::INGEST_ELAPSED). Set from the
     /// first event rather than from construction, so a writer started before
     /// the feed does not stamp every file with a leading gap.
+    ///
+    /// One base for the whole writer, not one per symbol. `elapsed` is what
+    /// replay paces by, so a per-symbol base would make each symbol restart at
+    /// zero and a two-symbol archive replay as two overlaid recordings.
     base: Option<IngestTime>,
+    /// Counts events across *every* partition, so it stays a total order over
+    /// the writer's run. A per-symbol counter would be denser but would say
+    /// nothing about how two symbols interleaved.
     event_seq: i64,
-    open: Option<OpenFile>,
+    /// One open file per symbol. See the module docs for what that costs.
+    open: BTreeMap<String, OpenFile>,
+    /// Next part number per symbol, so `part-NNNNN` counts up within a
+    /// partition instead of jumping wherever another symbol's rolls left it.
+    /// Kept beyond the file's life, which is why it is not on [`OpenFile`].
+    parts: BTreeMap<String, u64>,
     /// Files finished and uploaded, for logs and for the tests that need to
     /// know a roll actually happened.
     pub files_written: u64,
@@ -177,7 +206,8 @@ impl EventWriter {
             config: WriterConfig::default(),
             base: None,
             event_seq: 0,
-            open: None,
+            open: BTreeMap::new(),
+            parts: BTreeMap::new(),
             files_written: 0,
             rows_written: 0,
         }
@@ -189,36 +219,43 @@ impl EventWriter {
         self
     }
 
-    /// Append one event, rolling the file first if it belongs to a new window.
+    /// Append one event, rolling its symbol's file first if it belongs to a
+    /// new window.
+    ///
+    /// Rolling is per symbol, not global: an event for BTC-USD crossing an
+    /// hour boundary must not close ETH-USD's file, whose own hour has not
+    /// ended and whose `max_open` clock has its own deadline. A global roll
+    /// would make every partition's part boundaries a function of whichever
+    /// symbol happened to tick first.
     ///
     /// # Errors
     /// If the current file cannot be finished or uploaded.
     pub async fn append(&mut self, event: &MarketEvent) -> Result<(), WriteError> {
         let base = *self.base.get_or_insert(event.ingest_ts);
         let window = self.window_of(event.ingest_ts.wall());
+        let partition = partition_name(event.symbol.as_str());
 
         // Two independent reasons to close a file: it belongs to a different
         // hour, or it has simply been open long enough that the unwritten
         // footer represents more risk than it is worth. See
         // `WriterConfig::max_open`.
-        let stale = self
-            .open
-            .as_ref()
-            .is_some_and(|open| event.ingest_ts.since(open.opened_at) >= self.config.max_open);
-        match &self.open {
-            Some(open) if open.window == window && !stale => {}
-            Some(_) => self.roll().await?,
-            None => {}
+        let rotate = self.open.get(&partition).is_some_and(|open| {
+            open.window != window || event.ingest_ts.since(open.opened_at) >= self.config.max_open
+        });
+        if rotate {
+            self.roll(&partition).await?;
         }
-        if self.open.is_none() {
-            self.open = Some(self.start_file(window, event.ingest_ts.wall(), event.ingest_ts)?);
+        if !self.open.contains_key(&partition) {
+            let file =
+                self.start_file(&partition, window, event.ingest_ts.wall(), event.ingest_ts)?;
+            self.open.insert(partition.clone(), file);
         }
 
         self.event_seq += 1;
         let rows = flatten(event, self.event_seq, base);
 
-        // `open` was just ensured above.
-        let Some(open) = self.open.as_mut() else {
+        // Just ensured above.
+        let Some(open) = self.open.get_mut(&partition) else {
             return Ok(());
         };
         open.rows_total += rows.len() as u64;
@@ -230,16 +267,27 @@ impl EventWriter {
         Ok(())
     }
 
-    /// Finish and upload the open file, if any. Call before shutdown, or the
-    /// last partial hour is lost.
+    /// Finish and upload every open file. Call before shutdown, or the last
+    /// partial hour is lost — for every symbol, not just the one that happened
+    /// to receive the final event.
     ///
     /// # Errors
-    /// If the file cannot be finished or uploaded.
+    /// If a file cannot be finished or uploaded. Every remaining partition is
+    /// still attempted: one symbol's failed upload must not discard the
+    /// others' footers, which is the whole of what `close` is for.
     pub async fn close(&mut self) -> Result<(), WriteError> {
-        if self.open.is_some() {
-            self.roll().await?;
+        let partitions: Vec<String> = self.open.keys().cloned().collect();
+        let mut first_error = None;
+        for partition in partitions {
+            if let Err(e) = self.roll(&partition).await {
+                warn!(%partition, error = %e, "could not close a partition's file");
+                first_error.get_or_insert(e);
+            }
         }
-        Ok(())
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Which roll window a wall-clock instant falls in.
@@ -253,7 +301,8 @@ impl EventWriter {
     }
 
     fn start_file(
-        &self,
+        &mut self,
+        partition: &str,
         window: i64,
         at: SystemTime,
         opened_at: IngestTime,
@@ -265,7 +314,9 @@ impl EventWriter {
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
             .build();
         let writer = ArrowWriter::try_new(Vec::new(), EVENT_SCHEMA.clone(), Some(props))?;
-        let key = self.key_for(at, self.files_written);
+        let part = *self.parts.entry(partition.to_owned()).or_insert(0);
+        let key = self.key_for(partition, at, part);
+        self.parts.insert(partition.to_owned(), part + 1);
         debug!(%key, window, "opening a new parquet file");
         Ok(OpenFile {
             window,
@@ -278,19 +329,25 @@ impl EventWriter {
     }
 
     /// Hive-style partitioning, which every query engine understands without
-    /// being told: a reader filtering on one hour can skip the rest by path
-    /// alone, before opening a single file.
+    /// being told: a reader filtering on one symbol or one hour can skip the
+    /// rest by path alone, before opening a single file.
     ///
-    /// Symbol is a *column*, not a partition. Partitioning by it would mean one
-    /// open file per symbol, and at this volume that trades a real cost (open
-    /// file handles, more smaller files, worse compression) for a filter the
-    /// column already supports. It becomes the right call when a single
-    /// symbol's hour is big enough to be worth skipping whole, which is a v3
-    /// problem.
-    fn key_for(&self, at: SystemTime, part: u64) -> String {
+    /// Symbol comes **before** date, and that ordering is the whole point.
+    /// `symbol=X/date=D/hour=H` lets a query for one symbol prune to a single
+    /// subtree; `date=D/hour=H/symbol=X` would make it walk every hour in the
+    /// range and prune inside each. The symbol set is small and near-static
+    /// while the date set grows forever, which is the usual rule for ordering
+    /// partition columns: coarsest and most selective first.
+    ///
+    /// Symbol stays a column as well as a partition. The path is a physical
+    /// layout that a reader may or may not understand — Hive-aware engines
+    /// recover it, `ParquetRecordBatchReader` reading a single file does not —
+    /// so dropping the column would make a file's own contents unidentifiable
+    /// when read outside its directory.
+    fn key_for(&self, partition: &str, at: SystemTime, part: u64) -> String {
         let (date, hour) = date_hour(at);
         format!(
-            "{}/date={date}/hour={hour:02}/part-{part:05}.parquet",
+            "{}/symbol={partition}/date={date}/hour={hour:02}/part-{part:05}.parquet",
             self.prefix
         )
     }
@@ -305,9 +362,9 @@ impl EventWriter {
         Ok(())
     }
 
-    /// Finish the open file and hand it to the store.
-    async fn roll(&mut self) -> Result<(), WriteError> {
-        let Some(mut open) = self.open.take() else {
+    /// Finish one partition's open file and hand it to the store.
+    async fn roll(&mut self, partition: &str) -> Result<(), WriteError> {
+        let Some(mut open) = self.open.remove(partition) else {
             return Ok(());
         };
         Self::flush_row_group(&mut open)?;
@@ -332,6 +389,32 @@ impl EventWriter {
 
 fn into_prefix(raw: String) -> String {
     raw.trim_matches('/').to_owned()
+}
+
+/// A symbol as a path component.
+///
+/// Sanitised rather than trusted, for the same reason `LocalStore::resolve` and
+/// `DirRegistry::path_for` are: `Symbol::new` accepts any string, this string
+/// becomes part of a key, and a key is a path on a `LocalStore`. `../../` in a
+/// symbol must be a strange directory name rather than an escape. An empty
+/// symbol becomes `unknown` so it stays one identifiable partition instead of
+/// colliding with the prefix itself.
+fn partition_name(symbol: &str) -> String {
+    let safe: String = symbol
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe.trim_matches('.').is_empty() {
+        "unknown".to_owned()
+    } else {
+        safe
+    }
 }
 
 /// `(YYYY-MM-DD, hour)` in UTC.
@@ -816,6 +899,160 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(writer.files_written, 0);
+    }
+
+    #[tokio::test]
+    async fn each_symbol_lands_in_its_own_partition() {
+        // The whole point of v4's change: a query for one symbol's hour prunes
+        // by path, before opening a file. As a column it had to read every
+        // row of every other symbol to discover they were not this one's.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::LocalStore::new(dir.path()));
+        let mut writer = EventWriter::new(store.clone(), "events");
+
+        for (i, symbol) in ["BTC-USD", "ETH-USD", "BTC-USD"].into_iter().enumerate() {
+            writer
+                .append(&MarketEvent {
+                    symbol: Symbol::new(symbol),
+                    ..event(
+                        EventKind::Heartbeat { counter: None },
+                        at(1_786_247_000 + i as u64),
+                    )
+                })
+                .await
+                .unwrap();
+        }
+        writer.close().await.unwrap();
+
+        let keys = crate::store::ObjectStore::list(&*store, "events/")
+            .await
+            .unwrap();
+        assert_eq!(keys.len(), 2, "symbols shared a file: {keys:?}");
+        assert!(
+            keys.iter().any(|k| k.starts_with("events/symbol=BTC-USD/")),
+            "{keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| k.starts_with("events/symbol=ETH-USD/")),
+            "{keys:?}"
+        );
+        // Symbol above date, so one symbol is one subtree. The other order
+        // would make a single-symbol query walk every hour in the range.
+        assert!(
+            keys.iter()
+                .all(|k| k.contains("/date=") && k.contains("/hour=")),
+            "the date and hour partitions were lost: {keys:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_symbols_hour_boundary_does_not_roll_another() {
+        // Rolling is per partition. A global roll would make every symbol's
+        // part boundaries a function of whichever symbol happened to tick
+        // first across the hour — and would close a file whose own `max_open`
+        // deadline is nowhere near, producing small parts for no reason.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::LocalStore::new(dir.path()));
+        let mut writer = EventWriter::new(store.clone(), "events");
+
+        // 03:59:59, then 04:00:00 — BTC-USD crosses, ETH-USD does not.
+        let before = 1_786_247_999;
+        let after = 1_786_248_000;
+        for (symbol, secs) in [("BTC-USD", before), ("ETH-USD", before), ("BTC-USD", after)] {
+            writer
+                .append(&MarketEvent {
+                    symbol: Symbol::new(symbol),
+                    ..event(EventKind::Heartbeat { counter: None }, at(secs))
+                })
+                .await
+                .unwrap();
+        }
+        writer.close().await.unwrap();
+
+        let keys = crate::store::ObjectStore::list(&*store, "events/")
+            .await
+            .unwrap();
+        let btc: Vec<&String> = keys
+            .iter()
+            .filter(|k| k.contains("symbol=BTC-USD"))
+            .collect();
+        let eth: Vec<&String> = keys
+            .iter()
+            .filter(|k| k.contains("symbol=ETH-USD"))
+            .collect();
+
+        assert_eq!(btc.len(), 2, "BTC-USD did not roll at the hour: {btc:?}");
+        assert!(
+            btc[0].contains("hour=03") && btc[1].contains("hour=04"),
+            "{btc:?}"
+        );
+        assert_eq!(
+            eth.len(),
+            1,
+            "another symbol's hour boundary rolled ETH-USD: {eth:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn part_numbers_count_up_within_a_partition() {
+        // Per-symbol counters. A shared counter would leave each partition's
+        // parts numbered wherever the other symbol's rolls happened to land —
+        // readable, but it makes "how many parts does this hour have?"
+        // unanswerable from the names.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::LocalStore::new(dir.path()));
+        let mut writer = EventWriter::new(store.clone(), "events").with_config(WriterConfig {
+            max_open: Duration::from_secs(1),
+            ..WriterConfig::default()
+        });
+
+        let origin = at(1_786_247_000);
+        for i in 0..6_u64 {
+            writer
+                .append(&MarketEvent {
+                    symbol: Symbol::new(if i % 2 == 0 { "BTC-USD" } else { "ETH-USD" }),
+                    ingest_ts: origin.advanced_by(Duration::from_secs(i * 2)),
+                    ..event(EventKind::Heartbeat { counter: Some(i) }, origin)
+                })
+                .await
+                .unwrap();
+        }
+        writer.close().await.unwrap();
+
+        let keys = crate::store::ObjectStore::list(&*store, "events/")
+            .await
+            .unwrap();
+        for symbol in ["BTC-USD", "ETH-USD"] {
+            let parts: Vec<String> = keys
+                .iter()
+                .filter(|k| k.contains(symbol))
+                .filter_map(|k| k.rsplit('/').next().map(str::to_owned))
+                .collect();
+            assert_eq!(
+                parts,
+                vec![
+                    "part-00000.parquet".to_owned(),
+                    "part-00001.parquet".to_owned(),
+                    "part-00002.parquet".to_owned(),
+                ],
+                "{symbol} part numbers are not contiguous"
+            );
+        }
+    }
+
+    #[test]
+    fn a_symbol_cannot_escape_the_prefix() {
+        // `Symbol::new` accepts any string and this one becomes a path on a
+        // LocalStore. Same check, and the same reasoning, as
+        // `DirRegistry::path_for`: the day it matters is not the day anyone
+        // will think to add it.
+        assert_eq!(partition_name("BTC-USD"), "BTC-USD");
+        assert_eq!(partition_name("../../etc/passwd"), ".._.._etc_passwd");
+        assert!(!partition_name("a/b").contains('/'));
+        // An empty or all-dots symbol must still be one identifiable
+        // partition, not a name that resolves to the prefix itself.
+        assert_eq!(partition_name(""), "unknown");
+        assert_eq!(partition_name(".."), "unknown");
     }
 
     #[tokio::test]

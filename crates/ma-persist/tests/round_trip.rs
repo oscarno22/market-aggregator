@@ -368,3 +368,128 @@ async fn the_checksum_survives_so_a_replayed_book_is_still_verified() {
         EventKind::Checksum { value: 994_251_236 }
     ));
 }
+
+#[tokio::test]
+async fn two_symbols_read_back_interleaved_rather_than_one_after_the_other() {
+    // The regression v4's partitioning introduced, and the reason the reader
+    // now merges instead of walking keys.
+    //
+    // Symbol partitions sort above date partitions, so a reader listing keys
+    // and reading straight through yields all of BTC-USD, then all of ETH-USD.
+    // Nothing errors — the archive simply replays as two recordings laid end
+    // to end. Worse, `replay_archive` paces on the gap between consecutive
+    // `elapsed` values, so the second symbol arrives in one burst with every
+    // gap clamped to zero: a partitioning change presenting as a pacing bug.
+    let origin = base(1_786_247_000_000_000_000);
+    let events: Vec<MarketEvent> = (0..20_u64)
+        .map(|i| {
+            event(
+                VenueId::Coinbase,
+                if i % 2 == 0 { "BTC-USD" } else { "ETH-USD" },
+                EventKind::Heartbeat { counter: Some(i) },
+                origin.advanced_by(Duration::from_millis(i * 50)),
+            )
+        })
+        .collect();
+
+    let read = round_trip(&events, WriterConfig::default()).await;
+    assert_eq!(read.len(), 20);
+
+    let symbols: Vec<String> = read.iter().map(|e| e.event.symbol.to_string()).collect();
+    let expected: Vec<String> = events.iter().map(|e| e.symbol.to_string()).collect();
+    assert_eq!(
+        symbols, expected,
+        "the archive replayed grouped by symbol instead of in the order it was \
+         written"
+    );
+
+    // And the counters, which is the same claim stated where it is impossible
+    // to satisfy by accident.
+    let counters: Vec<Option<u64>> = read
+        .iter()
+        .map(|e| match e.event.kind {
+            EventKind::Heartbeat { counter } => counter,
+            _ => panic!("not a heartbeat"),
+        })
+        .collect();
+    assert_eq!(counters, (0..20).map(Some).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn elapsed_offsets_stay_monotonic_across_partitions() {
+    // What the merge is actually protecting. `replay_archive` sleeps for
+    // `elapsed - previous` and clamps a negative gap to zero, so an
+    // out-of-order merge does not fail — it silently replays at the wrong
+    // speed, which looks exactly like a fast machine.
+    let origin = base(1_786_247_000_000_000_000);
+    let events: Vec<MarketEvent> = (0..12_u64)
+        .map(|i| {
+            event(
+                VenueId::Kraken,
+                ["BTC-USD", "ETH-USD", "SOL-USD"][(i % 3) as usize],
+                EventKind::Heartbeat { counter: Some(i) },
+                origin.advanced_by(Duration::from_millis(i * 100)),
+            )
+        })
+        .collect();
+
+    let read = round_trip(&events, WriterConfig::default()).await;
+    let offsets: Vec<Duration> = read.iter().map(|e| e.elapsed).collect();
+
+    assert_eq!(offsets.len(), 12);
+    assert!(
+        offsets.windows(2).all(|w| w[0] <= w[1]),
+        "elapsed went backwards across the merge: {offsets:?}"
+    );
+    assert_eq!(offsets[0], Duration::ZERO);
+    assert_eq!(offsets[11], Duration::from_millis(1100));
+}
+
+#[tokio::test]
+async fn an_archive_written_before_symbol_partitioning_still_reads() {
+    // Files already sitting in S3 use the v2 layout, with no `symbol=`
+    // component at all. Same argument as the raw-frame tape's optional
+    // `symbol` field: a format change that silently invalidated existing
+    // recordings would throw away the artefacts that are hardest to replace.
+    //
+    // Built by writing normally and then re-keying the object into the old
+    // shape, so the bytes under test are bytes this writer actually produces.
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalStore::new(dir.path()));
+
+    let mut writer = EventWriter::new(Arc::clone(&store), "staging");
+    for e in sample() {
+        writer.append(&e).await.unwrap();
+    }
+    writer.close().await.unwrap();
+
+    // Re-key every part under the v2 layout, preserving relative order.
+    let staged = store.list("staging/").await.unwrap();
+    assert!(!staged.is_empty());
+    for (i, key) in staged.iter().enumerate() {
+        let bytes = store.get(key).await.unwrap();
+        store
+            .put(
+                &format!("legacy/date=2026-08-09/hour=03/part-{i:05}.parquet"),
+                bytes,
+            )
+            .await
+            .unwrap();
+    }
+
+    let read = EventReader::open(Arc::clone(&store), "legacy")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        read.len(),
+        sample().len(),
+        "a v2-layout archive did not read back"
+    );
+    let symbols: std::collections::BTreeSet<String> =
+        read.iter().map(|e| e.event.symbol.to_string()).collect();
+    assert!(symbols.contains("BTC-USD") && symbols.contains("ETH-USD"));
+}
