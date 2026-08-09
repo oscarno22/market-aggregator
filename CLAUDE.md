@@ -226,12 +226,20 @@ Neither layer replaces the other.
       excluded **by name and reason** rather than silently, and the
       integrity floor taken over the legs actually used
 
-**v4 — next**
+**v4 — in progress**
+- [x] A tape recorded across a real reconnect. `record --reconnect-at` forces
+      one stream at a time to drop and resubscribe, through the *same*
+      `ResyncRequests` handle the aggregator uses for a real desync.
+      `tapes/2026-08-09-btc-usd-reconnect.jsonl.gz` carries three staggered
+      boundaries; `ma-server/tests/reconnect.rs` replays it offline. It proves
+      each venue's **resubscribe** behaviour and the book rebuilt from it — not
+      **detection**, since we closed the socket. See `docs/DESIGN.md` §4
 - A cross-node view: a gateway merging every node's snapshot. It inherits
   the whole of §12's problem across a network hop rather than a socket
 - Symbol-partitioned Parquet, once one symbol's hour is worth skipping whole
-- A tape recorded across a real reconnect — the last artefact that would
-  make the recovery path as well-evidenced as the parsers now are
+- An S3-backed cluster registry — unblocked by the IAM user that opened the
+  Parquet store's gate, and the payoff for `Registry` having no
+  compare-and-swap
 
 ## Status
 

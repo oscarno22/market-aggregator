@@ -66,6 +66,21 @@ archive dir venues="coinbase,kraken,bitstamp" symbols="BTC-USD":
 record venue symbol="BTC-USD" secs="120":
     cargo run -p ma-server --bin record -- --venue {{venue}} --symbol {{symbol}} --secs {{secs}}
 
+# Record a tape that contains reconnects, one venue at a time.
+#
+# Each offset drops the *next* stream and lets it resubscribe, through the same
+# resync request the aggregator makes for a real desync. Staggering them is the
+# point: the tape then also records the other two venues carrying on untouched,
+# which is the claim "one connection per (venue, symbol)" is making.
+#
+# Gzip the result before committing — see ma_pipeline::tape on why tapes are
+# stored compressed. This is how tapes/2026-08-09-btc-usd-reconnect.jsonl.gz
+# was made.
+record-reconnect symbol="BTC-USD" secs="105" at="30,55,80":
+    cargo run --release -p ma-server --bin record -- \
+        --venue coinbase,kraken,bitstamp --symbol {{symbol}} \
+        --secs {{secs}} --reconnect-at {{at}}
+
 # Run two nodes sharding the streams between them, against live venues.
 #
 # Six streams (three venues x two symbols) split across two processes, with

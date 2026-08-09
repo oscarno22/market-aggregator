@@ -346,6 +346,40 @@ connections.
 `next_delay()` returns a `Duration` rather than sleeping, which is what makes
 the schedule assertable in microseconds instead of minutes.
 
+### What a recorded reconnect proves, and what it does not
+
+Until v4 this whole section had two kinds of evidence behind it and neither was
+a recording. The scripted fake venue proves the *logic* against messages
+someone wrote by hand. The two live tapes prove the *parsers* against real
+bytes — but both are clean runs, with zero session boundaries between them. So
+the path this section is about was the one path never exercised by real bytes,
+which is exactly the position the parsers were in before the first tape existed,
+and that went badly (§8).
+
+`tapes/2026-08-09-btc-usd-reconnect.jsonl.gz` closes it: 105 seconds of three
+live venues, with `record --reconnect-at 30,55,80` forcing one venue each to
+drop and resubscribe. `crates/ma-server/tests/reconnect.rs` replays it offline.
+
+Being exact about the claim, because the flag makes it easy to overstate:
+
+| | |
+|---|---|
+| **Proven** | What each venue actually sends on resubscribe, in its own bytes — Coinbase's fresh `sequence_num` base, Kraken's new snapshot, Bitstamp's silence until the REST body lands — and that a book rebuilt from those bytes is right. Kraken's is right in the strong sense: its own CRC32 agrees with the rebuilt book, continuously, for the rest of the recording. |
+| **Proven** | Blast radius. Three staggered boundaries produce exactly three desyncs, one per stream. A resync keyed by venue instead of by stream, or a multiplexed connection, would take neighbours down with it and show up as a fourth. |
+| **Not proven** | *Detection.* The socket was closed by us, so nothing in the recording exercises the idle watchdog or a mid-stream socket error. Those stay proven against the fake venue, where a silent socket can be produced on demand and a live venue cannot be asked for one. |
+
+The reconnect is requested through the same `ResyncRequests` handle the
+aggregator uses when a book desyncs from bad data — not through a second
+disconnect path added for recording. A boundary the production code could not
+produce would be a fixture wearing a tape's clothes.
+
+The tape earns its place immediately, in the way this project's tapes keep
+doing: deleting the `book.reset()` in the aggregator's `SessionEnded` arm makes
+the replay fail with `sequence gap: expected 521, got 0` — bug 1 of §8,
+Coinbase's connection-scoped sequence counter, reproduced from real bytes for
+the first time. Before this tape, that fix was only ever exercised against a
+boundary the project synthesised for itself.
+
 ---
 
 ## 5. Auditing the venues that prove nothing
@@ -1045,13 +1079,10 @@ v1, v2 and v3 are complete. What v3 added:
 
 ### Not built yet, in the order the plan puts them
 
-- **S3, still.** The store and — now — a cluster registry both want it, and
-  both wait on the same gate: an IAM user scoped to one bucket prefix. See §10.
-- **A tape recorded across a real reconnect.** Both committed tapes are clean
-  runs with zero session boundaries. The reconnect path is proven against the
-  fake venue and the audit against live venues, but not from a recording of a
-  real outage — the artefact that would make those paths as well-evidenced as
-  the parsers now are.
+- **A cluster registry backed by S3.** No longer gated: the IAM user that
+  opened §10's gate for the Parquet store opens this one too, and `Registry`
+  was designed for it — `PutObject`, `ListObjects`, `DeleteObject`, and
+  deliberately no conditional write.
 - **Symbol-partitioned Parquet.** Today symbol is a column, not a partition,
   which is right at this volume and stops being right once one symbol's hour is
   large enough to be worth skipping whole.

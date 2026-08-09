@@ -224,6 +224,20 @@ impl Pipeline {
         Arc::clone(&self.clock)
     }
 
+    /// The resync channel the aggregator uses to ask an ingest task to start
+    /// over.
+    ///
+    /// Exposed so `record` can *induce* a reconnect against a live venue. The
+    /// aggregator is the only thing that requests one in production, and that
+    /// stays true: this hands out the same handle rather than a second
+    /// mechanism, so a recorded reconnect goes down the identical path — drop
+    /// the socket, resubscribe, resnapshot — that a real sequence gap takes.
+    /// A separate "test disconnect" would record a session boundary the
+    /// production code cannot produce.
+    pub fn resync(&self) -> ResyncRequests {
+        self.resync.clone()
+    }
+
     pub fn venues(&self) -> &[VenueId] {
         &self.venues
     }

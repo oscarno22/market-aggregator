@@ -25,11 +25,12 @@ a live run uses — with the network unplugged.
 just demo tapes/2026-08-09-btc-usd-live.jsonl.gz
 ```
 
-Two tapes, for different jobs:
+Three tapes, for different jobs:
 
 | Tape | Length | What it is good for |
 |---|---|---|
 | `2026-08-09-btc-usd-live.jsonl.gz` | 3 min, 5827 frames | The default. Its touch moves — 114 distinct top-of-book states, 1.8 bps of range — so rolling indicators and the cross-venue view show real numbers. |
+| `2026-08-09-btc-usd-reconnect.jsonl.gz` | 105 s, 2874 frames | Recovery. Three live venues, each forced to drop and resubscribe in turn (30 s, 55 s, 80 s), so the tape carries what each venue *actually sends* on a new subscription. Kraken's CRC32 agrees with the book rebuilt from it. |
 | `2026-08-09-btc-usd.jsonl.gz` | 60 s, 1503 frames | The original, kept because it is the recording that found the three parser bugs below. Its Coinbase touch never moves once across 49,940 level updates, so it exercises parsing and books but not anything derived over time. |
 
 Then open <http://127.0.0.1:8080>. To connect to the live venues instead:
@@ -257,10 +258,13 @@ Deliberately unfinished, and stated rather than hidden:
   its own prefix and refuses to start if that succeeds. What is still untested
   is the far tail: listing pagination, and file sizes this project does not yet
   produce.
-- **No tape has been recorded across a real reconnect.** Both committed tapes
-  are clean runs; every recorded session boundary count is zero. The reconnect
-  path is proven against the scripted fake venue and, for the audit, against
-  live venues — but not yet from a recording of a real outage.
+- ~~No tape has been recorded across a real reconnect.~~ **Done.**
+  `2026-08-09-btc-usd-reconnect.jsonl.gz` records three live venues dropping and
+  resubscribing in turn, and `crates/ma-server/tests/reconnect.rs` replays it
+  offline. What it proves is each venue's *resubscribe* behaviour in its own
+  bytes, and that a book rebuilt from them is right — Kraken's verifiably so.
+  What it does not prove is *detection*: the socket was closed by us, so the
+  idle watchdog and mid-stream socket errors stay proven against the fake venue.
 
 - **A cluster registry backed by S3 is not implemented.** The trait needs only
   `PutObject`, `ListObjects` and `DeleteObject` — deliberately no conditional
@@ -271,8 +275,8 @@ Deliberately unfinished, and stated rather than hidden:
   hop instead of a socket, which makes it a separate piece of work rather than
   a flag.
 
-Next: v4 — a cross-node view, symbol-partitioned Parquet, and a tape recorded
-across a real reconnect.
+Next: v4 — a cross-node view, symbol-partitioned Parquet, and an S3-backed
+cluster registry.
 
 ## Non-goals
 
