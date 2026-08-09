@@ -1,6 +1,9 @@
 [package]
 name = "ma-server"
 version = "0.1.0"
+# Three binaries live here (serve, record, replay); `cargo run -p ma-server`
+# should mean the server.
+default-run = "ma-server"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
