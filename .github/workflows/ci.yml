@@ -1,0 +1,71 @@
+# The three offline gates, exactly as they run locally. Every job invokes the
+# justfile rather than restating the commands, so CI cannot drift from what a
+# developer runs before committing — if the gate changes, it changes once.
+#
+# Everything here passes in airplane mode by design (Tier 1 in the justfile's
+# terms). The live-venue and AWS tiers are deliberately absent: CI proving a
+# claim about a live venue would be CI that flakes with the venue.
+#
+# The toolchain is pinned to the workspace's `rust-version`, so a green run is
+# also a proof that the stated MSRV still compiles.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Lint and format, with and without the AWS SDK compiled in. One job for
+  # both because they share nearly every compiled artifact; splitting them
+  # would recompile arrow/parquet twice for a minute of wall-clock time.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          components: clippy, rustfmt
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: Swatinem/rust-cache@v2
+      - run: just check
+      - run: just check-s3
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: Swatinem/rust-cache@v2
+      - run: just test
+
+  # Advisory only. A new RUSTSEC advisory against a dependency is worth
+  # knowing about, but it must not turn a tree that was green yesterday red
+  # today with no code change — that trains people to ignore CI.
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit

@@ -1,5 +1,7 @@
 # market-aggregator
 
+[![ci](https://github.com/oscarno22/market-aggregator/actions/workflows/ci.yml/badge.svg)](https://github.com/oscarno22/market-aggregator/actions/workflows/ci.yml)
+
 Multi-venue crypto market data ingest, normalisation and fan-out, in Rust and
 tokio. Three venues, any number of symbols, one process.
 
@@ -248,15 +250,19 @@ runbook that says what to do when each metric moves.
 
 ## Status
 
-v1, v2 and v3 are complete: three venues, multi-symbol, full L2 depth,
+v1 through v4 are complete: three venues, multi-symbol, full L2 depth,
 reconnect with gap-fill, the periodic integrity audit, SSE and a page, metrics,
 a Parquet archive the process can replay itself from, rolling indicators that
-state their own coverage, a cross-venue consolidated touch, and streams sharded
-across nodes by a lease coordinator.
+state their own coverage, a cross-venue consolidated touch, streams sharded
+across nodes by a lease coordinator, and a gateway that merges every node
+back into one view.
 
 **337 tests (339 with `--features s3`), clippy-clean at `-D warnings`, and the whole suite runs offline** —
 including the multi-node cluster simulation, which steps several coordinators
-through one registry and asserts that no two ever hold the same stream.
+through one registry and asserts that no two ever hold the same stream. CI
+runs exactly those gates — `just check`, `just check-s3`, `just test`, the
+same justfile a developer runs — on every push, pinned to the workspace's
+stated minimum toolchain, so a green badge is also an MSRV proof.
 
 Deliberately unfinished, and stated rather than hidden:
 
