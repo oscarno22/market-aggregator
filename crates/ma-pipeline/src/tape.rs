@@ -246,10 +246,40 @@ pub struct TapeReader<R> {
     lines: Lines<BufReader<R>>,
 }
 
-impl TapeReader<tokio::fs::File> {
+/// A tape on disk, plain or gzipped.
+///
+/// Boxed rather than generic because the decision is made from a filename at
+/// runtime, and every caller wants "open this path" rather than "open this
+/// path, whose compression I already know".
+pub type FileTape = TapeReader<Box<dyn AsyncRead + Unpin + Send>>;
+
+impl TapeReader<Box<dyn AsyncRead + Unpin + Send>> {
+    /// Open a tape, transparently decompressing a `.gz`.
+    ///
+    /// Committed tapes are gzipped because they are dominated by one enormous
+    /// message: Coinbase's opening `level2` snapshot carries the entire book,
+    /// tens of thousands of levels, and it compresses by roughly 10x. The
+    /// alternative — committing only a trimmed or synthetic tape — would give
+    /// up the one property that makes a recording worth keeping, which is that
+    /// it is exactly what the venue sent.
+    ///
+    /// # Errors
+    /// If the file cannot be opened.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, TapeError> {
+        let path = path.as_ref();
+        let gzipped = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gz"));
         let file = tokio::fs::File::open(path).await?;
-        Ok(Self::new(file))
+
+        let reader: Box<dyn AsyncRead + Unpin + Send> = if gzipped {
+            Box::new(async_compression::tokio::bufread::GzipDecoder::new(
+                BufReader::new(file),
+            ))
+        } else {
+            Box::new(file)
+        };
+        Ok(Self::new(reader))
     }
 }
 

@@ -129,6 +129,15 @@ const CLAIM_SHORT = { verified: "verified", gap_detectable: "gap-detectable", or
 
 const COLOUR = { coinbase: "--cb", kraken: "--kr", bitstamp: "--bs" };
 const HISTORY = 240; // ~1 minute at 4Hz
+
+// A book nobody has updated in this long is not being plotted as a price, even
+// if it is still formally `live`. Nothing has invalidated it — that is why the
+// server does not desync on age, and why a quiet market must not read as a
+// fault — but a flat line drawn out of one stale reading claims a continuity
+// the data does not have. Live, the idle watchdog would have caught a dead
+// feed by now; at the end of a replayed tape there is no watchdog, and the
+// chart would otherwise extend forever off a single frozen quote.
+const STALE_MS = 5000;
 const series = new Map();  // venue -> [{ t, mid } | { t, gap: true }]
 let lagged = 0;
 
@@ -163,18 +172,25 @@ function render(snap) {
     // A desynced book contributes a gap, not a flat line. Carrying the last
     // known price forward would draw a confident chart out of data we have
     // explicitly said we do not trust.
-    s.push(v.status === "live" && v.mid !== null ? { t: now, mid: parseFloat(v.mid) } : { t: now, gap: true });
+    const fresh = v.status === "live" && v.mid !== null && (v.age_ms ?? 0) < STALE_MS;
+    s.push(fresh ? { t: now, mid: parseFloat(v.mid) } : { t: now, gap: true });
     if (s.length > HISTORY) s.shift();
   }
   draw();
 }
 
 function card(v) {
-  const stale = v.status !== "live";
+  const aged = (v.age_ms ?? 0) >= STALE_MS;
+  const stale = v.status !== "live" || aged;
   const claim = v.integrity
     ? `<div class="claim">Trust: ${CLAIM[v.integrity]}</div>`
     : "";
-  const reason = v.desync_reason ? `<div class="reason">${escapeHtml(v.desync_reason)}</div>` : "";
+  const reason = v.desync_reason
+    ? `<div class="reason">${escapeHtml(v.desync_reason)}</div>`
+    : aged
+      ? `<div class="reason">No update for ${ms(v.age_ms)} — nothing has invalidated this book,
+         but it is old enough that it should not be read as the current market.</div>`
+      : "";
   const c = v.counters;
   const problem = (n) => n > 0 ? ' class="bad"' : "";
 
@@ -188,7 +204,7 @@ function card(v) {
       <div><span class="label">Spread</span><span class="value num">${v.spread ?? "—"}</span></div>
     </div>
     <table>
-      <tr><td>Book age</td><td class="num">${ms(v.age_ms)}</td></tr>
+      <tr><td>Book age</td><td${aged ? ' class="bad"' : ""}><span class="num">${ms(v.age_ms)}</span></td></tr>
       <tr><td>${v.status} for</td><td class="num">${ms(v.status_for_ms)}</td></tr>
       <tr><td>Time untrusted (total)</td><td class="num"${v.desynced_total_ms > 0 ? ' class="bad"' : ""}>${ms(v.desynced_total_ms)}</td></tr>
       ${v.last_verified_ms !== null && v.last_verified_ms !== undefined
