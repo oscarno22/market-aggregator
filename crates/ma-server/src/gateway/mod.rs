@@ -79,7 +79,9 @@ use std::time::Duration;
 use ma_core::{
     BookState, CrossPolicy, DesyncReason, IngestTime, Integrity, Symbol, TopOfBook, VenueId,
 };
-use ma_pipeline::aggregator::{BookStatus, Snapshot, SymbolView, TradeView, VenueView, cross_view};
+use ma_pipeline::aggregator::{
+    BookStatus, Snapshot, SymbolView, TradeView, VenueView, consolidated_windows, cross_view,
+};
 use ma_pipeline::channel::ChannelMetrics;
 use serde::Serialize;
 
@@ -92,6 +94,11 @@ use serde::Serialize;
 /// any surfaced cross-venue comparison must say which clock it is on — applied
 /// to a comparison that now spans machines.
 pub const GATEWAY_CLOCK: &str = "node_monotonic+gateway_monotonic";
+
+/// One node's claim on a stream: the node, its delivery lag in ms (kept
+/// beside the view because the consolidated windows need it after a winner
+/// is picked), and the view with its ages already adjusted by that same lag.
+type Claim = (String, u64, VenueView);
 
 /// What the gateway is willing to merge.
 #[derive(Clone, Copy, Debug)]
@@ -248,7 +255,7 @@ pub fn merge(
     // Symbol -> venue -> the nodes reporting it, freshest first. A `Vec` per
     // venue rather than one entry, because more than one entry is the
     // violation this gateway exists to be able to see.
-    let mut books: BTreeMap<Symbol, BTreeMap<VenueId, Vec<(String, VenueView)>>> = BTreeMap::new();
+    let mut books: BTreeMap<Symbol, BTreeMap<VenueId, Vec<Claim>>> = BTreeMap::new();
     let mut channel = ChannelMetrics {
         len: 0,
         capacity: 0,
@@ -307,7 +314,7 @@ pub fn merge(
                     .or_default()
                     .entry(view.venue)
                     .or_default()
-                    .push((report.node.clone(), aged(view, lag)));
+                    .push((report.node.clone(), millis(lag), aged(view, lag)));
             }
         }
     }
@@ -317,6 +324,7 @@ pub fn merge(
 
     for (symbol, by_venue) in books {
         let mut views = Vec::with_capacity(by_venue.len());
+        let mut lags = Vec::with_capacity(by_venue.len());
         let mut tops = Vec::with_capacity(by_venue.len());
 
         for (venue, mut claims) in by_venue {
@@ -324,7 +332,7 @@ pub fn merge(
                 duplicated.push(DuplicatedStream {
                     symbol: symbol.to_string(),
                     venue,
-                    nodes: claims.iter().map(|(node, _)| node.clone()).collect(),
+                    nodes: claims.iter().map(|(node, _, _)| node.clone()).collect(),
                 });
                 // Freshest wins, then node name so the choice is stable rather
                 // than flapping between two nodes tick by tick. Picking *a*
@@ -332,15 +340,16 @@ pub fn merge(
                 // violation is published above, and nothing here can fix a
                 // stream that two processes are running.
                 claims.sort_by(|a, b| {
-                    effective_age(&a.1)
-                        .cmp(&effective_age(&b.1))
+                    effective_age(&a.2)
+                        .cmp(&effective_age(&b.2))
                         .then_with(|| a.0.cmp(&b.0))
                 });
             }
-            let Some((_, view)) = claims.into_iter().next() else {
+            let Some((_, lag_ms, view)) = claims.into_iter().next() else {
                 continue;
             };
             tops.push((venue, top_of_book(&view, now)));
+            lags.push(lag_ms);
             views.push(view);
         }
 
@@ -354,6 +363,12 @@ pub fn merge(
             symbol: symbol.to_string(),
             weakest_integrity,
             cross: cross_view(tops, policy.cross, Cow::Borrowed(GATEWAY_CLOCK)),
+            // Recomputed rather than passed through, and with the real lags:
+            // no node can compute a consolidated window over venues it does
+            // not own, which is the whole reason this field exists. Same
+            // core function a node uses with lag zero, so the shape cannot
+            // drift between the two vantage points.
+            cross_windows: consolidated_windows(views.iter().zip(lags.iter().copied())),
             venues: views,
         });
     }
@@ -392,11 +407,14 @@ pub fn merge(
 /// total, not an age, and adding lag to it would inflate a counter rather than
 /// correct a measurement.
 ///
-/// The rolling windows are also left alone, and that is a stated limitation
-/// rather than an oversight. A 60s window from a node three seconds stale
-/// describes a real 60 seconds — it simply ended three seconds ago. Shifting
-/// `span_ms` would be inventing coverage; the honest signal is the node's
-/// `lag_ms`, published beside it.
+/// The per-venue rolling windows are also left alone, deliberately. A 60s
+/// window from a node three seconds stale describes a real 60 seconds — it
+/// simply ended three seconds ago. Shifting `span_ms` would be inventing
+/// coverage; the honest signal is the node's `lag_ms`, published beside it.
+/// The *consolidated* windows are different: `merge` recomputes those from
+/// the merged views with each leg's real lag, via the same
+/// `ma_core::consolidate_windows` a node calls with lag zero — see
+/// `SymbolView::cross_windows`.
 fn aged(view: &VenueView, lag: Duration) -> VenueView {
     let lag_ms = millis(lag);
     VenueView {
@@ -513,6 +531,7 @@ mod tests {
                 symbol: symbol.to_owned(),
                 weakest_integrity: None,
                 cross: empty_cross(),
+                cross_windows: Vec::new(),
                 venues: views,
             }],
             channel: ChannelMetrics {
@@ -605,6 +624,104 @@ mod tests {
         assert_eq!(symbol.cross.integrity_floor, Some(Integrity::GapDetectable));
         assert_eq!(symbol.weakest_integrity, Some(Integrity::GapDetectable));
         assert!(merged.duplicated.is_empty());
+    }
+
+    fn window_reading(
+        span_ms: u64,
+        trusted_ms: u64,
+        integrity: Integrity,
+        samples: u64,
+        high: &str,
+        low: &str,
+        mean: &str,
+    ) -> ma_core::WindowReading {
+        use std::str::FromStr;
+        let dec = |s: &str| rust_decimal::Decimal::from_str(s).unwrap();
+        ma_core::WindowReading {
+            span_ms,
+            trusted_ms,
+            samples,
+            integrity_floor: Some(integrity),
+            first: Some(dec(mean)),
+            last: Some(dec(mean)),
+            high: Some(dec(high)),
+            low: Some(dec(low)),
+            mean: Some(dec(mean)),
+            change_bps: None,
+            range_bps: None,
+            mean_spread_bps: None,
+            trades: 0,
+            volume: None,
+            vwap: None,
+        }
+    }
+
+    #[test]
+    fn consolidated_windows_are_recomputed_with_each_nodes_real_lag() {
+        // The claim that closes §15's "rolling windows do not cross nodes":
+        // the gateway computes a per-symbol consolidated window over venues
+        // owned by different machines, with coverage merged as a floor and
+        // the slowest hop published beside it — never subtracted from it.
+        let clock = TestClock::new();
+
+        let mut kraken = view(VenueId::Kraken, "100", "101", 10, Integrity::Verified);
+        kraken.windows = vec![window_reading(
+            60_000,
+            60_000,
+            Integrity::Verified,
+            100,
+            "110",
+            "90",
+            "100",
+        )];
+        let mut coinbase = view(VenueId::Coinbase, "99", "102", 10, Integrity::GapDetectable);
+        coinbase.windows = vec![window_reading(
+            60_000,
+            45_000,
+            Integrity::GapDetectable,
+            300,
+            "120",
+            "95",
+            "104",
+        )];
+
+        // Node b reported, then went quiet for 600ms; node a reported 200ms
+        // ago. Both inside max_node_age, so both merge — with different lags.
+        let b_arrived = clock.now();
+        clock.advance(Duration::from_millis(400));
+        let a_arrived = clock.now();
+        clock.advance(Duration::from_millis(200));
+
+        let reports = [
+            report("a", snapshot("BTC-USD", vec![kraken]), a_arrived),
+            report("b", snapshot("BTC-USD", vec![coinbase]), b_arrived),
+        ];
+        let merged = merge(&reports, clock.now(), 1, GatewayPolicy::default());
+
+        let cw = &merged.snapshot.symbols[0].cross_windows;
+        assert_eq!(cw.len(), 1, "one configured span, one consolidated window");
+        let w = &cw[0];
+
+        assert_eq!(w.venues_used, 2);
+        assert_eq!(w.high.map(|d| d.to_string()), Some("120".to_owned()));
+        assert_eq!(w.low.map(|d| d.to_string()), Some("90".to_owned()));
+        assert_eq!(
+            w.trusted_ms_floor, 45_000,
+            "coverage merges as the least-watched contributor's"
+        );
+        assert_eq!(
+            w.integrity_floor,
+            Some(Integrity::GapDetectable),
+            "the weaker leg bounds the merged claim"
+        );
+        assert_eq!(
+            w.max_lag_ms, 600,
+            "the stalest node's hop must ride beside the floor"
+        );
+        assert_eq!(
+            w.trusted_ms_floor, 45_000,
+            "and must not have been subtracted from coverage"
+        );
     }
 
     #[test]

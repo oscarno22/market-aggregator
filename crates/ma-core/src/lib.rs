@@ -27,6 +27,7 @@
 pub mod audit;
 pub mod book;
 pub mod cross;
+pub mod cross_windows;
 pub mod event;
 pub mod price;
 pub mod stream;
@@ -36,6 +37,9 @@ pub mod window;
 pub use audit::{AuditFinding, AuditOutcome, AuditPolicy, AuditTrail, audit};
 pub use book::{Book, BookError, BookState, BookStateKind, DesyncReason, Integrity, TopOfBook};
 pub use cross::{CrossLeg, CrossPolicy, CrossVenue, Exclusion, ExclusionReason, consolidate};
+pub use cross_windows::{
+    CrossWindowReading, WindowExclusion, WindowExclusionReason, WindowLeg, consolidate_windows,
+};
 pub use event::{EventKind, Level, MarketEvent, Side, SkewObservation, Symbol, VenueId};
 pub use price::{ParseError, Price, Qty};
 pub use stream::StreamId;

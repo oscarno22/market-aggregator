@@ -207,6 +207,18 @@ pub struct SymbolView {
     /// from. See [`ma_core::cross`] for why this is the most misreadable
     /// number the process publishes and what stops it being noise.
     pub cross: CrossView,
+    /// Consolidated windows over every venue tracking this symbol — "the 60s
+    /// high across venues", with coverage merged as a floor and delivery lag
+    /// published beside it. Computed by [`ma_core::consolidate_windows`] here
+    /// with every lag zero, and *recomputed* by the gateway with real
+    /// per-node lags — the same function producing the same shape, so the
+    /// page renders it without knowing whether it is looking at a cluster.
+    ///
+    /// `#[serde(default)]` because the gateway deserialises older nodes'
+    /// snapshots. Serialisation is safe directly: every `Decimal` in it
+    /// leaves as a JSON string, same as [`WindowReading`]'s.
+    #[serde(default)]
+    pub cross_windows: Vec<ma_core::CrossWindowReading>,
     pub venues: Vec<VenueView>,
 }
 
@@ -841,6 +853,7 @@ impl Aggregator {
                         self.cross_policy,
                         Cow::Borrowed(INGEST_MONOTONIC),
                     ),
+                    cross_windows: consolidated_windows(venues.iter().map(|v| (v, 0))),
                     symbol: symbol.to_string(),
                     venues,
                 })
@@ -848,6 +861,28 @@ impl Aggregator {
             channel,
         }
     }
+}
+
+/// Consolidate one symbol's windows across its venue views.
+///
+/// Public for the same reason [`cross_view`] is: the gateway recomputes this
+/// over merged views with real per-node lags, and a second leg-building loop
+/// written beside this one would eventually disagree with it. `(view, lag)`
+/// pairs rather than views, because the lag is the one thing the two callers
+/// genuinely know differently — a node passes zeros, the gateway its hops.
+pub fn consolidated_windows<'a>(
+    views: impl Iterator<Item = (&'a VenueView, u64)>,
+) -> Vec<ma_core::CrossWindowReading> {
+    let pairs: Vec<(&VenueView, u64)> = views.collect();
+    let legs: Vec<ma_core::WindowLeg<'_>> = pairs
+        .iter()
+        .map(|(view, lag_ms)| ma_core::WindowLeg {
+            venue: view.venue,
+            lag_ms: *lag_ms,
+            windows: &view.windows,
+        })
+        .collect();
+    ma_core::consolidate_windows(&legs)
 }
 
 /// Consolidate one symbol's books and render the result for the wire.
@@ -1730,5 +1765,19 @@ mod tests {
             Some("100.50".to_owned()),
             "one print's vwap is that print's price"
         );
+
+        // And the consolidated reading exists on a single node too — same
+        // function the gateway calls with real lags, called here with zero,
+        // so the page renders one shape from both vantage points.
+        let snap = agg.snapshot(empty_channel());
+        let group = only_symbol(&snap);
+        let cw = group
+            .cross_windows
+            .iter()
+            .min_by_key(|w| w.span_ms)
+            .expect("consolidated windows on a node");
+        assert_eq!(cw.max_lag_ms, 0, "a node's own legs have no delivery lag");
+        assert_eq!(cw.trades, 1);
+        assert_eq!(cw.venues_used, 1);
     }
 }

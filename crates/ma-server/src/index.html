@@ -91,6 +91,11 @@
   table.windows tr.partial td.cover { color: var(--desync); font-weight: 600; }
   table.windows td.cover { color: var(--muted); }
   .windows-note { font-size: 0.7rem; color: var(--desync); margin: 0.1rem 0 0.6rem; }
+  /* Consolidated windows, one small table per symbol above the venue cards. */
+  .cross-windows { border: 1px solid var(--line); border-radius: 6px;
+    background: var(--card); padding: 0.5rem 0.8rem; margin: 0 0 0.8rem; }
+  .cross-windows .sub { font-size: 0.72rem; }
+
   /* The cluster panel — gateway only; an empty div on a plain node. The
      duplicate banner is the loudest thing the page can show, deliberately. */
   .dup-banner { background: color-mix(in srgb, var(--desync) 12%, var(--bg));
@@ -308,8 +313,66 @@ function group(g) {
   <section class="symbol">
     <h2 class="symbol-name">${escapeHtml(g.symbol)}</h2>
     <div class="banner">${banner}${crossBanner(g)}</div>
+    ${crossWindows(g)}
     <div class="grid">${g.venues.map(card).join("")}</div>
   </section>`;
+}
+
+// Consolidated windows across venues. There is deliberately no Δ column:
+// ordering samples from different venues — possibly different machines —
+// against each other is the wall-clock comparison this project refuses, so
+// the type itself carries no first/last/change. The floor column is the
+// governing one, same as `covered` on the per-venue rows: the merged numbers
+// describe all contributing venues for only that much of the span.
+const CROSS_WINDOW_EXCLUSION = {
+  span_not_published: "publishes no window of this span",
+  no_data: "no samples or prints in this window",
+};
+
+function crossWindows(g) {
+  const rows = (g.cross_windows ?? []).filter((w) => w.venues_used > 0);
+  if (!rows.length) return "";
+
+  const bps = (x) => (x === null || x === undefined) ? "—" : Number(x).toFixed(1);
+  const excluded = new Map();
+  const body = rows.map((w) => {
+    for (const e of (w.excluded ?? [])) {
+      excluded.set(e.venue, CROSS_WINDOW_EXCLUSION[e.reason] ?? e.reason);
+    }
+    const pct = w.span_ms > 0 ? Math.round((100 * w.trusted_ms_floor) / w.span_ms) : 0;
+    return `
+      <tr class="${pct < 100 ? "partial" : ""}">
+        <td>${span(w.span_ms)}</td>
+        <td class="num">${w.high ?? "—"}</td>
+        <td class="num">${w.low ?? "—"}</td>
+        <td class="num">${bps(w.range_bps)}</td>
+        <td class="num">${w.trades ?? 0}</td>
+        <td class="num">${w.volume ?? "—"}</td>
+        <td class="num">${w.venues_used}</td>
+        <td class="num cover">${pct < 100 ? pct + "%" : "full"}</td>
+        <td class="num">${w.max_lag_ms > 0 ? ms(w.max_lag_ms) : "—"}</td>
+      </tr>`;
+  }).join("");
+
+  const notes = excluded.size
+    ? `<div class="windows-note">Excluded: ${[...excluded]
+        .map(([v, r]) => `${escapeHtml(v)} (${escapeHtml(r)})`).join(", ")}.</div>`
+    : "";
+
+  return `
+    <div class="cross-windows">
+      <div class="sub"><strong>Consolidated windows</strong> — across every venue above.
+        The floor is the least-watched contributor's coverage; lag is the stalest delivery
+        and is shown beside the floor, never subtracted from it. No Δ column by design:
+        ordering samples across machines is a comparison this system refuses to make.</div>
+      <table class="windows">
+        <thead><tr>
+          <th>window</th><th>high</th><th>low</th><th>range bps</th><th>trades</th>
+          <th>volume</th><th>venues</th><th>floor</th><th>max lag</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>${notes}
+    </div>`;
 }
 
 // The consolidated touch: highest bid and lowest ask across venues.

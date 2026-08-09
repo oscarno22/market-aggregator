@@ -534,6 +534,26 @@ async fn metrics(State(handle): State<PipelineHandle>) -> impl IntoResponse {
                 }
             }
         }
+
+        // Consolidated windows: per symbol, no venue label — like the
+        // ma_cross_* touch gauges, that absence is the point. The floor is
+        // emitted first for the same reason ma_window_trusted_ms is: it is
+        // the denominator for everything beside it.
+        for (name, help, pick) in CROSS_WINDOW_GAUGES {
+            out.push_str(&format!(
+                "# HELP ma_{name} {help}\n# TYPE ma_{name} gauge\n"
+            ));
+            for symbol in &snapshot.symbols {
+                for w in &symbol.cross_windows {
+                    let Some(value) = pick(w) else { continue };
+                    out.push_str(&format!(
+                        "ma_{name}{{symbol=\"{}\",window=\"{}\"}} {value}\n",
+                        symbol.symbol,
+                        window_label(w.span_ms),
+                    ));
+                }
+            }
+        }
     }
 
     (
@@ -614,6 +634,57 @@ const WINDOW_GAUGES: [WindowGauge; 9] = [
         "High minus low over the window's mean mid, in basis points. The volatility proxy \
          this build publishes; see ma_core::window for why it is not realised volatility.",
         |w| w.range_bps.map(|d| d.to_string()),
+    ),
+];
+
+/// The consolidated-window series. Same table shape as [`WINDOW_GAUGES`] and
+/// the same absent-when-`None` rule, over [`ma_core::CrossWindowReading`].
+type CrossWindowGauge = (
+    &'static str,
+    &'static str,
+    fn(&ma_core::CrossWindowReading) -> Option<String>,
+);
+
+const CROSS_WINDOW_GAUGES: [CrossWindowGauge; 7] = [
+    (
+        "cross_window_trusted_ms_floor",
+        "The least-watched contributing venue's coverage of this window. Read first: \
+         every other cross-window series describes all venues for only this much of the span.",
+        |w| Some(w.trusted_ms_floor.to_string()),
+    ),
+    (
+        "cross_window_max_lag_ms",
+        "The stalest contributing delivery: zero on a node, the slowest node's hop on a \
+         gateway. Published beside the floor, never subtracted from it.",
+        |w| Some(w.max_lag_ms.to_string()),
+    ),
+    (
+        "cross_window_venues_used",
+        "Venues contributing to this consolidated window. The exclusions are named in \
+         the JSON snapshot, with reasons.",
+        |w| Some(w.venues_used.to_string()),
+    ),
+    (
+        "cross_window_high",
+        "Highest mid across contributing venues in the window.",
+        |w| w.high.map(|d| d.to_string()),
+    ),
+    (
+        "cross_window_low",
+        "Lowest mid across contributing venues in the window.",
+        |w| w.low.map(|d| d.to_string()),
+    ),
+    (
+        "cross_window_range_bps",
+        "Cross-venue high minus low over the merged mean, in basis points. There is \
+         deliberately no cross-window change_bps: ordering samples across machines is \
+         the wall-clock comparison this project refuses.",
+        |w| w.range_bps.map(|d| d.to_string()),
+    ),
+    (
+        "cross_window_volume",
+        "Total quantity printed across venues in the window. Absent when no venue printed.",
+        |w| w.volume.map(|d| d.to_string()),
     ),
 ];
 

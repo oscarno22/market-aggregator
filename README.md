@@ -59,6 +59,14 @@ and merge state, and a red banner naming any doubly-owned stream — and it is
 the *same* page a node serves: the panel renders exactly when the payload
 carries a `nodes` field, so the data decides, not a build flag.
 
+It also computes the one reading no single process can: **consolidated
+windows** — "the 60s high across all venues" when no node owns all venues.
+Only order-free statistics merge (max, min, sums, weighted means); `first`/
+`last`/`change` are absent from the type because ordering samples across
+machines is a wall-clock comparison this system refuses to make. Coverage
+merges as a floor — the least-watched contributor bounds the claim — and the
+slowest node's lag is published beside it, never subtracted from it.
+
 Endpoints: `/` the page, `/events` SSE, `/metrics` Prometheus text,
 `/api/snapshot` one JSON reading, `/health`.
 

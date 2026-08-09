@@ -617,7 +617,7 @@ const MID_SCALE: u32 = 8;
 /// a `Decimal` division from publishing twenty-eight digits of noise.
 const BPS_SCALE: u32 = 4;
 
-fn bps(numerator: Decimal, denominator: Decimal) -> Decimal {
+pub(crate) fn bps(numerator: Decimal, denominator: Decimal) -> Decimal {
     (numerator * Decimal::from(10_000_u32) / denominator).round_dp(BPS_SCALE)
 }
 

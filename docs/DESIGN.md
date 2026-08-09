@@ -1303,6 +1303,42 @@ a copy here would double-count in any query that sums across targets, silently,
 because both copies are correct and neither says it is a copy. The gateway
 publishes only what it is the sole source of.
 
+### Merging coverage without inventing it
+
+v4 stopped at "rolling windows do not cross nodes", and the sentence that
+followed — merging `trusted_ms` from two machines is two clocks' worth of
+trust — turned out to be the design once taken seriously rather than the
+blocker. v5's `ma_core::consolidate_windows` closes it, and the shape of the
+solution is three refusals:
+
+1. **Merge only order-free statistics.** `high` is a max, `low` a min,
+   `samples`/`trades`/`volume` are sums, `mean` is sample-weighted and `vwap`
+   volume-weighted — every one exactly as true merged as it was per venue.
+   `first`, `last` and `change_bps` are **absent from the consolidated type**,
+   not `None`: "first across venues" means ordering samples from two machines
+   against each other, and there is no third clock on which both nodes'
+   samples are ordered. That is §7's forbidden comparison, so the refusal
+   lives in the type where it cannot be reintroduced field by field.
+2. **Coverage merges as a floor.** "All venues watched for the last minute"
+   holds only as long as the least-watched contributor, so
+   `trusted_ms_floor` is a `min` — the `integrity_floor` argument one
+   dimension over. Venues with nothing in the span are excluded **by name
+   and reason** (`no data`, or `publishes no window of this span` — the
+   misconfigured `--windows` case nothing inside one process can otherwise
+   detect) rather than dragging the floor to zero for a window two other
+   venues covered completely.
+3. **Lag rides beside coverage, never inside it.** A 60s window from a node
+   600ms stale describes a real 60 seconds that ended 600ms ago; subtracting
+   the hop from the floor would conflate "how much was watched" with "how
+   long ago". `max_lag_ms` is the stalest contributing delivery, published
+   next to the floor — zero on a node, the slowest hop on a gateway.
+
+The per-venue windows still pass through the gateway untouched, exactly as
+before: each is whole on the node that owns its stream. What is new is the
+reading no single process could produce — and it is computed by the same
+pure function on both vantage points, with lag zero on a node, so the page
+renders one shape and still cannot tell it is looking at a cluster.
+
 ---
 
 ## 15. Where this stops
