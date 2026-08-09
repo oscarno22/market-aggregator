@@ -48,6 +48,32 @@ struct Args {
     #[arg(long, default_value = "1s,10s,1m")]
     windows: String,
 
+    /// This node's name in the cluster. Enables sharding when set with
+    /// `--cluster-dir`.
+    ///
+    /// Must be stable across restarts of this process and unique in the
+    /// cluster: a node that renames itself on every restart looks like one
+    /// node dying and another joining, which rebalances the whole cluster on
+    /// every deploy. See `ma_coord::NodeId`.
+    #[arg(long, requires = "cluster_dir")]
+    node_id: Option<String>,
+
+    /// Directory holding the cluster's lease records — one file per node.
+    ///
+    /// Every node must be started with the *same* `--symbols` and `--venues`:
+    /// the assignment is a pure function of the stream set, so a node
+    /// configured with a different one computes a different answer and the
+    /// at-most-one-owner guarantee no longer holds. Nothing can check that
+    /// from inside a single process.
+    #[arg(long, requires = "node_id")]
+    cluster_dir: Option<String>,
+
+    /// Lease lifetime in milliseconds. A dead node's streams move this long
+    /// after its last renewal; a joining node waits this plus the guard before
+    /// taking any.
+    #[arg(long, default_value_t = 15_000)]
+    cluster_ttl_ms: u64,
+
     /// Archive normalised events to Parquet, rolled hourly.
     ///
     /// A path writes locally; `s3://bucket/prefix` needs `--features s3` and,
@@ -93,6 +119,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    // Before the aggregator, which reads the ownership channel this creates.
+    let coordinator = match (&args.node_id, &args.cluster_dir) {
+        (Some(node), Some(dir)) => {
+            let registry = ma_coord::registry_from_uri(dir)?;
+            let ttl = Duration::from_millis(args.cluster_ttl_ms);
+            let config = ma_coord::LeaseConfig {
+                ttl,
+                // Five renewals inside one lease, so four consecutive failures
+                // are survivable before the node stands down.
+                renew: ttl / 5,
+                guard: ttl / 7,
+            };
+            tracing::info!(
+                node,
+                dir,
+                ?ttl,
+                "clustered: this node will own a share of the streams. Every node must be \
+                 started with the same --symbols and --venues."
+            );
+            Some(pipeline.clustered(ma_coord::NodeId::new(node), registry, config)?)
+        }
+        _ => None,
+    };
+
     let (handle, aggregator) = pipeline.spawn_aggregator()?;
     let ingest = pipeline.spawn_ingest(None)?;
     let shutdown = pipeline.shutdown();
@@ -118,6 +168,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = aggregator.await;
         for task in ingest {
             let _ = task.await;
+        }
+        // Last, and inside the same budget: the coordinator's final act is to
+        // withdraw this node's lease so the rest of the cluster rebalances now
+        // rather than after `ttl`. Nothing depends on it — a hard kill cannot
+        // run it and the lease timing out has to produce the same outcome —
+        // but it is cheap and it saves every other node a full lease of
+        // unowned streams on a rolling deploy.
+        if let Some(coordinator) = coordinator {
+            let _ = coordinator.await;
         }
     })
     .await;

@@ -48,6 +48,7 @@ pub fn router(handle: PipelineHandle) -> Router {
         .route("/events", get(events))
         .route("/metrics", get(metrics))
         .route("/api/snapshot", get(snapshot))
+        .route("/cluster", get(cluster))
         .route("/health", get(health))
         .with_state(handle)
 }
@@ -70,6 +71,24 @@ async fn snapshot(State(handle): State<PipelineHandle>) -> impl IntoResponse {
         Err(e) => (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             format!("no snapshot available: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// This node's view of the cluster.
+///
+/// 404 rather than an empty object when clustering is off, because "no cluster
+/// configured" and "a cluster this node cannot see" are different situations
+/// and an operator checking this endpoint is usually trying to tell them
+/// apart. An empty body would answer neither question.
+async fn cluster(State(handle): State<PipelineHandle>) -> impl IntoResponse {
+    match &handle.cluster {
+        Some(view) => Json(serde_json::json!(&*view.borrow())).into_response(),
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            "this process is not running in a cluster; start it with --node-id and \
+             --cluster-dir to shard streams across nodes\n",
         )
             .into_response(),
     }
@@ -357,6 +376,58 @@ async fn metrics(State(handle): State<PipelineHandle>) -> impl IntoResponse {
             }
         }
 
+        // Cluster gauges carry a `node` label so a scrape across every node in
+        // the cluster sums to the whole. `ma_cluster_owned_streams` summed
+        // over nodes should equal the configured stream count: less means a
+        // stream nobody is running, more means the property this design exists
+        // to guarantee has been violated.
+        if let Some(view) = &handle.cluster {
+            let view = view.borrow();
+            out.push_str(
+                "# HELP ma_cluster_owned_streams Streams this node is running. Summed across \
+                 every node it should equal the cluster's configured stream count; more than \
+                 that means two nodes hold one stream.\n\
+                 # TYPE ma_cluster_owned_streams gauge\n",
+            );
+            out.push_str(&format!(
+                "ma_cluster_owned_streams{{node=\"{}\"}} {}\n",
+                view.node,
+                view.owned.len()
+            ));
+            out.push_str(
+                "# HELP ma_cluster_members Live members this node can see, including itself.\n\
+                 # TYPE ma_cluster_members gauge\n",
+            );
+            out.push_str(&format!(
+                "ma_cluster_members{{node=\"{}\"}} {}\n",
+                view.node,
+                view.members.len()
+            ));
+            out.push_str(
+                "# HELP ma_cluster_stood_down 1 when this node has released every stream \
+                 because it could not reach the registry. Distinguishes an idle node that was \
+                 given no work from one that went blind and stood down — alert on this, not on \
+                 owned_streams being zero.\n\
+                 # TYPE ma_cluster_stood_down gauge\n",
+            );
+            out.push_str(&format!(
+                "ma_cluster_stood_down{{node=\"{}\"}} {}\n",
+                view.node,
+                u8::from(view.stood_down)
+            ));
+            if let Some(ms) = view.last_contact_ms {
+                out.push_str(
+                    "# HELP ma_cluster_last_contact_ms Time since the last complete registry \
+                     round trip. Climbing past ttl - guard is what makes a node stand down.\n\
+                     # TYPE ma_cluster_last_contact_ms gauge\n",
+                );
+                out.push_str(&format!(
+                    "ma_cluster_last_contact_ms{{node=\"{}\"}} {ms}\n",
+                    view.node
+                ));
+            }
+        }
+
         // The consolidated touch is per *symbol*, so these carry no `venue`
         // label — which is the point of them. The two legs are named in the
         // JSON snapshot rather than as labels here, because a series whose
@@ -540,6 +611,7 @@ mod tests {
                 symbols: symbols.to_vec(),
                 venues,
                 windows: ma_core::WindowSpec::default(),
+                cluster: None,
             },
             agg,
         )

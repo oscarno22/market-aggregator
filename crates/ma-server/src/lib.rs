@@ -7,6 +7,7 @@
 //! of [`Pipeline::channel`] can tell which it is.
 
 pub mod archive;
+pub mod cluster;
 pub mod http;
 pub mod pipeline;
 

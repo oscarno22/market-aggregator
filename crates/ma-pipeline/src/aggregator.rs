@@ -42,7 +42,7 @@ use ma_core::{
 };
 use ma_venues::{Outcome, VenueBook, VenueSpec};
 use serde::Serialize;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::channel::{ChannelMetrics, Receiver};
@@ -353,6 +353,16 @@ pub struct Aggregator {
     events: Option<mpsc::UnboundedSender<MarketEvent>>,
     window_spec: WindowSpec,
     cross_policy: CrossPolicy,
+    /// Streams this node is responsible for, when running in a cluster.
+    ///
+    /// `None` — the default and the single-node case — means every configured
+    /// stream. When set, the aggregator keeps state for every stream it was
+    /// built with but *publishes* only the owned ones, so a released stream
+    /// disappears from the view rather than lingering with the last prices
+    /// this node happened to see. Another node is watching it now, and a card
+    /// showing our stale copy beside their live one is two answers to one
+    /// question.
+    owned: Option<watch::Receiver<std::collections::BTreeSet<StreamId>>>,
 }
 
 impl Aggregator {
@@ -415,7 +425,18 @@ impl Aggregator {
             events: None,
             window_spec,
             cross_policy: CrossPolicy::default(),
+            owned: None,
         }
+    }
+
+    /// Publish only the streams this node owns. See [`Aggregator::owned`].
+    #[must_use]
+    pub fn restricted_to(
+        mut self,
+        owned: watch::Receiver<std::collections::BTreeSet<StreamId>>,
+    ) -> Self {
+        self.owned = Some(owned);
+        self
     }
 
     /// How stale a book may be and still be a leg of the consolidated touch.
@@ -677,7 +698,15 @@ impl Aggregator {
         // is worse than none.
         let mut tops: BTreeMap<Symbol, Vec<(VenueId, TopOfBook)>> = BTreeMap::new();
 
+        // Cloned rather than held as a borrow guard across the loop: it is a
+        // handful of `StreamId`s four times a second, and the alternative is a
+        // guard alive while the books are borrowed mutably.
+        let owned = self.owned.as_ref().map(|rx| rx.borrow().clone());
+
         for (stream, state) in &mut self.streams {
+            if owned.as_ref().is_some_and(|owned| !owned.contains(stream)) {
+                continue;
+            }
             let counters = state.counters.snapshot();
             let rates = Rates::between(state.previous, counters, tick);
             state.previous = counters;

@@ -22,6 +22,7 @@ async-stream = "0.3.6"
 axum = "0.8.9"
 clap = { version = "4.6.6", features = ["derive"] }
 futures-util = "0.3.33"
+ma-coord = { path = "../ma-coord" }
 ma-core = { path = "../ma-core" }
 ma-persist = { path = "../ma-persist" }
 ma-pipeline = { path = "../ma-pipeline" }

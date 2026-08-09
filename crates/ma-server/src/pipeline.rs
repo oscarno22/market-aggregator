@@ -13,6 +13,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::collections::BTreeSet;
+
+use ma_coord::{ClusterView, Coordinator, LeaseConfig, NodeId, Registry};
 use ma_core::{Clock, CrossPolicy, StreamId, Symbol, SystemClock, VenueId, WindowSpec};
 use ma_pipeline::aggregator::{Aggregator, Snapshot};
 use ma_pipeline::channel::{Receiver, Sender, bounded};
@@ -56,6 +59,12 @@ pub struct PipelineHandle {
     /// because `/metrics` has to name each series after its span — a
     /// Prometheus series cannot say "the second one in the list".
     pub windows: WindowSpec,
+    /// This node's view of the cluster, when clustering is on. `None` for a
+    /// single-node run, which is the default — and the distinction is worth
+    /// keeping in the type rather than reporting a one-member cluster, because
+    /// "no coordination configured" and "a cluster of one" behave differently
+    /// on startup: only the second serves a settling period.
+    pub cluster: Option<tokio::sync::watch::Receiver<ClusterView>>,
 }
 
 impl PipelineHandle {
@@ -73,6 +82,11 @@ pub struct Pipeline {
     tick: Duration,
     windows: WindowSpec,
     cross: CrossPolicy,
+    /// Set by [`Pipeline::clustered`]. When present, the aggregator publishes
+    /// only owned streams and a supervisor starts and stops sockets as
+    /// ownership moves.
+    owned: Option<tokio::sync::watch::Receiver<BTreeSet<StreamId>>>,
+    cluster: Option<tokio::sync::watch::Receiver<ClusterView>>,
     metrics: Arc<Metrics>,
     /// Lets the aggregator ask an ingest task to reconnect after a desync
     /// that a healthy socket cannot repair on its own.
@@ -127,6 +141,8 @@ impl Pipeline {
             tick: ma_pipeline::aggregator::DEFAULT_TICK,
             windows: WindowSpec::default(),
             cross: CrossPolicy::default(),
+            owned: None,
+            cluster: None,
             tx,
             rx: Some(rx),
             trigger,
@@ -234,16 +250,75 @@ impl Pipeline {
             aggregator = aggregator.publishing_events_to(events);
         }
 
+        if let Some(owned) = &self.owned {
+            aggregator = aggregator.restricted_to(owned.clone());
+        }
+
         let handle = PipelineHandle {
             snapshots: aggregator.publisher(),
             metrics: Arc::clone(&self.metrics),
             symbols: self.symbols.clone(),
             venues: self.venues.clone(),
             windows: self.windows.clone(),
+            cluster: self.cluster.clone(),
         };
 
         let task = tokio::spawn(aggregator.run(rx, self.shutdown.clone()));
         Ok((handle, task))
+    }
+
+    /// Join a cluster: run the lease loop, and start and stop streams as
+    /// ownership moves.
+    ///
+    /// Must be called **before** [`Self::spawn_aggregator`], which is what
+    /// reads the ownership channel. Returns the coordinator's task; the
+    /// supervisor's is spawned by [`Self::spawn_ingest`], because that is
+    /// where the network and the venue specs already are.
+    ///
+    /// # Errors
+    /// Never today. Fallible because a future registry — an object store —
+    /// will validate its target here rather than at the first renewal.
+    pub fn clustered(
+        &mut self,
+        node: NodeId,
+        registry: Box<dyn Registry>,
+        config: LeaseConfig,
+    ) -> Result<JoinHandle<()>, PipelineError> {
+        // The stream list is the *cluster's*, not this node's, and must be
+        // identical on every node: the assignment is a pure function of it, so
+        // a node configured with a different `--symbols` computes a different
+        // answer and the disjointness argument no longer holds. Nothing here
+        // can check that, which is why it is stated in the startup log and in
+        // docs/DESIGN.md rather than assumed.
+        let streams: Vec<StreamId> = self.streams().collect();
+
+        let (owned_tx, owned_rx) = tokio::sync::watch::channel(BTreeSet::new());
+        let (view_tx, view_rx) = tokio::sync::watch::channel(ClusterView {
+            node: node.clone(),
+            members: Vec::new(),
+            owned: Vec::new(),
+            elsewhere: streams.iter().map(StreamId::key).collect(),
+            settling: true,
+            stood_down: true,
+            last_contact_ms: None,
+        });
+
+        self.owned = Some(owned_rx);
+        self.cluster = Some(view_rx);
+
+        let coordinator = Coordinator::new(node, registry, config, streams);
+        let clock = Arc::clone(&self.clock);
+        let mut stop = self.shutdown.clone();
+        Ok(tokio::spawn(async move {
+            coordinator
+                .run(
+                    &*clock,
+                    owned_tx,
+                    view_tx,
+                    Box::pin(async move { stop.wait().await }),
+                )
+                .await;
+        }))
     }
 
     /// Spawn one live ingest task per venue, optionally teeing to a tape.
@@ -255,8 +330,18 @@ impl Pipeline {
         tape: Option<tokio::sync::mpsc::UnboundedSender<IngestMessage>>,
     ) -> Result<Vec<JoinHandle<()>>, PipelineError> {
         let net = Arc::new(LiveNetwork::new()?);
-        let mut tasks = Vec::new();
 
+        // Clustered: which streams run is decided by the coordinator and
+        // changes while the process is up, so the tasks are owned by a
+        // supervisor rather than spawned once here.
+        if let Some(owned) = self.owned.clone() {
+            let supervisor = self.supervisor(net, tape)?;
+            return Ok(vec![tokio::spawn(
+                supervisor.run(owned, self.shutdown.clone()),
+            )]);
+        }
+
+        let mut tasks = Vec::new();
         for stream in self.streams() {
             let spec = ma_venues::spec_for(stream.venue, &stream.symbol)?;
             let counters = self.metrics.stream(&stream).unwrap_or_default();
@@ -280,6 +365,55 @@ impl Pipeline {
             tasks.push(tokio::spawn(ingest.run()));
         }
         Ok(tasks)
+    }
+
+    /// A supervisor whose spawn function builds the same [`Ingest`] the
+    /// single-node path does — deliberately the same construction, so a
+    /// clustered stream is not a second, subtly different kind of stream.
+    fn supervisor(
+        &self,
+        net: Arc<LiveNetwork>,
+        tape: Option<tokio::sync::mpsc::UnboundedSender<IngestMessage>>,
+        // `use<>` because the closure captures only owned clones, so the
+        // supervisor outlives the `&self` it was built from. Without it,
+        // edition 2024's default capture ties the opaque type to that borrow
+        // and the task cannot be spawned.
+    ) -> Result<crate::cluster::Supervisor<impl crate::cluster::SpawnStream + use<>>, PipelineError>
+    {
+        let tx = self.tx.clone();
+        let clock = Arc::clone(&self.clock);
+        let metrics = Arc::clone(&self.metrics);
+        let resync = self.resync.clone();
+        let channel = self.tx.clone();
+
+        let spawn = move |stream: &StreamId, signal: ma_pipeline::ingest::Shutdown| {
+            let spec = ma_venues::spec_for(stream.venue, &stream.symbol).ok()?;
+            let counters = metrics.stream(stream).unwrap_or_default();
+            info!(%stream, url = %spec.endpoint.ws_url, "starting ingest");
+
+            let mut ingest = Ingest::new(
+                Arc::clone(&net),
+                stream.clone(),
+                spec.endpoint,
+                channel.clone(),
+                Arc::clone(&clock),
+                counters,
+                signal,
+            );
+            if let Some(tape) = tape.clone() {
+                ingest = ingest.recording_to(tape);
+            }
+            if let Some(signal) = resync.subscribe(stream) {
+                ingest = ingest.listening_for_resync(signal);
+            }
+            Some(tokio::spawn(ingest.run()))
+        };
+
+        Ok(crate::cluster::Supervisor::new(
+            spawn,
+            tx,
+            Arc::clone(&self.clock),
+        ))
     }
 
     /// Stop every task this pipeline started.

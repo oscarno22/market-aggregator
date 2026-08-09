@@ -66,6 +66,34 @@ archive dir venues="coinbase,kraken,bitstamp" symbols="BTC-USD":
 record venue symbol="BTC-USD" secs="120":
     cargo run -p ma-server --bin record -- --venue {{venue}} --symbol {{symbol}} --secs {{secs}}
 
+# Run two nodes sharding the streams between them, against live venues.
+#
+# Six streams (three venues x two symbols) split across two processes, with
+# neither ever running the same one. Pages at :8081 and :8082; each node shows
+# only what it owns, and /cluster on either says who has what.
+#
+# Try killing one with `kill -9` and watching the other pick its streams up:
+# that takes ttl (7s here) plus a renewal, because a hard kill cannot withdraw
+# and the survivor has to wait the lease out. `kill -TERM` hands over at once.
+cluster dir="/tmp/ma-cluster" symbols="BTC-USD,ETH-USD":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p {{dir}}
+    trap 'kill 0' EXIT
+    cargo run -p ma-server -- --node-id node-a --cluster-dir {{dir}} \
+        --cluster-ttl-ms 7000 --symbols {{symbols}} --addr 127.0.0.1:8081 &
+    cargo run -p ma-server -- --node-id node-b --cluster-dir {{dir}} \
+        --cluster-ttl-ms 7000 --symbols {{symbols}} --addr 127.0.0.1:8082 &
+    wait
+
+# Print who owns what, across a running cluster.
+cluster-status:
+    @for port in 8081 8082; do \
+        echo "--- :$port"; \
+        curl -s "http://127.0.0.1:$port/cluster" || echo "  not responding"; \
+        echo; \
+    done
+
 # Diagnose a depth-audit disagreement: build a book from the websocket, fetch
 # the venue's REST depth, and print exactly where the two differ. This is what
 # established that the first audit's guard band was measured in the wrong unit

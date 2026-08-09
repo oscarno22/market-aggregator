@@ -1,0 +1,31 @@
+# Sharding streams across nodes.
+#
+# The pure part — which node owns which stream — has no I/O and no async, for
+# the same reason `ma-core` has none: an assignment function that can only be
+# checked by standing up a cluster is an assignment function nobody checks.
+# Only the lease loop and the registry implementations touch a clock or a disk.
+#
+# No consensus library, and no `etcd`/`ZooKeeper` client. See the crate docs:
+# the safety argument here is a *lease* argument, and a lease needs a clock and
+# a place to write one key, not agreement.
+[package]
+name = "ma-coord"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ma-core = { path = "../ma-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "time", "rt", "fs", "io-util"] }
+tracing = "0.1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"

@@ -38,6 +38,13 @@ Then open <http://127.0.0.1:8080>. To connect to the live venues instead:
 just serve coinbase,kraken,bitstamp BTC-USD,ETH-USD
 ```
 
+Or shard those six streams across two processes, neither ever running the same
+one:
+
+```bash
+just cluster
+```
+
 Endpoints: `/` the page, `/events` SSE, `/metrics` Prometheus text,
 `/api/snapshot` one JSON reading, `/health`.
 
@@ -202,6 +209,16 @@ picks the units they are thinking in. Both are why
   40-second high wearing a 60-second label. Each reading carries `trusted_ms`
   beside `span_ms` and the weakest `Integrity` it sampled under, and a window
   with nothing in it is `null` rather than zero.
+- **Sharding without consensus, and the two rules that make it safe.** Each
+  node writes exactly one key — its own lease — so there is no
+  compare-and-swap anywhere and a shared directory is a complete registry.
+  Assignment is rendezvous hashing, so losing a node moves only that node's
+  streams rather than reshuffling everything, and every reshuffle is a real
+  disconnect against a venue that bans for reconnect storms. Safety comes from
+  a lease enforced by its **holder**: a node that cannot reach the registry
+  releases every stream `guard` before anyone could declare it dead, because a
+  partitioned node's sockets are fine and nothing will ever tell it otherwise.
+  A joining node serves a settling period for the mirror-image case.
 - **The cross-venue touch is the most misreadable number here, and is built to
   resist it.** Highest bid and lowest ask across venues, where a negative
   spread is an *apparent* arbitrage. Untrusted books are excluded (a `Desynced`
@@ -239,9 +256,10 @@ Deliberately unfinished, and stated rather than hidden:
   path is proven against the scripted fake venue and, for the audit, against
   live venues — but not yet from a recording of a real outage.
 
-Next: v3 — sharding across nodes, rolling indicators, and a cross-venue spread
-view that must surface `Integrity` beside every number it derives, or it will
-lie.
+- **A cluster registry backed by S3 is not implemented**, for the same reason.
+  The trait needs only `PutObject`, `ListObjects` and `DeleteObject` —
+  deliberately no conditional write — so it is a small addition behind the same
+  gate.
 
 ## Non-goals
 
