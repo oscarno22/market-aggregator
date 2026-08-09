@@ -34,6 +34,13 @@ struct Args {
     #[arg(long, default_value_t = 250)]
     tick_ms: u64,
 
+    /// How stale a book may be and still be a leg of the cross-venue touch.
+    ///
+    /// The guard that stops a stalled feed's frozen quote from showing up as
+    /// an arbitrage against the venues still moving. See `ma_core::cross`.
+    #[arg(long, default_value_t = 2_000)]
+    cross_max_age_ms: u64,
+
     /// Rolling indicator windows, e.g. `1s,10s,1m`. Suffixes: ms, s, m, h.
     ///
     /// Several spans cost nothing at ingest: they share one bucket ring per
@@ -68,7 +75,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let symbols = parse_symbols(&args.symbols)?;
     let mut pipeline = Pipeline::new(symbols, venues)?
         .with_tick(Duration::from_millis(args.tick_ms))
-        .with_windows(parse_windows(&args.windows)?);
+        .with_windows(parse_windows(&args.windows)?)
+        .with_cross_max_age(Duration::from_millis(args.cross_max_age_ms));
 
     // Attached before the aggregator is spawned, because the aggregator is the
     // only thing that can produce normalised events — see

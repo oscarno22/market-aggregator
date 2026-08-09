@@ -357,6 +357,52 @@ async fn metrics(State(handle): State<PipelineHandle>) -> impl IntoResponse {
             }
         }
 
+        // The consolidated touch is per *symbol*, so these carry no `venue`
+        // label — which is the point of them. The two legs are named in the
+        // JSON snapshot rather than as labels here, because a series whose
+        // labels changed every time the best bid moved between venues would
+        // start a new time series on each hop and be unqueryable.
+        out.push_str(
+            "# HELP ma_cross_spread_bps Best ask minus best bid across venues, in basis points \
+             of the consolidated mid. SIGNED: negative means the venues' books are crossed, and \
+             the magnitude is an apparent arbitrage gross of fees, latency and transfer time. \
+             Read ma_cross_oldest_leg_ms beside it — the two quotes were never simultaneous.\n\
+             # TYPE ma_cross_spread_bps gauge\n",
+        );
+        for symbol in &snapshot.symbols {
+            if let Some(bps) = &symbol.cross.spread_bps {
+                out.push_str(&format!(
+                    "ma_cross_spread_bps{{symbol=\"{}\"}} {bps}\n",
+                    symbol.symbol
+                ));
+            }
+        }
+        out.push_str(
+            "# HELP ma_cross_venues_used Venues contributing a side to the consolidated touch. \
+             A drop here narrows every cross-venue number without changing its shape, which is \
+             why it is published beside them.\n\
+             # TYPE ma_cross_venues_used gauge\n",
+        );
+        for symbol in &snapshot.symbols {
+            out.push_str(&format!(
+                "ma_cross_venues_used{{symbol=\"{}\"}} {}\n",
+                symbol.symbol, symbol.cross.venues_used
+            ));
+        }
+        out.push_str(
+            "# HELP ma_cross_oldest_leg_ms Age of the older of the two legs. Bounds how \
+             simultaneous the consolidated reading is.\n\
+             # TYPE ma_cross_oldest_leg_ms gauge\n",
+        );
+        for symbol in &snapshot.symbols {
+            if let Some(age) = symbol.cross.oldest_leg_ms {
+                out.push_str(&format!(
+                    "ma_cross_oldest_leg_ms{{symbol=\"{}\"}} {age}\n",
+                    symbol.symbol
+                ));
+            }
+        }
+
         // Prometheus has no notion of "absent" inside a sample, so a window
         // with no data must emit no series rather than a zero. A zero range
         // and an unknown range are the same line otherwise, and the whole

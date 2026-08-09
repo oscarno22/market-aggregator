@@ -202,6 +202,15 @@ picks the units they are thinking in. Both are why
   40-second high wearing a 60-second label. Each reading carries `trusted_ms`
   beside `span_ms` and the weakest `Integrity` it sampled under, and a window
   with nothing in it is `null` rather than zero.
+- **The cross-venue touch is the most misreadable number here, and is built to
+  resist it.** Highest bid and lowest ask across venues, where a negative
+  spread is an *apparent* arbitrage. Untrusted books are excluded (a `Desynced`
+  book keeps its last contents, and an unguarded `max` would read a frozen
+  aggressive bid as a live one); so are stalled ones; and the reported
+  `integrity_floor` is taken over the two legs actually used, not over the
+  venues present. Every exclusion is published with its reason, because a
+  consolidated touch that has quietly narrowed to one venue looks exactly like
+  one drawn from three.
 
 The reasoning lives in **[`docs/DESIGN.md`](docs/DESIGN.md)** — sequence
 diagrams, the decisions table with what was rejected and why, and an operating

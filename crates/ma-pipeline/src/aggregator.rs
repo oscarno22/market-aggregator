@@ -36,8 +36,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use ma_core::{
-    BookState, Clock, DesyncReason, EventKind, IngestTime, Integrity, Level, MarketEvent,
-    RollingWindows, Side, StreamId, Symbol, VenueId, WindowReading, WindowSpec,
+    BookState, Clock, CrossLeg, CrossPolicy, DesyncReason, EventKind, IngestTime, Integrity, Level,
+    MarketEvent, RollingWindows, Side, StreamId, Symbol, TopOfBook, VenueId, WindowReading,
+    WindowSpec,
 };
 use ma_venues::{Outcome, VenueBook, VenueSpec};
 use serde::Serialize;
@@ -180,7 +181,54 @@ pub struct SymbolView {
     /// checksum and a Bitstamp book that may have quietly lost a message get
     /// combined into a figure that looks more trustworthy than either.
     pub weakest_integrity: Option<Integrity>,
+    /// The best bid and best ask across venues, and what they were derived
+    /// from. See [`ma_core::cross`] for why this is the most misreadable
+    /// number the process publishes and what stops it being noise.
+    pub cross: CrossView,
     pub venues: Vec<VenueView>,
+}
+
+/// [`ma_core::CrossVenue`] rendered for the wire.
+///
+/// A separate type rather than serialising the core one, for the same reason
+/// [`describe`] exists: `Decimal` fields leave here as strings (see the module
+/// docs on why a JSON number would undo the exact-decimal discipline), and an
+/// exclusion reason is read by a person deciding what to do, not by a machine
+/// matching on a tag.
+#[derive(Clone, Debug, Serialize)]
+pub struct CrossView {
+    pub bid: Option<CrossLeg>,
+    pub ask: Option<CrossLeg>,
+    /// Signed. Negative means the venues' books are crossed.
+    pub spread: Option<String>,
+    pub spread_bps: Option<String>,
+    pub mid: Option<String>,
+    /// Weakest guarantee among the legs used — not among the venues present.
+    pub integrity_floor: Option<Integrity>,
+    /// Age of the older leg: how simultaneous this reading actually is.
+    pub oldest_leg_ms: Option<u64>,
+    pub venues_used: usize,
+    /// Best bid at or above best ask. The apparent-arbitrage flag, and it is
+    /// *apparent* — gross of fees, latency and transfer time, and derived from
+    /// two quotes that were never observed at the same instant.
+    pub crossed: bool,
+    /// Both legs came from one venue, so this is that venue's own spread and
+    /// cannot show an arbitrage.
+    pub single_venue: bool,
+    pub excluded: Vec<ExclusionView>,
+    /// Which clock `oldest_leg_ms` was measured on.
+    ///
+    /// Repeated here even though [`Snapshot::clock`] already carries it, and
+    /// deliberately: CLAUDE.md requires that *any cross-venue comparison
+    /// surfaced in the UI* name its clock, and this object is the one thing in
+    /// the snapshot most likely to be pulled out and rendered on its own.
+    pub clock: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ExclusionView {
+    pub venue: VenueId,
+    pub reason: String,
 }
 
 /// Everything the fan-out publishes, once per tick.
@@ -304,6 +352,7 @@ pub struct Aggregator {
     resync: ResyncRequests,
     events: Option<mpsc::UnboundedSender<MarketEvent>>,
     window_spec: WindowSpec,
+    cross_policy: CrossPolicy,
 }
 
 impl Aggregator {
@@ -365,7 +414,15 @@ impl Aggregator {
             resync: ResyncRequests::default(),
             events: None,
             window_spec,
+            cross_policy: CrossPolicy::default(),
         }
+    }
+
+    /// How stale a book may be and still be a leg of the consolidated touch.
+    #[must_use]
+    pub fn with_cross_policy(mut self, policy: CrossPolicy) -> Self {
+        self.cross_policy = policy;
+        self
     }
 
     /// The window spans this aggregator publishes, for a consumer that needs
@@ -613,6 +670,12 @@ impl Aggregator {
         // which for a BTreeMap keyed venue-then-symbol is stable run to run —
         // the property that keeps UI cards from shuffling between ticks.
         let mut by_symbol: BTreeMap<Symbol, Vec<VenueView>> = BTreeMap::new();
+        // Kept beside the views because the consolidated touch is computed
+        // from the same `TopOfBook` values the per-venue cards report. Reading
+        // the books a second time would let the two disagree by a tick, and a
+        // cross-venue spread that does not add up against the cards beside it
+        // is worse than none.
+        let mut tops: BTreeMap<Symbol, Vec<(VenueId, TopOfBook)>> = BTreeMap::new();
 
         for (stream, state) in &mut self.streams {
             let counters = state.counters.snapshot();
@@ -640,6 +703,10 @@ impl Aggregator {
                 ),
                 _ => (None, None),
             };
+
+            tops.entry(stream.symbol.clone())
+                .or_default()
+                .push((stream.venue, top));
 
             by_symbol
                 .entry(stream.symbol.clone())
@@ -679,12 +746,39 @@ impl Aggregator {
                 .into_iter()
                 .map(|(symbol, venues)| SymbolView {
                     weakest_integrity: venues.iter().filter_map(|v| v.integrity).min(),
+                    cross: cross_view(tops.remove(&symbol).unwrap_or_default(), self.cross_policy),
                     symbol: symbol.to_string(),
                     venues,
                 })
                 .collect(),
             channel,
         }
+    }
+}
+
+/// Consolidate one symbol's books and render the result for the wire.
+fn cross_view(tops: Vec<(VenueId, TopOfBook)>, policy: CrossPolicy) -> CrossView {
+    let cross = ma_core::consolidate(tops, policy);
+    CrossView {
+        bid: cross.bid,
+        ask: cross.ask,
+        spread: cross.spread.map(|d| d.to_string()),
+        spread_bps: cross.spread_bps.map(|d| d.to_string()),
+        mid: cross.mid.map(|d| d.to_string()),
+        integrity_floor: cross.integrity_floor,
+        oldest_leg_ms: cross.oldest_leg_ms,
+        venues_used: cross.venues_used,
+        crossed: cross.is_crossed(),
+        single_venue: cross.is_single_venue(),
+        excluded: cross
+            .excluded
+            .iter()
+            .map(|e| ExclusionView {
+                venue: e.venue,
+                reason: e.reason.to_string(),
+            })
+            .collect(),
+        clock: INGEST_MONOTONIC,
     }
 }
 
@@ -1048,6 +1142,58 @@ mod tests {
             v.desynced_total_ms, 0,
             "a verified book accrued untrusted time"
         );
+    }
+
+    #[test]
+    fn the_consolidated_touch_spans_venues_and_names_its_clock() {
+        let (mut agg, _m) = aggregator(&[VenueId::Coinbase, VenueId::Bitstamp]);
+        agg.apply(coinbase(0, "snapshot", "100", "103"));
+        agg.apply(IngestMessage::Frame(RawFrame::rest_snapshot(
+            StreamId::new(VenueId::Bitstamp, symbol()),
+            br#"{"microtimestamp":"1700000000000000","bids":[["101","1"]],"asks":[["104","1"]]}"#
+                .to_vec(),
+            SystemClock.now(),
+        )));
+
+        let snap = agg.snapshot(empty_channel());
+        let cross = &only_symbol(&snap).cross;
+
+        assert_eq!(cross.bid.unwrap().venue, VenueId::Bitstamp, "best bid 101");
+        assert_eq!(cross.ask.unwrap().venue, VenueId::Coinbase, "best ask 103");
+        assert_eq!(cross.spread.as_deref(), Some("2"));
+        assert_eq!(cross.venues_used, 2);
+        assert!(!cross.crossed);
+        assert!(!cross.single_venue);
+        // A spread whose weaker leg cannot detect a lost message is an
+        // order-only number, whatever the other leg proves.
+        assert_eq!(cross.integrity_floor, Some(Integrity::OrderOnly));
+        // CLAUDE.md: any cross-venue comparison surfaced must name its clock.
+        assert_eq!(cross.clock, "ingest_monotonic");
+    }
+
+    #[test]
+    fn a_desynced_venue_is_excluded_from_the_consolidated_touch_in_words() {
+        // The pipeline-level version of ma_core::cross's rule. A desynced book
+        // keeps its contents on purpose; if those contents reached the
+        // consolidation, a stuck aggressive bid would show a standing
+        // arbitrage against every healthy venue.
+        let (mut agg, _m) = aggregator(&[VenueId::Coinbase, VenueId::Kraken]);
+        agg.apply(coinbase(0, "snapshot", "100", "101"));
+        agg.apply(frame(
+            VenueId::Kraken,
+            r#"{"channel":"book","type":"snapshot","data":[{"symbol":"BTC/USD","bids":[{"price":99999,"qty":1}],"asks":[{"price":100000,"qty":1}],"checksum":0}]}"#,
+        ));
+
+        let snap = agg.snapshot(empty_channel());
+        let cross = &only_symbol(&snap).cross;
+
+        // Kraken's checksum cannot match a one-level book, so it desyncs.
+        assert_eq!(view(&snap, VenueId::Kraken).status, BookStatus::Desynced);
+        assert_eq!(cross.venues_used, 1);
+        assert!(!cross.crossed, "a desynced book manufactured an arbitrage");
+        assert_eq!(cross.excluded.len(), 1);
+        assert_eq!(cross.excluded[0].venue, VenueId::Kraken);
+        assert_eq!(cross.excluded[0].reason, "book is not trusted");
     }
 
     #[test]

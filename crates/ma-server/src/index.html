@@ -63,6 +63,15 @@
                   font-size: 0.8rem; margin-bottom: 0.7rem; background: var(--card); }
   .banner .warn { border-color: var(--desync); }
 
+  /* The consolidated touch. Deliberately styled as one more banner rather than
+     as a headline number: it is a derived reading with caveats attached, and
+     the caveats have to sit beside it, not in a tooltip. */
+  .cross { display: flex; flex-wrap: wrap; gap: 0.15rem 1.4rem; align-items: baseline; }
+  .cross .leg { font-size: 0.8rem; }
+  .cross .leg em { font-style: normal; color: var(--muted); }
+  .cross .crossed { color: var(--desync); font-weight: 600; }
+  .cross-note { flex-basis: 100%; font-size: 0.72rem; color: var(--muted); margin-top: 0.25rem; }
+
   /* The depth ladder. Asks above bids, best of each nearest the middle, so the
      touch sits where a reader's eye already expects the market to be. */
   table.ladder { margin: 0.5rem 0 0.6rem; font-size: 0.72rem; }
@@ -213,9 +222,61 @@ function group(g) {
   return `
   <section class="symbol">
     <h2 class="symbol-name">${escapeHtml(g.symbol)}</h2>
-    <div class="banner">${banner}</div>
+    <div class="banner">${banner}${crossBanner(g)}</div>
     <div class="grid">${g.venues.map(card).join("")}</div>
   </section>`;
+}
+
+// The consolidated touch: highest bid and lowest ask across venues.
+//
+// Rendered with its qualifications inline rather than as a clean headline
+// number, because every one of them changes what the number means. Which
+// venues were excluded and why, how stale the older leg was, and what the
+// weaker of the two books can actually prove are not footnotes to this figure
+// — they are the difference between a market-structure reading and a
+// fabricated arbitrage. See ma_core::cross.
+function crossBanner(g) {
+  const x = g.cross;
+  if (!x) return "";
+
+  if (!x.bid || !x.ask) {
+    const why = x.excluded.length
+      ? x.excluded.map((e) => `${e.venue} (${escapeHtml(e.reason)})`).join(", ")
+      : "no venue is quoting both sides";
+    return `<div>No consolidated touch for ${escapeHtml(g.symbol)}: ${why}.</div>`;
+  }
+
+  const bps = Number(x.spread_bps);
+  const headline = x.crossed
+    ? `<span class="crossed">crossed by ${Math.abs(bps).toFixed(2)} bps</span>`
+    : `<span class="num">${bps.toFixed(2)} bps</span>`;
+
+  // The three caveats, each only shown when it actually applies.
+  const notes = [];
+  if (x.crossed && !x.single_venue) {
+    notes.push(`An <strong>apparent</strong> edge only — gross of taker fees on both legs,
+      of the latency between seeing this and acting on it, and of transfer time between
+      venues. The two quotes were never observed at the same instant.`);
+  }
+  if (x.single_venue) {
+    notes.push(`Both legs are from ${x.bid.venue}, so this is that venue's own spread and
+      cannot show an arbitrage.`);
+  }
+  if (x.excluded.length) {
+    notes.push(`Excluded: ${x.excluded.map((e) =>
+      `${e.venue} — ${escapeHtml(e.reason)}`).join("; ")}.`);
+  }
+
+  return `
+  <div class="cross">
+    <div class="leg"><em>Best bid</em> <span class="num">${x.bid.price}</span>
+      <em>on</em> ${x.bid.venue} <em>(${x.bid.age_ms}ms old)</em></div>
+    <div class="leg"><em>Best ask</em> <span class="num">${x.ask.price}</span>
+      <em>on</em> ${x.ask.venue} <em>(${x.ask.age_ms}ms old)</em></div>
+    <div class="leg"><em>Consolidated</em> ${headline}
+      <em>· ${CLAIM_SHORT[x.integrity_floor]} at best · ages on ${x.clock}</em></div>
+    ${notes.length ? `<div class="cross-note">${notes.join(" ")}</div>` : ""}
+  </div>`;
 }
 
 // The L2 ladder: asks above bids, the best of each nearest the middle. That is

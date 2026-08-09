@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ma_core::{Clock, StreamId, Symbol, SystemClock, VenueId, WindowSpec};
+use ma_core::{Clock, CrossPolicy, StreamId, Symbol, SystemClock, VenueId, WindowSpec};
 use ma_pipeline::aggregator::{Aggregator, Snapshot};
 use ma_pipeline::channel::{Receiver, Sender, bounded};
 use ma_pipeline::ingest::{Ingest, IngestMessage, Shutdown, ShutdownTrigger, shutdown};
@@ -72,6 +72,7 @@ pub struct Pipeline {
     clock: Arc<dyn Clock>,
     tick: Duration,
     windows: WindowSpec,
+    cross: CrossPolicy,
     metrics: Arc<Metrics>,
     /// Lets the aggregator ask an ingest task to reconnect after a desync
     /// that a healthy socket cannot repair on its own.
@@ -125,6 +126,7 @@ impl Pipeline {
             clock: Arc::new(SystemClock),
             tick: ma_pipeline::aggregator::DEFAULT_TICK,
             windows: WindowSpec::default(),
+            cross: CrossPolicy::default(),
             tx,
             rx: Some(rx),
             trigger,
@@ -149,6 +151,13 @@ impl Pipeline {
     #[must_use]
     pub fn with_windows(mut self, spans: Vec<Duration>) -> Self {
         self.windows = WindowSpec::new(self.tick, spans);
+        self
+    }
+
+    /// How stale a book may be and still be a leg of the consolidated touch.
+    #[must_use]
+    pub fn with_cross_max_age(mut self, max_age: Duration) -> Self {
+        self.cross = CrossPolicy { max_age };
         self
     }
 
@@ -219,6 +228,7 @@ impl Pipeline {
             self.windows.clone(),
         )
         .with_tick(self.tick)
+        .with_cross_policy(self.cross)
         .requesting_resync_through(self.resync.clone());
         if let Some(events) = self.events.take() {
             aggregator = aggregator.publishing_events_to(events);
