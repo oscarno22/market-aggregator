@@ -101,6 +101,24 @@ cluster dir="/tmp/ma-cluster" symbols="BTC-USD,ETH-USD":
         --cluster-ttl-ms 7000 --symbols {{symbols}} --addr 127.0.0.1:8082 &
     wait
 
+# Merge every node's snapshot into one view, at http://127.0.0.1:8080.
+#
+# Run `just cluster` first. The gateway opens no venue sockets of its own — it
+# follows each node's /events, re-consolidates, and serves the same page and the
+# same JSON shape a node does, so the chart cannot tell it is looking at a
+# cluster.
+#
+# It is the only place two things are visible:
+#   - a consolidated touch over *every* venue, rather than over the venues one
+#     node happens to own
+#   - a stream two nodes both claim. /nodes and ma_gateway_duplicated_streams.
+gateway nodes="http://127.0.0.1:8081,http://127.0.0.1:8082" addr="127.0.0.1:8080":
+    cargo run -p ma-server --bin gateway -- --nodes {{nodes}} --addr {{addr}}
+
+# Who is contributing to the merged view, and what any two nodes both claim.
+gateway-status addr="127.0.0.1:8080":
+    @curl -s "http://{{addr}}/nodes" || echo "  gateway not responding"
+
 # Print who owns what, across a running cluster.
 cluster-status:
     @for port in 8081 8082; do \

@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ma_core::StreamId;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Live counters for one venue's ingest task.
 #[derive(Debug, Default)]
@@ -112,7 +112,7 @@ impl VenueCounters {
 }
 
 /// A reading of [`VenueCounters`] at one instant.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VenueCountersSnapshot {
     pub frames: u64,
     pub bytes: u64,
@@ -174,7 +174,7 @@ impl VenueCountersSnapshot {
 }
 
 /// Per-second rates over a stated interval, derived from two snapshots.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Rates {
     pub frames_per_sec: f64,
     pub bytes_per_sec: f64,

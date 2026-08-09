@@ -79,7 +79,7 @@
 use std::time::Duration;
 
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::book::{BookState, Integrity, TopOfBook};
 use crate::time::IngestTime;
@@ -144,7 +144,7 @@ impl Default for WindowSpec {
 /// the same condition: no trusted two-sided sample landed in the window. A
 /// caller cannot accidentally read "no data" as zero, which is the mistake
 /// this whole project is organised against.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowReading {
     /// The window actually examined: the configured span rounded up to a whole
     /// number of buckets. Reported rather than the configured value, because

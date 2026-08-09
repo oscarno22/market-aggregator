@@ -8,6 +8,7 @@
 
 pub mod archive;
 pub mod cluster;
+pub mod gateway;
 pub mod http;
 pub mod pipeline;
 

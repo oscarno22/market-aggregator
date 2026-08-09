@@ -1144,20 +1144,154 @@ the registry stands down) but pointless.
 
 ---
 
-## 14. Where this stops
+## 14. The gateway, and §12's problem across a network hop
 
-v1, v2 and v3 are complete. What v3 added:
+v3 shards streams across nodes, and then each node serves only its own share.
+The consolidated touch §12 is about is therefore computed over *the venues that
+node happens to own* — which on a two-node cluster is routinely a single venue
+wearing a cross-venue label. Measured on a live run, six streams across two
+nodes:
+
+| | BTC-USD | ETH-USD |
+|---|---|---|
+| node-a alone | 2 venues | **1 venue**, `single_venue: true` |
+| node-b alone | **1 venue**, `single_venue: true` | **1 venue**, `single_venue: true` |
+| merged | 3 venues, −1.6796 bps | 3 venues, −0.3135 bps |
+
+Three of those four single-node readings are a venue's own spread with a
+cross-venue name on it. The merged rows are the number the project set out to
+publish, and the legs come from different machines: BTC-USD's bid from Coinbase
+on one node, its ask from Kraken on the other.
+
+### Every age is two monotonic durations added together
+
+The gateway follows each node's `/events` — the same endpoint the page uses,
+not a private protocol, because a second serialisation of one state is the
+thing this document keeps arguing against. A node's snapshot then describes its
+books *as of that node's tick* and travels a network to get here, so:
+
+```text
+effective age = the node's own book age + the gateway's lag since that snapshot arrived
+```
+
+Both halves are monotonic, from two different processes' clocks. **Nothing
+compares two machines' wall clocks**, which is what the obvious implementation
+does first — `wall_unix_ms` is right there in the snapshot, and subtracting it
+from the gateway's own would fold every machine's NTP offset straight into the
+staleness guard. §7's rule, one layer out.
+
+Omitting the lag is the more dangerous mistake and it looks like nothing. A
+node that dies mid-tick leaves a last snapshot whose `age_ms` is frozen at a
+healthy few milliseconds; merged unadjusted, its books stay **fresh forever**
+and keep contributing legs to a touch drawn from a market that has since moved.
+That is §12's failure exactly, reached through a dead process rather than a
+quiet socket. Adding the lag can only make a book look *older*, never younger,
+so the error is in the direction that excludes — the same judgement `Desynced`
+makes, and the same one sharding makes in preferring a visible gap to a silent
+duplicate.
+
+Three fields are adjusted (`age_ms`, `status_for_ms`, `last_verified_ms`) and
+one deliberately is not: `desynced_total_ms` is a cumulative total, not an age,
+and adding lag to it would inflate a counter rather than correct a measurement.
+The rolling windows are also left alone, and that is a stated limit: a 60s
+window from a node three seconds stale describes a real 60 seconds that ended
+three seconds ago. Shifting `span_ms` would be inventing coverage; the honest
+signal is `lag_ms`, published beside it.
+
+### The one thing only a gateway can see
+
+**At most one node runs a given stream** is §13's safety property, and nothing
+in the system could check it. A node knows what it owns; it cannot know what
+anyone else owns except by trusting the registry that produced the answer. The
+gateway holds every node's snapshot at once, and a node *omits* streams it does
+not own — so two nodes reporting one `(symbol, venue)` is direct evidence.
+
+Demonstrated by pointing a gateway at the two clustered nodes plus a rogue
+process running all six streams outside the cluster — what a duplicated
+`--node-id`, a stale deployment or a lease bug looks like from outside:
+
+```text
+BTC-USD coinbase: claimed by ['node-b', 'rogue']
+BTC-USD kraken:   claimed by ['node-a', 'rogue']
+...
+ma_gateway_duplicated_streams 6
+```
+
+Alert on that gauge. The failure it names is the one §13's whole design exists
+to prevent, and from every other vantage point it looks healthy until a venue
+starts refusing connections.
+
+A duplicate is *published*, not repaired. The merge serves the freshest of the
+two claims so the view stays renderable, with the node name as a tie-break so
+it does not flap tick by tick — but nothing here can fix two processes running
+one stream, and pretending otherwise would hide the only evidence there is.
+
+### A node is excluded by name and reason, or not at all
+
+`CrossView::excluded` publishes which venues did not contribute and why,
+because a touch that quietly narrows to one venue looks exactly like one drawn
+from three. `NodeStatus` is that rule applied to nodes: every configured node
+appears whether or not it was used. A `kill -9` on node-b, live:
+
+```text
+node-b: included=true  lag_ms=2051   because=null
+node-b: included=false lag_ms=4302   because="no snapshot for 4302ms"
+```
+
+— and, once node-a had taken the orphaned streams over, the *stream* still
+mid-handover was excluded from the touch on its own merits:
+`kraken: no update for 2333ms`. Two independent staleness rules, at two scales,
+both firing correctly on one event.
+
+`max_node_age` (3s) and `CrossPolicy::max_age` (2s) are deliberately different
+numbers answering different questions: whether a **node** is still there, and
+whether a **book** has stalled.
+
+### What it costs: a snapshot is now a wire format in both directions
+
+`Snapshot` was write-only for three milestones. The gateway parses what a node
+publishes, so a field that serialises but cannot be read back would break
+nothing visible until a cluster was actually merged. Two tests pin it — a JSON
+round trip over a snapshot taken off a real tape, and an end-to-end run of two
+real HTTP surfaces on loopback followed by the real client, which is the only
+thing that exercises SSE reassembly across TCP chunk boundaries. A Coinbase
+ladder does not arrive in one read.
+
+The merged view serialises *as* a `Snapshot`, plus `nodes` and `duplicated`. So
+the gateway satisfies the same contract a node does: the chart page is served
+unchanged and does not know it is looking at a cluster, and a gateway can be
+pointed at another gateway without anything special.
+
+`/metrics` deliberately does **not** re-export the nodes' per-stream counters.
+Every node already publishes them and a Prometheus setup scrapes all of them;
+a copy here would double-count in any query that sums across targets, silently,
+because both copies are correct and neither says it is a copy. The gateway
+publishes only what it is the sole source of.
+
+---
+
+## 15. Where this stops
+
+v1, v2, v3 and v4 are complete. What v4 added:
 
 | | Status |
 |---|---|
-| Rolling indicators over configurable windows | Done, with coverage and an integrity floor on every reading; verified against a live tape |
-| Cross-venue consolidated touch | Done, with exclusions published rather than hidden |
-| Sharding across nodes with a coordination layer | Done, and verified live — two nodes, a `kill -9`, and a registry made unreadable under six healthy sockets |
+| A tape recorded across a real reconnect | Done — three staggered boundaries against live venues, replayed offline. Proves each venue's resubscribe and the book rebuilt from it; not detection, since we closed the socket. §4 |
+| Symbol-partitioned Parquet | Done — and it broke the reader's unstated assumption that key order is time order, which is now a per-partition merge. §8, §10 |
+| An S3-backed cluster registry | Done, and run live: two nodes, disjoint throughout, `kill -9` handover one lease later. §13 |
+| A cross-node merged view | Done, and run live against two clustered nodes plus a rogue process. §14 |
 
-### Not built yet, in the order the plan puts them
+### Not built yet
 
-- **A cross-node view.** Each node serves its own page and its own share of the
-  streams; nothing merges them. A gateway subscribing to every node's SSE and
-  re-consolidating is the obvious shape, and it inherits §12's whole problem
-  across a network hop rather than a socket — which is why it is a separate
-  piece of work rather than a flag.
+- **A gateway that is not a single point of failure.** It holds no state a node
+  does not, so a second one is just a second process — but nothing elects one,
+  and two gateways behind a load balancer would serve two views that differ by
+  a tick. That is fine for a page and not fine for anything that alerts.
+- **Cross-node rolling windows.** The gateway merges *instants*. A window
+  spanning nodes would have to merge coverage as well as values, and
+  `trusted_ms` from two machines is two different clocks' worth of trust — the
+  same problem this section solved for a touch, one dimension harder.
+- **Backfilling the archive from the gateway.** Each node archives its own
+  share, so an hour of "everything" is a union of prefixes rather than a file.
+  Symbol partitioning makes that a directory listing rather than a merge, which
+  is most of the work already done.

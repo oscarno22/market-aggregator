@@ -27,6 +27,12 @@ ma-core = { path = "../ma-core" }
 ma-persist = { path = "../ma-persist" }
 ma-pipeline = { path = "../ma-pipeline" }
 ma-venues = { path = "../ma-venues" }
+# The gateway is an SSE *client* of every node, so it reads a response as it
+# arrives rather than after it finishes — which for a stream that never
+# finishes is the whole thing. `Response::chunk` does that on the base API;
+# the `stream` feature would add a `futures-io` dependency for a combinator
+# this does not need.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "charset", "http2"] }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

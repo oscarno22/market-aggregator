@@ -266,3 +266,35 @@ async fn replaying_the_same_tape_twice_produces_the_same_books() {
     );
     assert_eq!(first.len(), DEFAULT_VENUES.len());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_round_trips_through_json_unchanged() {
+    // v4 made `Snapshot` a wire format in *both* directions: the gateway parses
+    // what a node publishes. For three milestones it was write-only, so nothing
+    // ever checked that what goes out can come back — and a field that
+    // serialises but cannot be read would break nothing visible until a cluster
+    // was actually merged.
+    //
+    // Run against a snapshot off the real tape rather than a hand-built one, so
+    // every optional field that only appears with real data — a desync reason, a
+    // Kraken `last_verified_ms`, an audit count, a populated ladder, a window
+    // reading with `None` prices — is actually present to be lost.
+    let snapshot = run().await;
+    let out = serde_json::to_value(&snapshot).expect("serialise");
+    let back: Snapshot = serde_json::from_value(out.clone()).expect("the snapshot did not parse");
+    let again = serde_json::to_value(&back).expect("re-serialise");
+
+    assert_eq!(
+        out, again,
+        "a snapshot changed shape through a JSON round trip"
+    );
+    // Not vacuous: the tape produces books, ladders and counters, so an empty
+    // document passing this comparison would still be a failure.
+    assert!(
+        out.get("symbols")
+            .and_then(|s| s.as_array())
+            .is_some_and(|s| !s.is_empty()),
+        "the round trip was tested against an empty snapshot"
+    );
+    assert_eq!(back.symbol("BTC-USD").expect("BTC-USD").venues.len(), 3);
+}

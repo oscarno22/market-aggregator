@@ -226,7 +226,7 @@ Neither layer replaces the other.
       excluded **by name and reason** rather than silently, and the
       integrity floor taken over the legs actually used
 
-**v4 — in progress**
+**v4 — complete**
 - [x] A tape recorded across a real reconnect. `record --reconnect-at` forces
       one stream at a time to drop and resubscribe, through the *same*
       `ResyncRequests` handle the aggregator uses for a real desync.
@@ -234,8 +234,13 @@ Neither layer replaces the other.
       boundaries; `ma-server/tests/reconnect.rs` replays it offline. It proves
       each venue's **resubscribe** behaviour and the book rebuilt from it — not
       **detection**, since we closed the socket. See `docs/DESIGN.md` §4
-- A cross-node view: a gateway merging every node's snapshot. It inherits
-  the whole of §12's problem across a network hop rather than a socket
+- [x] A cross-node view — `ma-server`'s `gateway` binary. Follows every node's
+      SSE, re-consolidates, and serves the same wire contract a node does, so
+      the page cannot tell. Every age is the node's own monotonic book age
+      **plus** this process's monotonic lag; nothing compares two machines'
+      wall clocks. It is also the only vantage point from which a doubly-owned
+      stream is visible — `ma_gateway_duplicated_streams`. See `docs/DESIGN.md`
+      §14
 - [x] Symbol-partitioned Parquet. `events/symbol=X/date=D/hour=H/part-N`, one
       open file per symbol, rolled per partition. Partitioning by symbol broke
       the reader's unstated assumption that key order is time order, so
@@ -256,11 +261,13 @@ Neither layer replaces the other.
 Snapshot as of the last session; update this when a milestone item lands or
 a design decision changes.
 
-**v1, v2 and v3 are complete.** Six-crate workspace, **298 tests passing,
-clippy-clean (`-D warnings`), `cargo fmt` clean**. The full suite runs offline;
+**v1 through v4 are complete.** Seven-crate workspace, **337 tests
+passing, clippy-clean (`-D warnings`) with and without `--features
+ma-server/s3`, `cargo fmt` clean**. The full suite runs offline;
 `just demo tapes/2026-08-09-btc-usd-live.jsonl.gz` plays a real recording
-through the real pipeline with the network unplugged, and `just cluster` shards
-six live streams across two processes.
+through the real pipeline with the network unplugged, `just cluster` shards six
+live streams across two processes, and `just gateway` merges them back into one
+view.
 
 Read `docs/DESIGN.md` first — it carries the reasoning, the gap-fill and audit
 sequence diagrams, and the operating runbook. This section is only the current
@@ -292,7 +299,10 @@ state.
   compare-and-swap in the trait, deliberately: each node writes only its own
   key. The offline suite steps several coordinators through one registry and
   asserts disjointness after every pass.
-- **`ma-server`** — axum SSE with correct `Lagged` handling, `/metrics`,
+- **`ma-server`** — v4 adds `gateway`: a pure `merge` (no I/O, no clock read,
+  like `ma-core` and `ma_coord::assign`), an SSE *client* per node reusing the
+  ingest tasks' backoff, and its own HTTP surface. Otherwise: axum SSE with
+  correct `Lagged` handling, `/metrics`,
   `/cluster`, a self-contained chart page with L2 ladders, rolling-window rows
   and the consolidated touch, the cluster supervisor that starts and stops
   streams as ownership moves, three binaries (`ma-server`, `record`, `replay`)
@@ -374,7 +384,10 @@ a root login session.
 An S3-backed cluster registry is now unblocked. It needs only PutObject,
 ListObjects and DeleteObject — deliberately no conditional write.
 
-**Next up:** v4's last item — a gateway merging every node's snapshot.
+**Next up:** the gateway is a single point of failure and nothing elects a
+second one; rolling windows do not cross nodes (merging *coverage* is harder
+than merging a touch); and each node archives its own share, so an hour of
+"everything" is a union of prefixes. `docs/DESIGN.md` §15.
 
 ## Non-goals
 

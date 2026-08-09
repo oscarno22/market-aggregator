@@ -79,7 +79,7 @@ use std::fmt;
 use std::time::Duration;
 
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::book::{BookState, Integrity, TopOfBook};
 use crate::event::VenueId;
@@ -109,7 +109,7 @@ impl Default for CrossPolicy {
 }
 
 /// One side of the consolidated touch, and where it came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrossLeg {
     pub venue: VenueId,
     pub price: Price,

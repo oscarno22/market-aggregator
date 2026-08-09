@@ -25,7 +25,9 @@ use crate::time::IngestTime;
 ///
 /// Ordered weakest to strongest, and `Ord` is derived deliberately: a view that
 /// combines venues can take the minimum and report the truth about the whole.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Integrity {
     /// **Bitstamp.** Diffs carry a microtimestamp and nothing else. We can tell

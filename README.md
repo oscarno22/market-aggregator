@@ -40,11 +40,19 @@ just serve coinbase,kraken,bitstamp BTC-USD,ETH-USD
 ```
 
 Or shard those six streams across two processes, neither ever running the same
-one:
+one — then merge them back into one view:
 
 ```bash
 just cluster
 ```
+
+```bash
+just gateway
+```
+
+The gateway is the only place two things are visible: a consolidated touch over
+*every* venue rather than over the venues one node happens to own, and a stream
+two nodes both claim.
 
 Endpoints: `/` the page, `/events` SSE, `/metrics` Prometheus text,
 `/api/snapshot` one JSON reading, `/health`.
@@ -246,7 +254,7 @@ a Parquet archive the process can replay itself from, rolling indicators that
 state their own coverage, a cross-venue consolidated touch, and streams sharded
 across nodes by a lease coordinator.
 
-**298 tests, clippy-clean at `-D warnings`, and the whole suite runs offline** —
+**337 tests (339 with `--features s3`), clippy-clean at `-D warnings`, and the whole suite runs offline** —
 including the multi-node cluster simulation, which steps several coordinators
 through one registry and asserts that no two ever hold the same stream.
 
@@ -282,13 +290,19 @@ Deliberately unfinished, and stated rather than hidden:
   project's own IAM user cannot `DeleteObject`, so a clean withdrawal is
   refused; that costs a lease's wait on handover and nothing else, because a
   node that cannot withdraw is exactly a node that was `kill -9`'d.
-- **Nothing merges the nodes.** Each node serves its own page and its own share
-  of the streams; `/cluster` says who has what. A gateway that re-consolidates
-  across nodes inherits the whole cross-venue timing problem across a network
-  hop instead of a socket, which makes it a separate piece of work rather than
-  a flag.
+- ~~Nothing merges the nodes.~~ **Done.** `just gateway` follows every node's
+  SSE, re-consolidates, and serves the same page and JSON shape a node does. It
+  is also the only place a doubly-owned stream is visible — measured live
+  against two clustered nodes plus a rogue process, it named all six.
 
-Next: v4's last item — a gateway that merges every node's snapshot.
+- **The gateway is a single point of failure.** It holds no state a node does
+  not, so a second one is just a second process — but nothing elects one, and
+  two behind a load balancer would serve views differing by a tick.
+- **Rolling windows do not cross nodes.** The gateway merges instants. A window
+  spanning nodes would have to merge *coverage* too, and `trusted_ms` from two
+  machines is two clocks' worth of trust.
+
+v1 through v4 are complete.
 
 ## Non-goals
 

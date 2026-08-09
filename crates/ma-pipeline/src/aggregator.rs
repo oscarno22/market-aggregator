@@ -41,7 +41,8 @@ use ma_core::{
     WindowSpec,
 };
 use ma_venues::{Outcome, VenueBook, VenueSpec};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -82,7 +83,7 @@ pub const DEFAULT_DEPTH_LEVELS: usize = 10;
 
 /// What a book is, in one word, for a consumer that does not want to match on
 /// [`BookState`]'s payloads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BookStatus {
     /// No data. Different from bad data.
@@ -94,7 +95,7 @@ pub enum BookStatus {
 }
 
 /// One venue's view at snapshot time.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VenueView {
     pub venue: VenueId,
     pub status: BookStatus,
@@ -169,7 +170,7 @@ pub struct VenueView {
 /// meaningful *within* a symbol: the weakest integrity across BTC-USD says
 /// nothing about ETH-USD, and a UI that mixed them would invite exactly the
 /// wrong reading.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SymbolView {
     pub symbol: String,
     /// The weakest integrity among this symbol's live books, or `None` if none
@@ -195,7 +196,7 @@ pub struct SymbolView {
 /// docs on why a JSON number would undo the exact-decimal discipline), and an
 /// exclusion reason is read by a person deciding what to do, not by a machine
 /// matching on a tag.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CrossView {
     pub bid: Option<CrossLeg>,
     pub ask: Option<CrossLeg>,
@@ -222,17 +223,25 @@ pub struct CrossView {
     /// deliberately: CLAUDE.md requires that *any cross-venue comparison
     /// surfaced in the UI* name its clock, and this object is the one thing in
     /// the snapshot most likely to be pulled out and rendered on its own.
-    pub clock: &'static str,
+    ///
+    /// `Cow` so that producing a snapshot still costs nothing — it is always
+    /// `Borrowed(INGEST_MONOTONIC)` here — while a *reader* can still own one.
+    /// v4's gateway parses other nodes' snapshots, and a field typed
+    /// `&'static str` cannot be deserialised at all. Kept as data rather than
+    /// substituted on read, because a node reporting a different clock is a
+    /// real disagreement and silently overwriting it would hide exactly the
+    /// thing this field exists to surface.
+    pub clock: Cow<'static, str>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExclusionView {
     pub venue: VenueId,
     pub reason: String,
 }
 
 /// Everything the fan-out publishes, once per tick.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     /// Monotonic per process, so a client that skipped ahead after a
     /// `Lagged` can say how far it jumped instead of pretending it did not.
@@ -241,8 +250,9 @@ pub struct Snapshot {
     pub wall_unix_ms: u64,
     /// Which clock every `_ms` duration in this snapshot was measured on.
     /// Published rather than documented, per CLAUDE.md's rule that any
-    /// surfaced comparison must name its clock.
-    pub clock: &'static str,
+    /// surfaced comparison must name its clock. See [`CrossView::clock`] on
+    /// why this is a `Cow`.
+    pub clock: Cow<'static, str>,
     /// One entry per symbol this process tracks, in a stable order.
     pub symbols: Vec<SymbolView>,
     /// The ingest channel's occupancy and lifetime drop count. Process-wide:
@@ -266,7 +276,8 @@ impl Snapshot {
     }
 }
 
-const INGEST_MONOTONIC: &str = "ingest_monotonic";
+/// The clock every `_ms` in a node's own snapshot is measured on.
+pub const INGEST_MONOTONIC: &str = "ingest_monotonic";
 
 /// Per-venue bookkeeping the aggregator keeps alongside the book itself.
 #[derive(Debug)]
@@ -770,12 +781,16 @@ impl Aggregator {
         Snapshot {
             seq: self.seq,
             wall_unix_ms: unix_millis(now.wall()),
-            clock: INGEST_MONOTONIC,
+            clock: Cow::Borrowed(INGEST_MONOTONIC),
             symbols: by_symbol
                 .into_iter()
                 .map(|(symbol, venues)| SymbolView {
                     weakest_integrity: venues.iter().filter_map(|v| v.integrity).min(),
-                    cross: cross_view(tops.remove(&symbol).unwrap_or_default(), self.cross_policy),
+                    cross: cross_view(
+                        tops.remove(&symbol).unwrap_or_default(),
+                        self.cross_policy,
+                        Cow::Borrowed(INGEST_MONOTONIC),
+                    ),
                     symbol: symbol.to_string(),
                     venues,
                 })
@@ -786,7 +801,18 @@ impl Aggregator {
 }
 
 /// Consolidate one symbol's books and render the result for the wire.
-fn cross_view(tops: Vec<(VenueId, TopOfBook)>, policy: CrossPolicy) -> CrossView {
+///
+/// Public because v4's gateway re-consolidates across nodes and must produce
+/// the *same* shape from the same core function. A second conversion written
+/// beside this one would be correct on the day it was written and wrong on
+/// some later day — the argument this project keeps making about duplicated
+/// logic, and the reason `clock` is a parameter rather than a constant here:
+/// the gateway's ages are measured differently and have to say so.
+pub fn cross_view(
+    tops: Vec<(VenueId, TopOfBook)>,
+    policy: CrossPolicy,
+    clock: Cow<'static, str>,
+) -> CrossView {
     let cross = ma_core::consolidate(tops, policy);
     CrossView {
         bid: cross.bid,
@@ -807,7 +833,7 @@ fn cross_view(tops: Vec<(VenueId, TopOfBook)>, policy: CrossPolicy) -> CrossView
                 reason: e.reason.to_string(),
             })
             .collect(),
-        clock: INGEST_MONOTONIC,
+        clock,
     }
 }
 

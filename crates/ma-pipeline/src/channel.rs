@@ -78,7 +78,7 @@ impl<T> std::fmt::Debug for Inner<T> {
 /// `dropped` is the one CLAUDE.md calls out specifically: "a silent drop
 /// policy is a bug." Wiring this into `/metrics` is what keeps it from being
 /// one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChannelMetrics {
     pub len: usize,
     pub capacity: usize,

@@ -1,6 +1,7 @@
 //! Recovery, proven against a recording of real reconnects.
 //!
-//! This is the artefact `docs/DESIGN.md` §14 listed as missing since v1. The
+//! This is the artefact `docs/DESIGN.md` listed as missing since v1 — see §4's
+//! "What a recorded reconnect proves". The
 //! gap-fill state machine had two kinds of evidence and neither was this one:
 //! the scripted fake venue, which proves the *logic* against messages someone
 //! wrote by hand, and two live tapes, which prove the *parsers* against real
