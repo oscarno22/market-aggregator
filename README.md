@@ -237,11 +237,15 @@ runbook that says what to do when each metric moves.
 
 ## Status
 
-v1 and v2 are complete: three venues, multi-symbol, full L2 depth, reconnect
-with gap-fill, the periodic integrity audit, SSE and a page, metrics, and a
-Parquet archive the process can replay itself from.
+v1, v2 and v3 are complete: three venues, multi-symbol, full L2 depth,
+reconnect with gap-fill, the periodic integrity audit, SSE and a page, metrics,
+a Parquet archive the process can replay itself from, rolling indicators that
+state their own coverage, a cross-venue consolidated touch, and streams sharded
+across nodes by a lease coordinator.
 
-**235 tests, clippy-clean at `-D warnings`, and the whole suite runs offline.**
+**298 tests, clippy-clean at `-D warnings`, and the whole suite runs offline** —
+including the multi-node cluster simulation, which steps several coordinators
+through one registry and asserts that no two ever hold the same stream.
 
 Deliberately unfinished, and stated rather than hidden:
 
@@ -260,6 +264,14 @@ Deliberately unfinished, and stated rather than hidden:
   The trait needs only `PutObject`, `ListObjects` and `DeleteObject` —
   deliberately no conditional write — so it is a small addition behind the same
   gate.
+- **Nothing merges the nodes.** Each node serves its own page and its own share
+  of the streams; `/cluster` says who has what. A gateway that re-consolidates
+  across nodes inherits the whole cross-venue timing problem across a network
+  hop instead of a socket, which makes it a separate piece of work rather than
+  a flag.
+
+Next: v4 — a cross-node view, symbol-partitioned Parquet, and a tape recorded
+across a real reconnect.
 
 ## Non-goals
 

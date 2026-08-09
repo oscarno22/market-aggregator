@@ -3,7 +3,7 @@
 //! # What this replay can and cannot prove
 //!
 //! `ma-pipeline`'s raw-frame tape and this are **two layers, not two copies**,
-//! and CLAUDE.md §4 is explicit that neither replaces the other. The difference
+//! and CLAUDE.md §6 is explicit that neither replaces the other. The difference
 //! is what evidence survives:
 //!
 //! - A **tape** stores bytes, before parsing. It can therefore reproduce a

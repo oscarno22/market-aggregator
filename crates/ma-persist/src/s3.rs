@@ -36,7 +36,7 @@
 //! # Status
 //!
 //! Written, compiled under `--features s3`, and **not yet exercised against a
-//! live bucket** — see `docs/DESIGN.md` §9. The `ObjectStore` contract it
+//! live bucket** — see `docs/DESIGN.md` §10. The `ObjectStore` contract it
 //! implements is proven by `LocalStore` and by the round-trip tests; what is
 //! unproven is this file's behaviour against real S3 semantics, which no
 //! amount of local testing can establish.
@@ -149,7 +149,7 @@ fn check_interlock(ack: Option<&str>) -> Result<(), StoreError> {
     Err(StoreError::Config(format!(
         "refusing to write to S3 without {ACK_VAR}=1. Set it only once an IAM \
          user scoped to this one bucket prefix has replaced any root \
-         credentials — see CLAUDE.md's sequencing rule and docs/DESIGN.md §9. \
+         credentials — see CLAUDE.md's sequencing rule and docs/DESIGN.md §10. \
          Note that this process cannot verify the scoping; setting the \
          variable asserts it."
     )))

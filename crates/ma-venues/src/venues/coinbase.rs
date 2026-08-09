@@ -21,7 +21,7 @@ struct Envelope {
     channel: String,
     sequence_num: u64,
     /// Coinbase's own clock, RFC 3339. Reported as skew, never trusted for
-    /// ordering — see `docs/DESIGN.md` §6. Optional and untyped-until-parsed
+    /// ordering — see `docs/DESIGN.md` §7. Optional and untyped-until-parsed
     /// for the same reason every other field here is: a venue dropping or
     /// reformatting a decorative field must not fail the frame that carries
     /// the book.

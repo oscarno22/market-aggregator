@@ -619,6 +619,18 @@ hoping.
 | Parquet prices as **strings** | Arrow `Decimal128`, or floats | `Decimal128` fixes one scale per column and these venues do not share one. Kraken's checksum covers the digits it sent, trailing zeros included; a column-wide scale would silently rewrite them. |
 | Parquet: one row per **level** | one row per event, levels nested in a `list<struct>` | A file nobody can query is just an expensive tape, and the tape is better at being a tape. Flat rows make "what was on the book at 03:14" a predicate rather than an unnest. |
 | Parquet teed from the **aggregator** | a second consumer of the raw-frame channel | A second consumer would have to duplicate every `VenueSync` and would eventually disagree with the first. Teeing after normalisation means the archive is the same event sequence the live books were built from. |
+| Window coverage as `trusted_ms` + `span_ms` | a single `coverage` fraction | Two integers say *which* of the two is unusual — a young process and a flapping book both read 0.5. A fraction also invites `f64` into a crate that lints against it. |
+| `range_bps` as the volatility figure | realised volatility (stdev of log returns) | Needs a log and a square root, so `f64`, so the exact-decimal discipline breaks at the last step. The range is cruder, exact, and assumes no distribution. |
+| One bucket ring per stream, shared by every span | one sample buffer per configured span | Memory becomes `O(longest / resolution)` instead of `O(updates_per_sec × longest)` — kilobytes rather than megabytes per stream on Coinbase — and a fourth window costs nothing at ingest. |
+| Window readings exclude the in-progress bucket | include it, partially filled | Makes `span_ms` exactly a whole number of buckets rather than "about `S`, plus however far into the current one we are". Costs one tick of lag; buys an assertable boundary. |
+| Cross-venue staleness measured on **book age** | time since the touch last moved | Measured: the v1 tape carries 49,940 Coinbase level updates with the touch unchanged throughout. On a gap-free incremental feed a touch that has not moved *has not changed* — the venue would have sent a delta. Touch age would read a healthy feed as a minute stale. |
+| A cross-venue cross is not a desync | route it into `DesyncReason` like a crossed book | Within one venue, bid ≥ ask is proof of misapplication. Across venues it is an ordinary market state; wiring them together would reconnect every stream whenever two exchanges disagreed by a basis point. |
+| Rendezvous hashing for assignment | `hash(stream) % nodes.len()` | Modulo reshuffles ~two thirds of assignments when a third node joins, against the third that must move. Every reassignment here is a disconnect and a resync against a venue that bans for reconnect storms. |
+| A hand-written FNV+SplitMix hash | `DefaultHasher` | SipHash keys are not specified to be stable across a rebuild, a Rust version, or a process. Two nodes would compute *different* assignments from the *same* membership and both claim a stream — the exact failure the lease design prevents, reintroduced above it. |
+| Lease expiry enforced by the **holder** | readers decide who is alive | Safe only if the dead node agrees it is dead. A node partitioned from the registry has healthy sockets, live books, and no way to be told. |
+| A settling period on join | acquire as soon as the assignment says so | Covers the mirror case: a joining node seeing `{A,B}` before A has seen B. See §13. |
+| Lease registry with no compare-and-swap | conditional writes, or `etcd` | Each node writes only its own key, so there is nothing to serialise. That is what makes a plain directory a complete implementation — and what would make an object store one. |
+| No Kafka, and now no etcd | a consensus system for membership | Revisited at v3 as CLAUDE.md asked. The problem is membership, not a log, and membership by lease needs a clock and one writable key per node. |
 | S3 behind a default-off feature | always compiled | Makes CLAUDE.md's "nothing touches AWS before v2" structural rather than remembered: the offline suite cannot acquire a dependency on credentials. |
 
 ### What the live tape found that fixtures did not
@@ -638,6 +650,36 @@ Worth recording, because it is the argument for the tape recorder existing:
 All three fixture suites were green throughout. A fixture author writes the
 messages they are thinking about.
 
+### What the *second* tape found, while v3 was being built
+
+Two more, and both are the same lesson at a different layer — a thing that is
+only observable over a long enough run against real traffic.
+
+4. **A matching checksum was being read as a state transition.** Transitions
+   are detected by comparing whole `BookState` values, and `Live` carries
+   `last_verified`, which `mark_verified` advances every time Kraken's CRC32
+   matches. Kraken produced 1006 "book is live" INFO lines for 1108 messages,
+   and `status_since` reset on every one — so a Kraken book healthy for two
+   minutes reported having been live for however long since its last message.
+   Coinbase and Bitstamp publish no checksum, so neither showed it. It needs a
+   *stream* of matching checksums against a book that stays live, which no
+   fixture produces. `BookState::same_status` is the comparison that was
+   actually wanted; `PartialEq` stays exact.
+
+5. **Realtime replay drifted one timer tick per frame.** Pacing slept for the
+   *gap* between consecutive frames, and a sleep may only overshoot, so every
+   frame added a debt never repaid. On a 5827-frame tape that reached ~7
+   seconds by the halfway point, and because replayed frames carry
+   reconstructed `IngestTime` while the aggregator reads a real clock, **every
+   book reported a seven-second age while frames arrived normally**. The page
+   greyed every card, and §12's staleness guard excluded every venue. Now
+   scheduled against a fixed origin, so a late frame catches up instead of
+   pushing everything after it further back.
+
+The second is the more uncomfortable of the two: the bug was in the *test
+harness* — the thing every offline claim in this document rests on — and it
+presented as a bug in the system under test.
+
 ---
 
 ## 9. Operating it
@@ -650,10 +692,14 @@ just archive /var/lib/market-data                     # serve, and keep the hist
 just demo tapes/<tape>.jsonl.gz # replay a recording at its original pace, with the page
 just replay-archive /var/lib/market-data              # replay the Parquet archive
 just record coinbase,kraken,bitstamp BTC-USD 60       # capture a new tape (needs network)
+just cluster                    # two nodes sharding the streams, :8081 and :8082
+just cluster-status             # who owns what, across a running cluster
 ```
 
 Endpoints: `/` the page, `/events` SSE, `/metrics` Prometheus text,
-`/api/snapshot` one JSON reading, `/health`.
+`/api/snapshot` one JSON reading, `/cluster` this node's view of the cluster
+(404 when not clustered — "not configured" and "cannot see the cluster" are
+different situations), `/health`.
 
 ### What each metric means, and what to do when it moves
 
@@ -673,6 +719,15 @@ Endpoints: `/` the page, `/events` SSE, `/metrics` Prometheus text,
 | status `desynced`, reason `depth audit disagreed` | Two consecutive audits found the same book wrong. On Bitstamp this is the *only* loss signal that exists. | The resync has already been requested. If it recurs after a fresh snapshot, the fault is in our application logic, not the venue's stream. |
 | `ma_audit_failures_total` climbing, `ma_audits_total` flat | The audit endpoint is unreachable. The book is **unchecked**, not wrong. | Nothing is broken yet, but the venue's weakest guarantee is now the only one in force. Check the REST host before assuming the feed is fine. |
 | `ma_book_levels` far larger than the served depth | Normal, and worth understanding. Coinbase holds five figures of depth while serving ten levels. | Nothing. A *small* number here on Coinbase or Bitstamp would be the surprise — it would mean the book is being pruned, which is unsafe on a full-depth feed. |
+| `ma_window_trusted_ms` well below `ma_window_span_ms` | Every other window series for that stream covers less time than its label says. | Not a fault on its own — it is the *correct* reading during and after a desync. It becomes one if it persists on a book whose `status` has been `live` throughout, which would mean the coverage accounting and the book disagree. |
+| A window gauge missing entirely for a stream | No trusted two-sided sample landed in it. | Expected at startup and during a resync. The series is absent rather than `0` on purpose: Prometheus cannot express "unknown" inside a sample, and a zero range would draw as a flat line where the honest rendering is a gap. |
+| `ma_cross_spread_bps` negative | The venues' books are crossed: highest bid above lowest ask. **Apparent** arbitrage. | Read `ma_cross_oldest_leg_ms` beside it — the two quotes were never simultaneous — and remember it is gross of taker fees on both legs, of latency, and of transfer time. A persistent large one is far more likely to be a bug in one venue's book than free money. |
+| `ma_cross_venues_used` below the venue count | Some venue is untrusted or stalled and is excluded from the consolidated touch. | `/api/snapshot` names each exclusion and its reason. A view that has quietly narrowed to one venue looks exactly like one drawn from three, which is why this is published beside every cross-venue number. |
+| `ma_cluster_owned_streams` summed over nodes **exceeds** the configured stream count | Two nodes are running one stream. **The one thing the coordination layer exists to prevent.** | Serious: duplicate subscriptions against venues that ban for it, and doubled metrics under identical labels. Check that every node was started with the same `--symbols`/`--venues` — the assignment is a pure function of that list and nothing can verify it from inside one process — and that no two nodes share a `--node-id`. |
+| ...summed over nodes **below** the configured count | Some stream is running nowhere. | The deliberately-preferred failure: loud, and visible as `uninitialized`. Normal for `ttl + guard` after a node joins or dies. If it persists, look at `ma_cluster_stood_down`. |
+| `ma_cluster_stood_down` is 1 | This node released everything because it could not complete a registry round trip within `ttl - guard`. | **Alert on this, not on `owned_streams` being zero** — a node given no work and a node that went blind look identical by stream count. Its sockets were fine; the registry was not. Check the cluster directory's permissions and mount. |
+| `ma_cluster_last_contact_ms` climbing | Registry round trips are failing. At `ttl - guard` the node stands down. | The early warning for the row above. |
+| `ma_cluster_members` disagreeing between nodes | Normal for one renewal interval after a change; a lasting disagreement means one node cannot read what another can write. | The lease argument tolerates this — it is exactly what holder-side expiry and the settling period cover — but a *persistent* split means the registry is not the shared thing it is assumed to be. |
 | `ma_book_age_ms` large, status still `live` | Nothing has invalidated the book, but nothing is updating it either. | On a live feed the idle watchdog should have fired; if it has not, check that the heartbeat subscription is actually established. |
 
 ### A note on restarts
@@ -705,7 +760,7 @@ coupling the bounded channel exists to prevent.
 
 ---
 
-## 10. Where this stops
+## 10. What v2 left unproven
 
 v1 and v2 are complete: three venues, any number of symbols, full L2 depth,
 reconnect with gap-fill, a periodic integrity audit, the three book states, SSE
@@ -745,18 +800,208 @@ the way `LocalStore`'s rename does. No amount of local testing establishes any
 of that. The first run against a real bucket is a Tier 3 exercise and should be
 treated as one.
 
+---
+
+## 11. Rolling windows, and the coverage every one of them carries
+
+v1 and v2 published *instantaneous* readings. A window answers the second
+question anyone asks — how much has it moved — and it does so by making a claim
+about a stretch of time.
+
+**That claim is usually false, and predictably so.** A "60-second high" over a
+book that spent twenty of those seconds `Desynced` is a 40-second high wearing a
+60-second label. It is not an edge case: every reconnect and every sequence gap
+puts a hole in a window, and a Bitstamp book is `Desynced` for its first REST
+round trip by construction.
+
+So every reading carries `trusted_ms` beside `span_ms`, and the weakest
+`Integrity` it sampled under. It is `weakest_integrity`'s argument one dimension
+over: a window spanning a reconnect can hold samples taken under two different
+guarantees, and reporting the stronger is the lie `Ord` on `Integrity` exists to
+prevent. A window with nothing in it is `None` everywhere rather than zero.
+
+Coverage is accounted by **interval**, not by sample. A book silently desynced
+for 900ms between two updates has 900ms of untrusted time whether or not
+anything was sampled during it; a counter incremented per observation would
+report a silent desynced book as perfectly covered.
+
+```
+resolution ──►  │ b0 │ b1 │ b2 │ b3 │ b4 │ b5 │ b6 │ b7 │ b8 │
+                └────┴────┴────┴────┴────┴────┴────┴────┴────┘
+ 1s window                          ╰──────── 4 ────────╯  ▲
+10s window      ╰──────────── 8 (and more) ────────────╯   │
+                                                  in progress,
+                                                    excluded
+```
+
+One bucket ring per stream, sized to the longest span; a window of span `S` is
+its last `ceil(S/resolution)` **completed** buckets. Adding a span costs nothing
+at ingest and nothing in memory. Excluding the in-progress bucket is what makes
+`span_ms` exactly a whole number of buckets rather than "about `S`, plus however
+far into the current one we are" — one tick of lag, bought for an assertable
+boundary.
+
+Sampling happens per applied message, not per publish tick: a tick-sampled high
+on a book updating hundreds of times a second misses most of what it claims to
+measure.
+
+---
+
+## 12. The consolidated touch, and the arbitrage it appears to show
+
+Highest bid and lowest ask across venues. Usually an ordinary spread, tighter
+than any single venue's. Occasionally the bid is *above* the ask and the books
+are crossed.
+
+This is the most misreadable number the system publishes, and it is §5's problem
+one layer up: there, a REST snapshot from instant `T` was compared against a
+websocket book at `T + δ`; here, two different venues' books are compared, and
+they were never observed at the same instant either.
+
+```mermaid
+flowchart LR
+  CB["Coinbase<br/>live, 12ms"] --> F{"eligible?"}
+  KR["Kraken<br/>live, 367ms"] --> F
+  BS["Bitstamp<br/>desynced"] --> F
+  ST["a stalled venue<br/>live, 5s old"] --> F
+  F -->|"trusted and fresh"| C["max bid / min ask"]
+  F -->|"untrusted"| X["excluded, with the reason"]
+  F -->|"older than max_age"| X
+  C --> O["signed spread_bps<br/>+ integrity_floor of the legs used<br/>+ age of the older leg<br/>+ the clock label"]
+```
+
+Three rules make it evidence rather than noise:
+
+1. **Only trusted books participate.** A `Desynced` book retains its last
+   contents deliberately, and those contents are exactly what an unguarded `max`
+   picks up — a frozen aggressive bid showing a standing arbitrage against every
+   healthy venue beside it.
+2. **A stalled book does not participate.** Not because a quiet book is wrong,
+   but because a stalled one is: its touch is a quote from a market that has
+   since moved. `max_age` (2s) sits far beyond a healthy inter-update gap and
+   inside the tightest idle watchdog — the window where a socket has gone quiet
+   but nothing has reconnected it yet.
+3. **The integrity floor is taken over the legs used, not the venues present.**
+   A spread whose ask came from Bitstamp is an order-only number whatever the
+   bid's venue proves; and a desynced third venue must not drag down a figure it
+   contributed nothing to.
+
+The tempting refinement — measuring staleness as *time since the touch last
+moved* — is wrong, and the v1 tape is the counter-example: 49,940 Coinbase level
+updates with the touch unchanged throughout. On a gap-free incremental feed a
+touch that has not moved has not *changed*.
+
+And a cross here never desyncs anything. Within one venue, bid ≥ ask is proof of
+misapplication; across venues it is an ordinary market state.
+
+---
+
+## 13. Sharding, and a safety argument instead of a consensus system
+
+One process holding every stream is right at a handful of symbols. At fifty,
+three venues is 150 sockets on one node — and §2 has always named sharding as
+the honest answer rather than multiplexing away the isolation §4's recovery path
+depends on.
+
+**The property:** at most one node runs a given stream. Its dual — every stream
+running somewhere — is weaker in consequence, and the asymmetry is the design.
+An unowned stream is loudly `uninitialized`; a doubly-owned one looks fine from
+every angle until the venue starts refusing connections. **Prefer the visible
+gap to the silent duplicate** — the same judgement `Desynced` makes about a
+book.
+
+Two pieces. *Which node owns which stream* is a pure function of the live
+membership (rendezvous hashing), so every node computes the same answer without
+talking to any other — that is what removes the need for a leader. *Who is a
+member* is a lease, and each node writes exactly one key: its own. No node ever
+writes a key another node writes, so there is nothing to serialise and no
+compare-and-swap anywhere, which is why a plain directory is a complete
+registry.
+
+What replaces agreement is a lease argument with two halves.
+
+**Half one: expiry is enforced by the holder.** Letting readers decide who is
+alive is safe only if the dead node agrees it is dead — and a node partitioned
+from the registry knows nothing has happened. Its sockets are fine, its books
+are live, and it keeps publishing. So a node releases *everything* if a complete
+round trip has not succeeded within `ttl - guard`, while no reader can observe
+expiry before `ttl`.
+
+```mermaid
+sequenceDiagram
+  participant A as node-a
+  participant R as registry
+  participant B as node-b
+  Note over A,B: a is running the stream
+  A--xR: renewals start failing
+  Note over A: sockets fine, books live,<br/>nothing will ever tell it
+  A->>A: ttl - guard: release EVERYTHING
+  R->>B: a's record expired (ttl)
+  B->>B: takes the stream
+  Note over A,B: disjoint by `guard`, on a's own monotonic clock
+```
+
+**Half two: a joining node waits.** The mirror case is the one that looks safe:
+B starts, sees `{A, B}`, and takes a stream A is still running because A's reads
+happen to be failing. So a node acquires nothing until `ttl + guard` after its
+own first successful announcement. The argument: B's record is durable from
+`t_write`, so any successful membership read after `t_write` returns B; if A
+never releases by recomputing, A had no successful round trip after `t_write`,
+so A's own deadline is `t_ok + ttl - guard` for some `t_ok < t_write`, and A
+therefore releases strictly before B can acquire. Disjoint by `2 × guard`.
+
+The argument depends on the hold deadline being extended only by a **complete**
+round trip — announce *and* read. A node that can write but not listen would
+otherwise keep renewing its right to hold streams it can no longer be told to
+release.
+
+Both halves are load-bearing, and the offline suite proves it the only way that
+means anything: reverting either one makes the disjointness assertion in
+`ma-coord/tests/cluster.rs` fire, naming the overlapping streams. Those tests
+step several coordinators through one in-process registry against a `TestClock`
+and check after *every* pass, because a violation lasting 250ms in production is
+a venue ban and a fortnight of wondering why.
+
+The clock split is §7's, one layer up: the record carries a **wall** timestamp
+because other machines have to compare it, and the holder's own deadline is
+**monotonic** so an NTP step cannot extend its lease.
+
+Two things nothing in the process can check, so they are stated instead. Every
+node must be started with the same `--symbols` and `--venues`, because the
+assignment is a pure function of that list. And two processes must never share
+a `--node-id`, because they would share a lease and each would renew the
+other's.
+
+**CLAUDE.md said to revisit Kafka at v3 sharding. Revisited, and declined.** The
+coordination problem here is membership, not a log, and membership by lease
+needs a clock and one writable key per node.
+
+---
+
+## 14. Where this stops
+
+v1, v2 and v3 are complete. What v3 added:
+
+| | Status |
+|---|---|
+| Rolling indicators over configurable windows | Done, with coverage and an integrity floor on every reading; verified against a live tape |
+| Cross-venue consolidated touch | Done, with exclusions published rather than hidden |
+| Sharding across nodes with a coordination layer | Done, and verified live — two nodes, a `kill -9`, and a registry made unreadable under six healthy sockets |
+
 ### Not built yet, in the order the plan puts them
 
-- **v3** — sharding venues across nodes with a coordination layer; rolling
-  indicators over configurable windows; a cross-venue spread view. That last
-  one must surface `Integrity` beside every number it derives, or it will lie —
-  the machinery for that already exists (`SymbolView::weakest_integrity`) and
-  the page already uses it per symbol.
+- **S3, still.** The store and — now — a cluster registry both want it, and
+  both wait on the same gate: an IAM user scoped to one bucket prefix. See §10.
+- **A tape recorded across a real reconnect.** Both committed tapes are clean
+  runs with zero session boundaries. The reconnect path is proven against the
+  fake venue and the audit against live venues, but not from a recording of a
+  real outage — the artefact that would make those paths as well-evidenced as
+  the parsers now are.
 - **Symbol-partitioned Parquet.** Today symbol is a column, not a partition,
   which is right at this volume and stops being right once one symbol's hour is
   large enough to be worth skipping whole.
-- **A tape recorded across a real reconnect.** The committed tape is a clean
-  60 seconds. The reconnect and audit paths are proven against the fake venue
-  and, for the audit, against live venues — but not yet from a recording of a
-  real outage, which is the artefact that would make those paths as
-  well-evidenced as the parsers now are.
+- **A cross-node view.** Each node serves its own page and its own share of the
+  streams; nothing merges them. A gateway subscribing to every node's SSE and
+  re-consolidating is the obvious shape, and it inherits §12's whole problem
+  across a network hop rather than a socket — which is why it is a separate
+  piece of work rather than a flag.

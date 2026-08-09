@@ -44,7 +44,7 @@ pub fn system_time_from_micros(micros: u64) -> SystemTime {
 /// in a full calendar library to read one field would be a poor trade, because
 /// the field is only ever *reported*, never used for a decision.
 ///
-/// That last point is what makes this safe to hand-roll. `docs/DESIGN.md` §6 is
+/// That last point is what makes this safe to hand-roll. `docs/DESIGN.md` §7 is
 /// categorical: venue timestamps are never used for ordering, windowing, or
 /// book age, because venues disagree by seconds and some are simply wrong. So
 /// the worst a bug here can do is misreport observed clock skew and write a

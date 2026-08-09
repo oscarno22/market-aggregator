@@ -159,7 +159,7 @@ fn the_venue_clock_is_reported_on_updates_and_absent_from_snapshots() {
     // Kraken puts its timestamp inside each `data` entry, and only on
     // `update` messages. A field that appears on some messages and not others
     // could not order anything even if we were willing to trust it -- which
-    // `docs/DESIGN.md` §6 says we are not.
+    // `docs/DESIGN.md` §7 says we are not.
     let mut vb = book();
     let snapshot = vb.feed(&frame(fixture!("snapshot.json"))).unwrap();
     assert!(

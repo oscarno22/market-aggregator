@@ -160,7 +160,7 @@ impl fmt::Debug for RawFrame {
 /// invite the two copies to disagree.
 ///
 /// It exists to be **measured, never trusted**. `ma_core::MarketEvent`'s docs
-/// and `docs/DESIGN.md` §6 are emphatic: venues disagree by seconds and some
+/// and `docs/DESIGN.md` §7 are emphatic: venues disagree by seconds and some
 /// are simply wrong, so nothing orders or windows by this. It is carried so
 /// clock skew is observable and so the persistence layer can write a column
 /// that says what the venue claimed, next to the column that says what we

@@ -20,7 +20,7 @@
 //!   same reason, and the two agreeing is not a coincidence — a second answer
 //!   to a solved question would be the mistake.
 //! - [`VENUE_TS`] — the venue's own claim, nullable. Never ordered by, never
-//!   windowed on, present so skew can be measured. `docs/DESIGN.md` §6.
+//!   windowed on, present so skew can be measured. `docs/DESIGN.md` §7.
 //!
 //! # Why prices are strings
 //!

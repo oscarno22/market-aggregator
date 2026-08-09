@@ -269,7 +269,7 @@ fn the_venue_clock_is_reported_but_never_used_for_ordering() {
     assert_eq!(nanos, 1_786_190_400_000_000_000, "2026-08-08T12:00:00Z");
 
     // And the rule that makes carrying it safe: ordering and book age come off
-    // `ingest_ts`, never this. `docs/DESIGN.md` §6.
+    // `ingest_ts`, never this. `docs/DESIGN.md` §7.
     assert_ne!(
         event.ingest_ts.wall(),
         venue_ts,

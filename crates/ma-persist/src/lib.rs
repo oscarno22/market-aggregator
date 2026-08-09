@@ -3,7 +3,7 @@
 //!
 //! # Where this sits relative to the tape
 //!
-//! CLAUDE.md §4 says replay is **two layers, not one**, and that neither
+//! CLAUDE.md §6 says replay is **two layers, not one**, and that neither
 //! replaces the other. This crate is the second layer. The first —
 //! `ma_pipeline::tape` — records raw bytes before parsing, which is the only
 //! way a recorded session can reproduce a parser bug or a venue schema change.
