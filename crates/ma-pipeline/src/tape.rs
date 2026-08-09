@@ -435,19 +435,33 @@ where
     C: Clock + ?Sized,
 {
     let base = clock.now();
-    let mut previous_elapsed = Duration::ZERO;
+    // Every deadline is measured from one fixed origin, and the frame's own
+    // recorded offset is what places it. The obvious alternative — sleep for
+    // the *gap* since the previous frame — accumulates error instead of
+    // correcting it: `sleep` may only overshoot, and the work between frames
+    // adds to every overshoot, so the lag is monotonically increasing and
+    // permanent.
+    //
+    // Measured on a three-minute, 5827-frame tape, that came to about seven
+    // seconds by the halfway point: every book reported a seven-second age
+    // while frames were arriving normally, `just demo` ran materially slower
+    // than "the recording's original pace", and anything downstream that acts
+    // on book age — the page greying a stale card, v3's cross-venue staleness
+    // guard — misread a healthy replay as a stalled feed. Scheduling against
+    // the origin makes a late frame catch up rather than push everything after
+    // it further back.
+    let origin = tokio::time::Instant::now();
     let mut stats = ReplayStats::default();
 
     while let Some(taped) = reader.next_frame().await? {
         let elapsed = taped.elapsed;
         if let Pacing::Realtime { speed } = pacing {
-            let gap = elapsed.saturating_sub(previous_elapsed);
-            let scaled = gap.div_f64(speed.max(f64::MIN_POSITIVE));
-            if scaled > Duration::ZERO {
-                tokio::time::sleep(scaled).await;
-            }
+            // `sleep_until` a deadline already past returns immediately, which
+            // is exactly the catch-up behaviour wanted: a replay that fell
+            // behind bursts back onto schedule instead of drifting.
+            let target = origin + elapsed.div_f64(speed.max(f64::MIN_POSITIVE));
+            tokio::time::sleep_until(target).await;
         }
-        previous_elapsed = elapsed;
 
         let message = taped.into_message(base, fallback_symbol);
         stats.frames_sent += 1;
@@ -633,6 +647,69 @@ mod tests {
                 "frame {i} was not spaced according to the tape's recorded offsets"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn realtime_pacing_does_not_accumulate_drift_across_frames() {
+        // Found by replaying a three-minute live tape: sleeping for the *gap*
+        // between consecutive frames adds every sleep's overshoot to a running
+        // total that is never repaid, so a long tape falls further behind the
+        // clock the longer it runs. Every book then reports an age it does not
+        // have, and anything that acts on book age reads a healthy replay as a
+        // stalled feed.
+        //
+        // This deliberately runs on a *real* runtime rather than a paused one.
+        // A paused runtime advances by exactly the requested duration, so both
+        // the correct and the broken implementation would finish in exactly
+        // the tape's span and the test would prove nothing. The bug lives in
+        // the gap between a requested sleep and an actual one, which only a
+        // real timer has.
+        //
+        // The numbers are chosen to make that gap dominate: 2000 frames spaced
+        // 100µs apart span 200ms of tape, but no timer wakes at 100µs, so
+        // summing gaps costs 2000 × (timer granularity) — seconds. Scheduling
+        // against a fixed origin finds most deadlines already past and returns
+        // immediately, landing near the tape's own span. The bound below sits
+        // between the two by a factor of five in each direction.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tape.jsonl");
+
+        let record_clock = TestClock::new();
+        let mut writer = TapeWriter::create(&path, record_clock.now())
+            .await
+            .expect("create");
+        for _ in 0..2000 {
+            record_clock.advance(Duration::from_micros(100));
+            writer
+                .write_frame(&frame(VenueId::Kraken, "{}", record_clock.now()))
+                .await
+                .expect("write");
+        }
+        writer.flush().await.expect("flush");
+        drop(writer);
+
+        let mut reader = TapeReader::open(&path).await.expect("open");
+        let (tx, _rx) = bounded::<IngestMessage>(4096);
+
+        let started = std::time::Instant::now();
+        let stats = replay(
+            &mut reader,
+            &tx,
+            &TestClock::new(),
+            Pacing::Realtime { speed: 1.0 },
+            &Symbol::new("BTC-USD"),
+        )
+        .await
+        .expect("replay");
+        let took = started.elapsed();
+
+        assert_eq!(stats.frames_sent, 2000);
+        assert!(
+            took < Duration::from_secs(1),
+            "a 200ms tape took {took:?} to replay at 1.0x — realtime pacing is \
+             accumulating one timer granularity per frame instead of \
+             scheduling against a fixed origin"
+        );
     }
 
     #[tokio::test]
