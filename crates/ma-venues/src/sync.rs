@@ -124,6 +124,8 @@ pub enum VenueError {
     Malformed(String),
     #[error("frame was for {got}, but this is a {expected} sync")]
     WrongVenue { expected: VenueId, got: VenueId },
+    #[error("{venue} has no network endpoint; it is driven by a script or a tape")]
+    NoEndpoint { venue: VenueId },
 }
 
 /// A venue's wire protocol and its integrity discipline.
@@ -205,6 +207,17 @@ impl VenueBook {
     pub fn new(sync: Box<dyn VenueSync>, symbol: Symbol) -> Self {
         let book = Book::new(sync.venue(), symbol);
         Self { sync, book }
+    }
+
+    /// Cap retained depth, mirroring [`Book::with_max_depth`].
+    ///
+    /// Only correct for a venue that is itself publishing a depth-limited
+    /// feed — see the hazard on `Book::with_max_depth` and the reasoning on
+    /// [`VenueSpec::max_depth`](crate::venues::endpoint::VenueSpec::max_depth),
+    /// which is where the per-venue decision actually lives.
+    pub fn with_max_depth(mut self, depth: usize) -> Self {
+        self.book = self.book.with_max_depth(depth);
+        self
     }
 
     pub fn book(&self) -> &Book {
