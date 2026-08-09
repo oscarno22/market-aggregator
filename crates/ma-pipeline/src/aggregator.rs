@@ -36,8 +36,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use ma_core::{
-    BookState, Clock, DesyncReason, EventKind, IngestTime, Integrity, Level, MarketEvent, Side,
-    StreamId, Symbol, VenueId,
+    BookState, Clock, DesyncReason, EventKind, IngestTime, Integrity, Level, MarketEvent,
+    RollingWindows, Side, StreamId, Symbol, VenueId, WindowReading, WindowSpec,
 };
 use ma_venues::{Outcome, VenueBook, VenueSpec};
 use serde::Serialize;
@@ -148,6 +148,16 @@ pub struct VenueView {
     /// point: it is how a reader can tell a depth-limited *view* from a
     /// depth-limited *book*.
     pub levels_held: [usize; 2],
+    /// Rolling indicators, one per configured span, in the order they were
+    /// configured.
+    ///
+    /// Each carries its own `trusted_ms`/`span_ms` pair rather than inheriting
+    /// this view's `status`, and the two answer different questions: `status`
+    /// is the book *now*, coverage is how much of the window we were entitled
+    /// to speak about. A book that is `live` this instant and was `desynced`
+    /// for the previous forty seconds has a perfectly healthy `status` and a
+    /// 60s window that means almost nothing.
+    pub windows: Vec<WindowReading>,
     pub counters: VenueCountersSnapshot,
     pub rates: Rates,
 }
@@ -225,9 +235,25 @@ struct VenueState {
     /// `Desynced` but not for `Uninitialized`, and a view that reported
     /// "uninitialized for 0ms" forever would be worse than useless.
     status_since: IngestTime,
+    /// Rolling indicators over this stream's mid. Sampled per applied message,
+    /// not per publish tick — see [`RollingWindows::observe`].
+    windows: RollingWindows,
 }
 
 impl VenueState {
+    /// Fold the book's current state into the rolling windows.
+    ///
+    /// Called on *every* applied message, including the ones that change
+    /// nothing — a parse error, a heartbeat, a session ending. The windows
+    /// need the calls that change nothing as much as the ones that do: their
+    /// coverage accounting is interval-based, so a stretch during which the
+    /// book was untrusted is only charged when something reports the time
+    /// passing.
+    fn sample_windows(&mut self, at: IngestTime) {
+        let top = self.book.book().top_of_book(at);
+        self.windows.observe(&top, at);
+    }
+
     fn status(&self) -> BookStatus {
         match self.book.book().state() {
             BookState::Uninitialized => BookStatus::Uninitialized,
@@ -277,6 +303,7 @@ pub struct Aggregator {
     tx: broadcast::Sender<Arc<Snapshot>>,
     resync: ResyncRequests,
     events: Option<mpsc::UnboundedSender<MarketEvent>>,
+    window_spec: WindowSpec,
 }
 
 impl Aggregator {
@@ -287,6 +314,22 @@ impl Aggregator {
     /// spec per (venue, symbol) pair and this constructor does not need to know
     /// how the two lists were crossed.
     pub fn new(specs: Vec<VenueSpec>, clock: Arc<dyn Clock>, metrics: &Metrics) -> Self {
+        Self::with_window_spec(specs, clock, metrics, WindowSpec::default())
+    }
+
+    /// As [`Aggregator::new`], with the rolling windows configured.
+    ///
+    /// Taken at construction rather than through a `with_` builder because the
+    /// windows have to exist before the first message is applied. A builder
+    /// that replaced them afterwards would silently discard whatever coverage
+    /// had already been accounted, which is precisely the kind of quiet hole
+    /// `trusted_ms` exists to make visible.
+    pub fn with_window_spec(
+        specs: Vec<VenueSpec>,
+        clock: Arc<dyn Clock>,
+        metrics: &Metrics,
+        window_spec: WindowSpec,
+    ) -> Self {
         let now = clock.now();
         let streams = specs
             .into_iter()
@@ -306,6 +349,7 @@ impl Aggregator {
                         desynced_total: Duration::ZERO,
                         desynced_since: None,
                         status_since: now,
+                        windows: RollingWindows::new(window_spec.clone(), now),
                     },
                 )
             })
@@ -320,7 +364,15 @@ impl Aggregator {
             tx: broadcast::channel(BROADCAST_CAPACITY).0,
             resync: ResyncRequests::default(),
             events: None,
+            window_spec,
         }
+    }
+
+    /// The window spans this aggregator publishes, for a consumer that needs
+    /// to label them — `/metrics` does, since a Prometheus series name cannot
+    /// carry a position in a list.
+    pub fn window_spec(&self) -> &WindowSpec {
+        &self.window_spec
     }
 
     /// Tee every normalised event to a persistence sink.
@@ -473,6 +525,7 @@ impl Aggregator {
                         // announces itself.
                         state.counters.record_parse_error();
                         warn!(%stream, error = %e, "could not parse frame");
+                        state.sample_windows(frame.ingest_ts);
                         return;
                     }
                 }
@@ -493,6 +546,7 @@ impl Aggregator {
                     state.note_transition(before, after, at);
                 }
                 info!(%stream, ?end, "session ended; book reset and marked desynced");
+                state.sample_windows(at);
                 return;
             }
         };
@@ -540,6 +594,11 @@ impl Aggregator {
                 let _ = sink.send(event);
             }
         }
+
+        // Sample after the book has been updated and after any transition has
+        // been recorded, so the window sees the state this message produced
+        // rather than the one it replaced.
+        state.sample_windows(at);
     }
 
     /// Build the snapshot for this tick.
@@ -562,6 +621,10 @@ impl Aggregator {
 
             let status = state.status();
             let trail = state.book.audit_trail();
+            // Read before borrowing the book: `read` charges trust time up to
+            // `now`, which is what keeps a stream that has gone silent from
+            // reporting the coverage it had at its last message forever.
+            let windows = state.windows.read(now);
             let book = state.book.book();
             let top = book.top_of_book(now);
             let (held_bids, held_asks) = book.depth();
@@ -602,6 +665,7 @@ impl Aggregator {
                     desynced_total_ms: millis(state.desynced_total(now)),
                     last_verified_ms,
                     levels_held: [held_bids, held_asks],
+                    windows,
                     counters,
                     rates,
                 });
@@ -614,8 +678,8 @@ impl Aggregator {
             symbols: by_symbol
                 .into_iter()
                 .map(|(symbol, venues)| SymbolView {
-                    symbol: symbol.to_string(),
                     weakest_integrity: venues.iter().filter_map(|v| v.integrity).min(),
+                    symbol: symbol.to_string(),
                     venues,
                 })
                 .collect(),
@@ -983,6 +1047,80 @@ mod tests {
         assert_eq!(
             v.desynced_total_ms, 0,
             "a verified book accrued untrusted time"
+        );
+    }
+
+    #[test]
+    fn a_window_spanning_an_outage_reports_the_hole_it_has() {
+        // The end-to-end version of ma_core::window's coverage test, through
+        // the real parser and the real session-boundary path. The reading that
+        // matters is the one a naive implementation gets wrong: after the
+        // reconnect the book is `live` and its 4s window looks like any other,
+        // but a full second of that window is a book we were not entitled to
+        // speak about.
+        let clock = Arc::new(TestClock::new());
+        let stream = StreamId::new(VenueId::Coinbase, symbol());
+        let metrics = Arc::new(Metrics::new([stream.clone()]));
+        let mut agg = Aggregator::with_window_spec(
+            vec![spec_for(VenueId::Coinbase, &symbol()).unwrap()],
+            clock.clone(),
+            &metrics,
+            WindowSpec::new(Duration::from_millis(250), [Duration::from_secs(4)]),
+        );
+
+        let snapshot_frame = |clock: &TestClock| {
+            IngestMessage::Frame(RawFrame::new(
+                stream.clone(),
+                br#"{"channel":"l2_data","sequence_num":0,"events":[{"type":"snapshot","product_id":"BTC-USD","updates":[{"side":"bid","price_level":"100","new_quantity":"1"},{"side":"offer","price_level":"101","new_quantity":"1"}]}]}"#.to_vec(),
+                clock.now(),
+            ))
+        };
+
+        agg.apply(snapshot_frame(&clock));
+        clock.advance(Duration::from_secs(1));
+
+        agg.apply(IngestMessage::SessionEnded {
+            stream: stream.clone(),
+            at: clock.now(),
+            end: SessionEnd::Errored,
+        });
+        clock.advance(Duration::from_secs(1));
+
+        agg.apply(snapshot_frame(&clock));
+        clock.advance(Duration::from_secs(1));
+
+        let v = view(&agg.snapshot(empty_channel()), VenueId::Coinbase);
+        assert_eq!(v.status, BookStatus::Live, "the book recovered");
+
+        let w = &v.windows[0];
+        assert_eq!(w.span_ms, 4_000);
+        assert_eq!(
+            w.trusted_ms, 2_000,
+            "the outage did not show up as missing coverage"
+        );
+        assert!(w.is_partial());
+        assert_eq!(w.samples, 2);
+        assert_eq!(w.integrity_floor, Some(Integrity::GapDetectable));
+        // `normalize` because a mid is *derived*: its scale is an artefact of
+        // the division, not digits a venue sent and a checksum covers. The
+        // trailing-zero discipline in `Price` applies to the latter.
+        assert_eq!(
+            w.high.map(|d| d.normalize().to_string()).as_deref(),
+            Some("100.5")
+        );
+    }
+
+    #[test]
+    fn window_readings_are_published_for_every_configured_span() {
+        let (mut agg, _m) = aggregator(&[VenueId::Coinbase]);
+        agg.apply(coinbase(0, "snapshot", "100", "101"));
+
+        let v = view(&agg.snapshot(empty_channel()), VenueId::Coinbase);
+        let spans: Vec<u64> = v.windows.iter().map(|w| w.span_ms).collect();
+        assert_eq!(
+            spans,
+            vec![1_000, 10_000, 60_000],
+            "the default spans are not what the snapshot published"
         );
     }
 

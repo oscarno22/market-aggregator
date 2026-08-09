@@ -158,6 +158,14 @@ live run.
    so `SIGTERM`, which is what an orchestrator sends on every deploy, discarded
    everything since the last roll.
 
+**From replaying a three-minute tape while building v3:**
+
+7. A matching checksum was being read as a *state transition*, because
+   `Live` carries `last_verified` and comparing whole states sees it move.
+   Kraken logged 1006 "book is live" lines for 1108 messages, and the "live
+   for" clock reset on every one — on the single venue whose guarantee is
+   strongest, and only there.
+
 A fixture author writes the messages they are thinking about. A policy author
 picks the units they are thinking in. Both are why
 [`just record`](justfile) and [`just audit-probe`](justfile) exist.
@@ -189,6 +197,11 @@ picks the units they are thinking in. Both are why
 - **`Decimal` everywhere, and prices serialise as JSON strings.** Kraken hashes
   the exact digits it sent, trailing zeros included. A JSON number would be an
   `f64` in every browser and would undo that at the last step; a test pins it.
+- **Every rolling window states how much of itself it covers.** A "60-second
+  high" over a book that spent twenty of those seconds `Desynced` is a
+  40-second high wearing a 60-second label. Each reading carries `trusted_ms`
+  beside `span_ms` and the weakest `Integrity` it sampled under, and a window
+  with nothing in it is `null` rather than zero.
 
 The reasoning lives in **[`docs/DESIGN.md`](docs/DESIGN.md)** — sequence
 diagrams, the decisions table with what was rejected and why, and an operating

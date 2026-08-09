@@ -30,6 +30,7 @@ pub mod event;
 pub mod price;
 pub mod stream;
 pub mod time;
+pub mod window;
 
 pub use audit::{AuditFinding, AuditOutcome, AuditPolicy, AuditTrail, audit};
 pub use book::{Book, BookError, BookState, BookStateKind, DesyncReason, Integrity, TopOfBook};
@@ -37,3 +38,4 @@ pub use event::{EventKind, Level, MarketEvent, Side, SkewObservation, Symbol, Ve
 pub use price::{ParseError, Price, Qty};
 pub use stream::StreamId;
 pub use time::{Clock, IngestTime, SystemClock, TestClock};
+pub use window::{RollingWindows, WindowReading, WindowSpec};

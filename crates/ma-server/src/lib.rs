@@ -101,6 +101,51 @@ pub fn parse_symbols(raw: &str) -> Result<Vec<ma_core::Symbol>, String> {
     Ok(symbols)
 }
 
+/// Parse a comma-separated window list, e.g. `1s,10s,1m`.
+///
+/// Suffixes are `ms`, `s`, `m`, `h`; a bare number is seconds. Deliberately
+/// hand-rolled rather than pulling in a duration-parsing crate: the grammar is
+/// four suffixes, and the alternative is a dependency in the binary that
+/// parses operator input, which is the one place a surprising accepted format
+/// turns into a window silently a thousand times the length asked for.
+///
+/// # Errors
+/// If a span is unparseable, zero, or the list is empty.
+pub fn parse_windows(raw: &str) -> Result<Vec<std::time::Duration>, String> {
+    use std::time::Duration;
+
+    let spans = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|span| {
+            let (digits, unit) = span.split_at(
+                span.find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(span.len()),
+            );
+            let n: u64 = digits
+                .parse()
+                .map_err(|_| format!("{span:?} does not start with a number"))?;
+            let d = match unit {
+                "ms" => Duration::from_millis(n),
+                "s" | "" => Duration::from_secs(n),
+                "m" => Duration::from_secs(n * 60),
+                "h" => Duration::from_secs(n * 3600),
+                other => return Err(format!("unknown unit {other:?} in {span:?} (ms, s, m, h)")),
+            };
+            if d.is_zero() {
+                return Err(format!("{span:?} is a zero-length window"));
+            }
+            Ok(d)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    if spans.is_empty() {
+        return Err("no windows given".to_owned());
+    }
+    Ok(spans)
+}
+
 /// Parse a comma-separated venue list, e.g. `coinbase,kraken`.
 ///
 /// # Errors
@@ -119,4 +164,43 @@ pub fn parse_venues(raw: &str) -> Result<Vec<ma_core::VenueId>, String> {
             )),
         })
         .collect()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn window_units_mean_what_they_say() {
+        // The failure worth a test: `m` reading as milliseconds would turn a
+        // one-minute window into a one-millisecond one, which is not an error
+        // anywhere downstream — it is a window that quietly contains a single
+        // bucket and reports plausible numbers over 250ms.
+        assert_eq!(
+            parse_windows("500ms,1s,1m,1h").unwrap(),
+            vec![
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(60),
+                Duration::from_secs(3600),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bare_number_is_seconds() {
+        assert_eq!(parse_windows("30").unwrap(), vec![Duration::from_secs(30)]);
+    }
+
+    #[test]
+    fn nonsense_windows_are_rejected_at_startup_not_absorbed() {
+        for raw in ["", "1d", "abc", "0s", "s"] {
+            assert!(
+                parse_windows(raw).is_err(),
+                "{raw:?} was accepted as a window"
+            );
+        }
+    }
 }

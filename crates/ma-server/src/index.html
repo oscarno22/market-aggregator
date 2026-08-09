@@ -72,6 +72,16 @@
   table.ladder td:first-child { text-align: left; }
   table.ladder td:last-child { text-align: right; color: var(--muted); }
   tr.ask td:first-child { color: var(--desync); }
+
+  /* Rolling windows. The `covered` column is the one that governs how much any
+     other column on its row is worth, so it is the one that changes colour. */
+  table.windows { margin: 0.4rem 0 0.2rem; font-size: 0.72rem; }
+  table.windows th { color: var(--muted); font-weight: 400; text-align: right; padding-bottom: 0.2rem; }
+  table.windows th:first-child, table.windows td:first-child { text-align: left; color: var(--muted); }
+  table.windows td { padding: 0.06rem 0; text-align: right; }
+  table.windows tr.partial td.cover { color: var(--desync); font-weight: 600; }
+  table.windows td.cover { color: var(--muted); }
+  .windows-note { font-size: 0.7rem; color: var(--desync); margin: 0.1rem 0 0.6rem; }
   tr.bid td:first-child { color: var(--live); }
   tr.touch td { border-top: 1px solid var(--line); padding: 0.1rem 0; }
 
@@ -228,6 +238,55 @@ function ladder(v) {
     </table>`;
 }
 
+// Rolling indicators, one row per configured window.
+//
+// The `covered` column is not decoration and it is not a health check for the
+// process — it governs how much every other figure on its row is worth. A book
+// that is `live` this instant can have spent forty of the last sixty seconds
+// desynced, and its 60s range would then describe twenty seconds of market
+// under a label that says sixty. There is no way to render that honestly
+// except to print the coverage beside it.
+function windowRows(v) {
+  if (!v.windows || !v.windows.length) return "";
+  const bps = (x) => (x === null || x === undefined) ? "—" : Number(x).toFixed(1);
+  const signed = (x) => (x === null || x === undefined)
+    ? "—"
+    : (Number(x) >= 0 ? "+" : "") + Number(x).toFixed(1);
+
+  let anyPartial = false;
+  const rows = v.windows.map((w) => {
+    const partial = w.trusted_ms < w.span_ms;
+    anyPartial = anyPartial || partial;
+    const pct = w.span_ms > 0 ? Math.round((100 * w.trusted_ms) / w.span_ms) : 0;
+    return `
+      <tr class="${partial ? "partial" : ""}">
+        <td>${span(w.span_ms)}</td>
+        <td class="num">${signed(w.change_bps)}</td>
+        <td class="num">${bps(w.range_bps)}</td>
+        <td class="num">${bps(w.mean_spread_bps)}</td>
+        <td class="num cover">${partial ? pct + "%" : "full"}</td>
+      </tr>`;
+  }).join("");
+
+  const note = anyPartial
+    ? `<div class="windows-note">A window under 100% covered spans time this book was not
+       trusted, or time before this process started. Its figures describe only the covered
+       part.</div>`
+    : "";
+
+  return `
+    <table class="windows">
+      <thead><tr>
+        <th>window</th><th>Δ bps</th><th>range bps</th><th>spread bps</th><th>covered</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>${note}`;
+}
+
+function span(ms) {
+  return ms % 1000 === 0 ? `${ms / 1000}s` : `${ms}ms`;
+}
+
 function card(v) {
   const aged = (v.age_ms ?? 0) >= STALE_MS;
   const stale = v.status !== "live" || aged;
@@ -253,6 +312,7 @@ function card(v) {
       <div><span class="label">Spread</span><span class="value num">${v.spread ?? "—"}</span></div>
     </div>
     ${ladder(v)}
+    ${windowRows(v)}
     <table>
       <tr><td>Book age</td><td${aged ? ' class="bad"' : ""}><span class="num">${ms(v.age_ms)}</span></td></tr>
       <tr><td>${v.status} for</td><td class="num">${ms(v.status_for_ms)}</td></tr>

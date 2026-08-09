@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use ma_server::{
-    DEFAULT_VENUES, Pipeline, http, init_tracing, parse_symbols, parse_venues, stop_requested,
+    DEFAULT_VENUES, Pipeline, http, init_tracing, parse_symbols, parse_venues, parse_windows,
+    stop_requested,
 };
 
 #[derive(Parser, Debug)]
@@ -28,9 +29,17 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:8080")]
     addr: SocketAddr,
 
-    /// Snapshot publish interval, in milliseconds.
+    /// Snapshot publish interval, in milliseconds. Also the bucket resolution
+    /// of every rolling window.
     #[arg(long, default_value_t = 250)]
     tick_ms: u64,
+
+    /// Rolling indicator windows, e.g. `1s,10s,1m`. Suffixes: ms, s, m, h.
+    ///
+    /// Several spans cost nothing at ingest: they share one bucket ring per
+    /// stream, sized to the longest. See `ma_core::window`.
+    #[arg(long, default_value = "1s,10s,1m")]
+    windows: String,
 
     /// Archive normalised events to Parquet, rolled hourly.
     ///
@@ -57,8 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let symbols = parse_symbols(&args.symbols)?;
-    let mut pipeline =
-        Pipeline::new(symbols, venues)?.with_tick(Duration::from_millis(args.tick_ms));
+    let mut pipeline = Pipeline::new(symbols, venues)?
+        .with_tick(Duration::from_millis(args.tick_ms))
+        .with_windows(parse_windows(&args.windows)?);
 
     // Attached before the aggregator is spawned, because the aggregator is the
     // only thing that can produce normalised events — see

@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ma_core::{Clock, StreamId, Symbol, SystemClock, VenueId};
+use ma_core::{Clock, StreamId, Symbol, SystemClock, VenueId, WindowSpec};
 use ma_pipeline::aggregator::{Aggregator, Snapshot};
 use ma_pipeline::channel::{Receiver, Sender, bounded};
 use ma_pipeline::ingest::{Ingest, IngestMessage, Shutdown, ShutdownTrigger, shutdown};
@@ -52,6 +52,10 @@ pub struct PipelineHandle {
     pub metrics: Arc<Metrics>,
     pub symbols: Vec<Symbol>,
     pub venues: Vec<VenueId>,
+    /// The rolling-window spans this process publishes. Carried on the handle
+    /// because `/metrics` has to name each series after its span — a
+    /// Prometheus series cannot say "the second one in the list".
+    pub windows: WindowSpec,
 }
 
 impl PipelineHandle {
@@ -67,6 +71,7 @@ pub struct Pipeline {
     venues: Vec<VenueId>,
     clock: Arc<dyn Clock>,
     tick: Duration,
+    windows: WindowSpec,
     metrics: Arc<Metrics>,
     /// Lets the aggregator ask an ingest task to reconnect after a desync
     /// that a healthy socket cannot repair on its own.
@@ -119,6 +124,7 @@ impl Pipeline {
             venues,
             clock: Arc::new(SystemClock),
             tick: ma_pipeline::aggregator::DEFAULT_TICK,
+            windows: WindowSpec::default(),
             tx,
             rx: Some(rx),
             trigger,
@@ -130,6 +136,19 @@ impl Pipeline {
     #[must_use]
     pub fn with_tick(mut self, tick: Duration) -> Self {
         self.tick = tick;
+        self
+    }
+
+    /// Rolling-window spans, at the publish tick's resolution.
+    ///
+    /// The bucket resolution is tied to the tick rather than configured
+    /// separately: a window bucket finer than the publish interval buys
+    /// nothing a client can observe, and one coarser would make `span_ms`
+    /// quantise in a way an operator reading the page has no way to see. Call
+    /// after [`Self::with_tick`], which is where the resolution comes from.
+    #[must_use]
+    pub fn with_windows(mut self, spans: Vec<Duration>) -> Self {
+        self.windows = WindowSpec::new(self.tick, spans);
         self
     }
 
@@ -193,9 +212,14 @@ impl Pipeline {
             .flat_map(|v| self.symbols.iter().map(move |s| ma_venues::spec_for(*v, s)))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut aggregator = Aggregator::new(specs, Arc::clone(&self.clock), &self.metrics)
-            .with_tick(self.tick)
-            .requesting_resync_through(self.resync.clone());
+        let mut aggregator = Aggregator::with_window_spec(
+            specs,
+            Arc::clone(&self.clock),
+            &self.metrics,
+            self.windows.clone(),
+        )
+        .with_tick(self.tick)
+        .requesting_resync_through(self.resync.clone());
         if let Some(events) = self.events.take() {
             aggregator = aggregator.publishing_events_to(events);
         }
@@ -205,6 +229,7 @@ impl Pipeline {
             metrics: Arc::clone(&self.metrics),
             symbols: self.symbols.clone(),
             venues: self.venues.clone(),
+            windows: self.windows.clone(),
         };
 
         let task = tokio::spawn(aggregator.run(rx, self.shutdown.clone()));

@@ -31,6 +31,7 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::{Json, Router};
 use futures_util::Stream;
+use ma_core::WindowReading;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, warn};
 
@@ -310,6 +311,72 @@ async fn metrics(State(handle): State<PipelineHandle>) -> impl IntoResponse {
                 ));
             }
         }
+
+        // Rolling windows carry a third label, `window`, naming the span. It
+        // is derived from the *measured* `span_ms` rather than echoing what
+        // was typed on the command line, so `--windows 1m` labels itself `60s`
+        // and a span rounded up to a whole bucket labels itself with the span
+        // that was actually examined.
+        //
+        // Not an index: a series named after position would silently re-point
+        // at a different span the day someone reorders `--windows`, and every
+        // historical query would change meaning without breaking.
+        //
+        // `ma_window_trusted_ms` is emitted first and deliberately: it is the
+        // denominator for everything below it. A range or a change read
+        // without it is a number over an unknown amount of time.
+        out.push_str(
+            "# HELP ma_window_trusted_ms Milliseconds of this window during which the book \
+             was trusted. Compare against ma_window_span_ms: anything less means every other \
+             window series for this stream covers less time than its label.\n\
+             # TYPE ma_window_trusted_ms gauge\n",
+        );
+        for (symbol, v) in snapshot.views() {
+            for w in &v.windows {
+                out.push_str(&format!(
+                    "ma_window_trusted_ms{{venue=\"{}\",symbol=\"{symbol}\",window=\"{}\"}} {}\n",
+                    v.venue,
+                    window_label(w.span_ms),
+                    w.trusted_ms
+                ));
+            }
+        }
+        out.push_str(
+            "# HELP ma_window_span_ms The window actually examined, rounded up to a whole \
+             bucket.\n\
+             # TYPE ma_window_span_ms gauge\n",
+        );
+        for (symbol, v) in snapshot.views() {
+            for w in &v.windows {
+                out.push_str(&format!(
+                    "ma_window_span_ms{{venue=\"{}\",symbol=\"{symbol}\",window=\"{}\"}} {}\n",
+                    v.venue,
+                    window_label(w.span_ms),
+                    w.span_ms
+                ));
+            }
+        }
+
+        // Prometheus has no notion of "absent" inside a sample, so a window
+        // with no data must emit no series rather than a zero. A zero range
+        // and an unknown range are the same line otherwise, and the whole
+        // point of `Option` on WindowReading is that they are not the same
+        // thing.
+        for (name, help, pick) in WINDOW_GAUGES {
+            out.push_str(&format!(
+                "# HELP ma_{name} {help}\n# TYPE ma_{name} gauge\n"
+            ));
+            for (symbol, v) in snapshot.views() {
+                for w in &v.windows {
+                    let Some(value) = pick(w) else { continue };
+                    out.push_str(&format!(
+                        "ma_{name}{{venue=\"{}\",symbol=\"{symbol}\",window=\"{}\"}} {value}\n",
+                        v.venue,
+                        window_label(w.span_ms),
+                    ));
+                }
+            }
+        }
     }
 
     (
@@ -320,6 +387,60 @@ async fn metrics(State(handle): State<PipelineHandle>) -> impl IntoResponse {
         out,
     )
 }
+
+/// The `window` label for a measured span. Seconds when it divides evenly,
+/// milliseconds otherwise — the two spellings a configured span can have.
+fn window_label(span_ms: u64) -> String {
+    if span_ms.is_multiple_of(1000) {
+        format!("{}s", span_ms / 1000)
+    } else {
+        format!("{span_ms}ms")
+    }
+}
+
+/// The optional window series, and how to read each one.
+///
+/// A table rather than six near-identical loops because they differ only in
+/// name and accessor, and the thing that must not vary between them — emitting
+/// *nothing* when the reading is `None` rather than a zero — is then written
+/// once. A window with no trusted samples has no range; publishing `0` for it
+/// would put a flat line on a dashboard where the honest rendering is a gap.
+type WindowGauge = (
+    &'static str,
+    &'static str,
+    fn(&WindowReading) -> Option<String>,
+);
+
+const WINDOW_GAUGES: [WindowGauge; 6] = [
+    (
+        "window_samples",
+        "Book updates that produced a two-sided mid inside the window. Small with a full \
+         ma_window_trusted_ms means a quiet market; small with a small one means no data.",
+        |w| Some(w.samples.to_string()),
+    ),
+    (
+        "window_mid",
+        "Mean mid over the window, sample-weighted.",
+        |w| w.mean.map(|d| d.to_string()),
+    ),
+    ("window_high", "Highest mid observed in the window.", |w| {
+        w.high.map(|d| d.to_string())
+    }),
+    ("window_low", "Lowest mid observed in the window.", |w| {
+        w.low.map(|d| d.to_string())
+    }),
+    (
+        "window_change_bps",
+        "Signed move from the first mid in the window to the last, in basis points.",
+        |w| w.change_bps.map(|d| d.to_string()),
+    ),
+    (
+        "window_range_bps",
+        "High minus low over the window's mean mid, in basis points. The volatility proxy \
+         this build publishes; see ma_core::window for why it is not realised volatility.",
+        |w| w.range_bps.map(|d| d.to_string()),
+    ),
+];
 
 /// Serve until `shutdown` fires.
 ///
@@ -372,6 +493,7 @@ mod tests {
                 metrics,
                 symbols: symbols.to_vec(),
                 venues,
+                windows: ma_core::WindowSpec::default(),
             },
             agg,
         )
@@ -428,6 +550,61 @@ mod tests {
                 "receiver ran past a snapshot it should have delivered"
             );
         }
+    }
+
+    /// Scrape `/metrics`, publishing snapshots in the background because the
+    /// handler waits for a tick rather than caching one.
+    async fn scrape(handle: PipelineHandle, mut agg: Aggregator) -> String {
+        let publisher = handle.snapshots.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = publisher.send(Arc::new(agg.snapshot(
+                    ma_pipeline::channel::ChannelMetrics {
+                        len: 0,
+                        capacity: 1,
+                        dropped: 0,
+                    },
+                )));
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let body = axum::body::to_bytes(
+            metrics(State(handle)).await.into_response().into_body(),
+            1 << 20,
+        )
+        .await
+        .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn window_series_are_labelled_by_span_and_absent_when_there_is_no_data() {
+        let (handle, agg) = handle();
+        let text = scrape(handle, agg).await;
+
+        // Labelled by span, not by position in the list. A positional label
+        // would silently re-point at a different window the day `--windows` is
+        // reordered, and every historical query would change meaning.
+        assert!(
+            text.contains(
+                r#"ma_window_trusted_ms{venue="coinbase",symbol="BTC-USD",window="60s"}"#
+            ),
+            "window series are not labelled by span:\n{text}"
+        );
+
+        // No book has ever synced here, so there is no range to report. The
+        // series must be *absent* rather than zero: Prometheus cannot express
+        // "unknown" inside a sample, and a zero range on a dashboard is a flat
+        // line where the honest rendering is a gap.
+        assert!(
+            text.contains("# TYPE ma_window_range_bps gauge"),
+            "the range metric was not declared at all:\n{text}"
+        );
+        assert!(
+            !text.contains("ma_window_range_bps{"),
+            "a window with no samples published a range anyway:\n{text}"
+        );
     }
 
     #[tokio::test]
