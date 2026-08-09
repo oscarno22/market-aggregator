@@ -1149,21 +1149,27 @@ streams, `s3://…/events/cluster`:
 | `kill -9` on node-a | node-b took all six streams 16s later: `ttl` plus one renewal, as a hard kill must cost |
 | `SIGTERM` on node-b | Clean stop — and the withdrawal was **refused** |
 
-That last row is the finding. This project's own IAM user is scoped to
-`PutObject`, `GetObject` and `ListBucket` and **not** `DeleteObject`, so
-`withdraw` fails and the record stays behind. Nothing breaks, and that is by
-construction rather than by luck: a node that cannot delete its own record is
-indistinguishable from one that was `kill -9`'d, and the lease argument already
-has to cover that case, because no shutdown path runs on a hard kill. The
-safety property is untouched; the only thing lost is the *speed* of a clean
-handover.
+That last row was the finding, and it is now **historical**: the IAM policy
+*of that day* granted `PutObject`, `GetObject` and `ListBucket` and not
+`DeleteObject`, so `withdraw` was refused and the record stayed behind. The
+policy has since been widened (Get/Put/Delete on `events/*` and `cluster/*` —
+see `docs/iam-policy.md`), so a clean shutdown now withdraws and the survivor
+rebalances immediately instead of waiting out the lease.
 
-It is deliberately not treated as an error, because every available reaction is
-worse than waiting — retrying hammers a registry that has already said no, and
-treating it as fatal turns a permissions gap into a crash loop.
-`ma-coord/tests/cluster.rs` now pins this offline with a registry whose
-`withdraw` always fails, asserting both halves: B does **not** grab early while
-the stale record is inside its `ttl`, and does take over once it expires.
+What the refusal proved is not historical, and is the reason the episode
+stays in this table: nothing broke, by construction rather than by luck. A
+node that cannot delete its own record is indistinguishable from one that was
+`kill -9`'d, and the lease argument already has to cover that case, because
+no shutdown path runs on a hard kill. The safety property never depended on
+`DeleteObject`; only the *speed* of a clean handover did. A refused withdraw
+is deliberately not an error, because every available reaction is worse than
+waiting — retrying hammers a registry that has already said no, and treating
+it as fatal turns a permissions gap into a crash loop.
+`ma-coord/tests/cluster.rs` pins the general claim offline with a registry
+whose `withdraw` always fails, asserting both halves: B does **not** grab
+early while the stale record is inside its `ttl`, and does take over once it
+expires. That test outlives the policy fix, because the next Put-only policy
+someone writes will meet the same behaviour.
 
 Stale records do not accumulate, because a record is named after its node: a
 restarting `node-a` overwrites `node-a.json` rather than adding to it. The
@@ -1171,11 +1177,13 @@ residue is one dead object per node id that never returns, and one extra
 `GetObject` per renewal for each.
 
 Two operational notes. A registry belongs in its own prefix, not inside the
-archive's; the live run used `events/cluster` only because the scoped user
-cannot reach anything outside `events/*`. And `ttl` must account for a registry
-round trip now being a network call — a value tuned for a shared directory will
-make an S3-backed cluster flap, and the flap is safe (a node that cannot reach
-the registry stands down) but pointless.
+archive's; the first live run used `events/cluster` only because that day's
+policy could not reach anything outside `events/*` — the widened policy
+covers `cluster/*`, which is where the registry belongs
+(`s3://…/cluster`). And `ttl` must account for a registry round trip now
+being a network call — a value tuned for a shared directory will make an
+S3-backed cluster flap, and the flap is safe (a node that cannot reach the
+registry stands down) but pointless.
 
 ---
 
@@ -1343,26 +1351,32 @@ renders one shape and still cannot tell it is looking at a cluster.
 
 ## 15. Where this stops
 
-v1, v2, v3 and v4 are complete. What v4 added:
+v1 through v5 are complete. v5 was the stopping-line milestone: close the
+remaining technical problems, then leave the project organised for whatever
+comes next. What it added:
 
 | | Status |
 |---|---|
-| A tape recorded across a real reconnect | Done — three staggered boundaries against live venues, replayed offline. Proves each venue's resubscribe and the book rebuilt from it; not detection, since we closed the socket. §4 |
-| Symbol-partitioned Parquet | Done — and it broke the reader's unstated assumption that key order is time order, which is now a per-partition merge. §8, §10 |
-| An S3-backed cluster registry | Done, and run live: two nodes, disjoint throughout, `kill -9` handover one lease later. §13 |
-| A cross-node merged view | Done, and run live against two clustered nodes plus a rogue process. §14 |
+| CI | Done — GitHub Actions runs the three offline gates by invoking the justfile (`check`, `check-s3`, `test`), pinned to the workspace's `rust-version`, so a green badge is also an MSRV proof. cargo-audit runs advisory, never blocking |
+| Archive observability | Done — `ArchiveCounters` replaces the writer's private tallies; a bucket rejecting every write now scrapes as `ma_archive_write_failures_total` climbing instead of as a healthy process. §9 |
+| Part-number resume | Done — a restart in the same hour lists the hour directory and appends `part-N+1` instead of silently overwriting `part-00000`, which every same-hour redeploy had been doing. §9 |
+| Trades ingestion | Done — all three venues subscribe to their trades channel on the book's own socket, verified against a live tape that also caught a genuine Bitstamp crossed book. §8 |
+| Trades downstream | Done — prints share the book's bucket ring (one coverage account per stream), surface as `last_trade` with a lag-adjusted age, and add `volume`/`vwap` to every window reading |
+| Consolidated cross-node windows | Done — order-free statistics only, coverage merged as a floor, lag published beside it, `first`/`last`/`change` refused by construction. §14 |
+| The gateway page shows its cluster | Done — node table and duplicated-stream banner, gated on the payload's `nodes` field so one page still serves both vantage points. §14 |
+| The policy that gates S3 | Documented — `docs/iam-policy.md`, including why the `s3:prefix` condition on `ListBucket` must never be "fixed" |
 
-### Not built yet
+### Not built, and where the next milestone would start
 
-- **A gateway that is not a single point of failure.** It holds no state a node
-  does not, so a second one is just a second process — but nothing elects one,
-  and two gateways behind a load balancer would serve two views that differ by
-  a tick. That is fine for a page and not fine for anything that alerts.
-- **Cross-node rolling windows.** The gateway merges *instants*. A window
-  spanning nodes would have to merge coverage as well as values, and
-  `trusted_ms` from two machines is two different clocks' worth of trust — the
-  same problem this section solved for a touch, one dimension harder.
+- **A gateway that is not a single point of failure.** It holds no state a
+  node does not, so a second one is just a second process — but nothing
+  elects one, and two gateways behind a load balancer would serve two views
+  that differ by a tick. That is fine for a page and not fine for anything
+  that alerts.
 - **Backfilling the archive from the gateway.** Each node archives its own
-  share, so an hour of "everything" is a union of prefixes rather than a file.
-  Symbol partitioning makes that a directory listing rather than a merge, which
-  is most of the work already done.
+  share, so an hour of "everything" is a union of prefixes rather than a
+  file. Symbol partitioning makes that a directory listing rather than a
+  merge, which is most of the work already done.
+- **S3's far tail.** Listing pagination past the first page, and file sizes
+  this project does not yet produce. The code paths exist; the evidence for
+  them does not.

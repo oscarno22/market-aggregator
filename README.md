@@ -293,14 +293,16 @@ runbook that says what to do when each metric moves.
 
 ## Status
 
-v1 through v4 are complete: three venues, multi-symbol, full L2 depth,
-reconnect with gap-fill, the periodic integrity audit, SSE and a page, metrics,
-a Parquet archive the process can replay itself from, rolling indicators that
-state their own coverage, a cross-venue consolidated touch, streams sharded
-across nodes by a lease coordinator, and a gateway that merges every node
-back into one view.
+v1 through v5 are complete: three venues with book *and* trade channels,
+multi-symbol, full L2 depth, reconnect with gap-fill, the periodic integrity
+audit, SSE and a page, metrics, a Parquet archive the process can replay
+itself from (and that survives a same-hour restart without overwriting
+itself), rolling indicators that state their own coverage and carry
+volume/vwap, a cross-venue consolidated touch *and* consolidated windows,
+streams sharded across nodes by a lease coordinator, and a gateway that
+merges every node back into one view — cluster panel included.
 
-**337 tests (339 with `--features s3`), clippy-clean at `-D warnings`, and the whole suite runs offline** —
+**368 tests (370 with `--features s3`), clippy-clean at `-D warnings`, and the whole suite runs offline** —
 including the multi-node cluster simulation, which steps several coordinators
 through one registry and asserts that no two ever hold the same stream. CI
 runs exactly those gates — `just check`, `just check-s3`, `just test`, the
@@ -336,26 +338,41 @@ Deliberately unfinished, and stated rather than hidden:
   directory on first touch and resumes after what is already there.
 
 - ~~A cluster registry backed by S3 is not implemented.~~ **Done**, and run
-  live: two nodes sharding six streams through `s3://…/events/cluster`, a
-  `kill -9` handover one lease later, and a disjoint assignment throughout. It
-  cost exactly `PutObject`, `ListObjects` and `DeleteObject` — the payoff for
-  `Registry` having no compare-and-swap. The live run also found that this
-  project's own IAM user cannot `DeleteObject`, so a clean withdrawal is
-  refused; that costs a lease's wait on handover and nothing else, because a
-  node that cannot withdraw is exactly a node that was `kill -9`'d.
+  live: two nodes sharding six streams, a `kill -9` handover one lease later,
+  and a disjoint assignment throughout. It cost exactly `PutObject`,
+  `ListObjects` and `DeleteObject` — the payoff for `Registry` having no
+  compare-and-swap. The first live run also found that the IAM user of that
+  day could not `DeleteObject`, so a clean withdrawal was refused; that cost
+  a lease's wait on handover and nothing else, because a node that cannot
+  withdraw is exactly a node that was `kill -9`'d. The policy has since been
+  widened ([`docs/iam-policy.md`](docs/iam-policy.md)) and the refusal is
+  history — but the offline test that pins the behaviour stays, because the
+  next Put-only policy will meet it again.
 - ~~Nothing merges the nodes.~~ **Done.** `just gateway` follows every node's
   SSE, re-consolidates, and serves the same page and JSON shape a node does. It
   is also the only place a doubly-owned stream is visible — measured live
   against two clustered nodes plus a rogue process, it named all six.
 
+- ~~Rolling windows do not cross nodes.~~ **Done.** Consolidated per-symbol
+  windows merge only order-free statistics, take coverage as a floor over the
+  contributing venues, and publish the slowest node's lag beside it — while
+  `first`/`last`/`change` are absent from the type, because ordering samples
+  across machines is a wall-clock comparison this system refuses to make.
+- ~~Trades are plumbed but never ingested.~~ **Done**, end to end: subscribed
+  on the book's own socket at all three venues, proven against a live tape,
+  counted into the windows, surfaced on the page, archived to Parquet.
+
 - **The gateway is a single point of failure.** It holds no state a node does
   not, so a second one is just a second process — but nothing elects one, and
   two behind a load balancer would serve views differing by a tick.
-- **Rolling windows do not cross nodes.** The gateway merges instants. A window
-  spanning nodes would have to merge *coverage* too, and `trusted_ms` from two
-  machines is two clocks' worth of trust.
+- **The archive is a union of per-node prefixes.** Each node archives its own
+  share; nothing yet assembles an hour of "everything" into one view, though
+  symbol partitioning makes that a directory listing rather than a merge.
 
-v1 through v4 are complete.
+This is the stopping line, chosen rather than reached: the remaining items
+are operational hardening around a solved core, and
+[`docs/DESIGN.md` §15](docs/DESIGN.md) says exactly where the next milestone
+would start.
 
 ## Non-goals
 

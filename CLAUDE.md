@@ -254,16 +254,52 @@ Neither layer replaces the other.
       throughout, `kill -9` handover one lease later. The live run found that
       the scoped IAM user has no `DeleteObject`, so `withdraw` is refused —
       which costs a lease's wait and nothing else, since a node that cannot
-      withdraw is exactly a node that was hard-killed
+      withdraw is exactly a node that was hard-killed. (The policy has since
+      been widened — `docs/iam-policy.md` — so withdraw now succeeds; the
+      offline pin for the refusal behaviour stays)
+
+**v5 — the stopping line — complete**
+
+The milestone that closed the remaining technical problems and organised the
+project for whatever comes next. One commit per item, each standalone-green:
+
+- [x] CI: GitHub Actions runs the three offline gates by invoking the
+      justfile (`just check`, `just check-s3`, `just test`), pinned to the
+      workspace's `rust-version` so a green badge is also an MSRV proof.
+      cargo-audit runs advisory, never blocking
+- [x] Archive observability: `ArchiveCounters` (the writer's one set of
+      tallies — a control that exists twice will disagree with itself) and an
+      `ma_archive_*` block on `/metrics`, present only when archiving. A
+      bucket rejecting every write no longer scrapes as a healthy process
+- [x] Part-number resume: the writer lists an hour directory on first touch
+      and appends after what a previous run left, so a same-hour restart —
+      i.e. any redeploy — no longer silently overwrites `part-00000`
+- [x] Trades, end to end: all three venues subscribe to their trades channel
+      on the book's own socket (the interleaving analysis is per venue and
+      deliberate — see README), prints share the book's bucket ring so there
+      is one coverage account per stream, `last_trade` on the view with a
+      lag-adjusted age, `volume`/`vwap` per window, `ma_trades_total`.
+      Verified against a live tape — which also caught a genuine Bitstamp
+      crossed book, the venue's only loss signal, firing on real data
+- [x] Consolidated cross-node windows — `ma_core::consolidate_windows`:
+      order-free statistics only, coverage merged as a floor, the slowest
+      node's lag published beside it, and `first`/`last`/`change` refused by
+      construction (ordering samples across machines is §7's forbidden
+      comparison). Same pure function on node (lag 0) and gateway (real lags)
+- [x] The gateway page renders its cluster: node table + duplicated-stream
+      banner, gated on the payload's `nodes` field so one page serves both
+- [x] `docs/iam-policy.md`, and DESIGN §13's withdraw-refusal reworded from a
+      fact about the system into a fact about a Put/List-only policy
 
 ## Status
 
 Snapshot as of the last session; update this when a milestone item lands or
 a design decision changes.
 
-**v1 through v4 are complete.** Seven-crate workspace, **337 tests
-passing, clippy-clean (`-D warnings`) with and without `--features
-ma-server/s3`, `cargo fmt` clean**. The full suite runs offline;
+**v1 through v5 are complete.** Seven-crate workspace, **368 tests
+passing (370 with `--features ma-server/s3`), clippy-clean (`-D warnings`)
+with and without the s3 feature, `cargo fmt` clean, and CI proving all of it
+on every push**. The full suite runs offline;
 `just demo tapes/2026-08-09-btc-usd-live.jsonl.gz` plays a real recording
 through the real pipeline with the network unplugged, `just cluster` shards six
 live streams across two processes, and `just gateway` merges them back into one
@@ -368,26 +404,27 @@ code, both only observable over a long run against real traffic:
    and v2 because nothing before v3 published a number derived from a duration.
    `ma_core::ScaledClock` now advances with the tape.
 
-**The S3 gate is now open, and was opened properly.** As of 2026-08-09 an IAM
-user (`market-aggregator`) scoped to exactly one bucket prefix replaced the root
-credentials, and the store has been run end to end: written under
-`s3://market-aggregator-…/events`, flushed 58,574 rows on `SIGTERM`, and
-replayed back out of S3 into three live checksum-verified books.
+**The S3 gate is open, and was opened properly.** As of 2026-08-09 an IAM
+user (`market-aggregator`) scoped to the `events/*` and `cluster/*` prefixes
+replaced the root credentials — the policy and its one load-bearing subtlety
+(the `s3:prefix` condition on `ListBucket` is what makes the scope probe
+*pass*) are in `docs/iam-policy.md`. The store has been run end to end:
+written under `s3://market-aggregator-…/events`, flushed 58,574 rows on
+`SIGTERM`, and replayed back out of S3 into three live checksum-verified
+books.
 
-`MA_S3_ACK_SCOPED_IAM=1` is still required, but it is no longer the whole
-control: `S3Store::connect` now lists the bucket *outside* its configured prefix
-and refuses to start if that succeeds. Root is allowed there, a scoped user is
+`MA_S3_ACK_SCOPED_IAM=1` is still required, but it is not the whole control:
+`S3Store::connect` lists the bucket *outside* its configured prefix and
+refuses to start if that succeeds. Root is allowed there, a scoped user is
 denied, and **any other error is also a refusal** — never read as proof of
-scoping. Run with `AWS_PROFILE=market-aggregator`; the ambient default is still
-a root login session.
+scoping. Run with `AWS_PROFILE=market-aggregator`; the ambient default is
+still a root login session.
 
-An S3-backed cluster registry is now unblocked. It needs only PutObject,
-ListObjects and DeleteObject — deliberately no conditional write.
-
-**Next up:** the gateway is a single point of failure and nothing elects a
-second one; rolling windows do not cross nodes (merging *coverage* is harder
-than merging a touch); and each node archives its own share, so an hour of
-"everything" is a union of prefixes. `docs/DESIGN.md` §15.
+**Next up — deliberately nothing.** v5 was the stopping line: the remaining
+items in `docs/DESIGN.md` §15 (a second gateway and whatever elects it,
+assembling the per-node archives into one view, S3's far tail) are
+operational hardening around a solved core, and they are where the next
+milestone would start if one is ever cut.
 
 ## Non-goals
 
