@@ -15,9 +15,11 @@
 
 pub mod fake;
 pub mod sync;
+pub mod venues;
 
 pub use fake::{FakeSync, Script, Tape, fake_checksum};
 pub use sync::{
     Outcome, RawFrame, RecoveryStrategy, RestSnapshot, SyncAction, VenueBook, VenueError,
     VenueSync,
 };
+pub use venues::CoinbaseSync;

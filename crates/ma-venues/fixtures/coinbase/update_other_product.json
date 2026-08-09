@@ -1,0 +1,15 @@
+{
+  "channel": "l2_data",
+  "client_id": "",
+  "timestamp": "2026-08-08T12:00:01.500000000Z",
+  "sequence_num": 1,
+  "events": [
+    {
+      "type": "update",
+      "product_id": "ETH-USD",
+      "updates": [
+        { "side": "bid", "event_time": "2026-08-08T12:00:01Z", "price_level": "3000.00", "new_quantity": "5.00000000" }
+      ]
+    }
+  ]
+}
