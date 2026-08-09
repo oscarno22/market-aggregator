@@ -330,6 +330,10 @@ version = "0.1.0"
 dependencies = [
  "ma-core",
  "ma-venues",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
 ]
