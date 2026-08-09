@@ -137,6 +137,19 @@ Bitstamp is the weakest and is kept deliberately, because it is the only one
 that exercises the REST-splice recovery archetype, and because a system that
 only ever talks to well-behaved venues has not been tested.
 
+Since v5 each stream also subscribes to its venue's **trades** channel
+(`market_trades` / `trade` / `live_trades_*`) on the same socket — a stream
+owns one connection, and a resync is a disconnect. The interleaving hazards
+are venue-shaped and documented where they live: Coinbase's connection-scoped
+sequence check runs before channel dispatch (a third channel is counted, not
+read as a gap), Kraken's CRC is computed only in the book arm (a print
+provably cannot touch checksum state), and a Bitstamp trade's
+`microtimestamp` never reaches the book's ordering check (the channels
+interleave arbitrarily; an older print is normal delivery, not a
+regression). Every venue answers a trade subscription with a burst of recent
+history, which is dropped — forwarding it would replay the same prints on
+every reconnect. §8 has what the trades tape proved, and found.
+
 ### The type that carries this
 
 `BookState` has three variants, and the third is the one that matters:
@@ -812,6 +825,8 @@ different situations), `/health`.
 | `ma_cluster_members` disagreeing between nodes | Normal for one renewal interval after a change; a lasting disagreement means one node cannot read what another can write. | The lease argument tolerates this — it is exactly what holder-side expiry and the settling period cover — but a *persistent* split means the registry is not the shared thing it is assumed to be. |
 | `ma_book_age_ms` large, status still `live` | Nothing has invalidated the book, but nothing is updating it either. | On a live feed the idle watchdog should have fired; if it has not, check that the heartbeat subscription is actually established. |
 | `ma_archive_write_failures_total` climbing, `ma_archive_files_written_total` flat | The store is rejecting every write. Ingest and the live books are unaffected **by design** — which is exactly why this is the only place the failure shows. | The archive is accumulating a gap while the process looks healthy. Check credentials, the bucket policy, and disk space — before the hour rolls, not after. These series only exist when `--archive` is configured: absent means "not archiving", zero means "archiving cleanly". |
+| `ma_trades_total` flat on a liquid pair, book counters still moving | The trades subscription quietly died while the book channel stayed healthy — they share a socket but are separate subscriptions. | The book is unaffected. A reconnect resubscribes both channels; if it recurs, compare the subscribe payload against the venue's current docs — a renamed channel fails silently, which is what `subscribing_and_parsing_agree_on_the_channel` exists to pin. |
+| `ma_cross_window_trusted_ms_floor` far below `span` while each venue's own `ma_window_trusted_ms` looks fine | One *contributing* venue is the bottleneck — the floor is a `min`, and a single briefly-desynced leg bounds the whole consolidated claim. | Working as designed. `/api/snapshot` names each excluded venue and the floor's shape tells you which leg to look at. Read `ma_cross_window_max_lag_ms` beside it: on a gateway, a slow *node* and an untrusted *book* both narrow the reading, for different reasons. |
 
 ### A note on restarts
 

@@ -38,7 +38,9 @@ A **stream** is one `(venue, symbol)` pair. It owns a connection, a book, a set
 of counters and a resync signal. Three venues × two symbols is six streams and
 six sockets — deliberately not multiplexed, because a resync *is* a disconnect
 and multiplexing would make one book's gap tear down every other symbol on that
-venue.
+venue. Since v5 each connection carries the venue's book **and** trades
+channels; the interleaving analysis is per venue and lives in the parsers
+(and `docs/DESIGN.md` §3).
 
 **Ingest tasks.** One `tokio` task per stream. Owns reconnect, heartbeat/ping,
 deserialization, and the periodic REST depth audit. Emits `MarketEvent` into the

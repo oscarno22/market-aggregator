@@ -27,12 +27,13 @@ a live run uses — with the network unplugged.
 just demo tapes/2026-08-09-btc-usd-live.jsonl.gz
 ```
 
-Three tapes, for different jobs:
+Four tapes, for different jobs:
 
 | Tape | Length | What it is good for |
 |---|---|---|
 | `2026-08-09-btc-usd-live.jsonl.gz` | 3 min, 5827 frames | The default. Its touch moves — 114 distinct top-of-book states, 1.8 bps of range — so rolling indicators and the cross-venue view show real numbers. |
 | `2026-08-09-btc-usd-reconnect.jsonl.gz` | 105 s, 2874 frames | Recovery. Three live venues, each forced to drop and resubscribe in turn (30 s, 55 s, 80 s), so the tape carries what each venue *actually sends* on a new subscription. Kraken's CRC32 agrees with the book rebuilt from it. |
+| `2026-08-09-btc-usd-trades.jsonl.gz` | 2 min, 5407 frames | Trades. The first recording with all three venues' trade channels subscribed beside the book — and the one that caught **Bitstamp's diff stream producing a genuinely crossed book**, the failure `OrderOnly` can detect no other way. `trades_tape.rs` pins the episode. |
 | `2026-08-09-btc-usd.jsonl.gz` | 60 s, 1503 frames | The original, kept because it is the recording that found the three parser bugs below. Its Coinbase touch never moves once across 49,940 level updates, so it exercises parsing and books but not anything derived over time. |
 
 Then open <http://127.0.0.1:8080>. To connect to the live venues instead:
