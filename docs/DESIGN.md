@@ -742,6 +742,26 @@ The second is the more uncomfortable of the two: the bug was in the *test
 harness* — the thing every offline claim in this document rests on — and it
 presented as a bug in the system under test.
 
+### What the trades tape caught, that no one was looking for
+
+The v5 recording — the first with all three venues' trades channels
+subscribed beside the book — was made to verify the trade parsers, and it did:
+every wire shape matched, 238 prints forwarded, zero parse errors. But two
+minutes of live traffic also handed over something no fixture and no clean
+tape could: **Bitstamp's own diff stream produced a crossed book partway
+through the recording.** Reconstructing the book offline from the tape's
+diffs alone — REST snapshot, then every diff, no trade frames involved —
+reproduces the cross at the same prices the desync reason names. A diff was
+lost or reordered upstream of our socket, the stale level sat invisible (this
+is the venue where a dropped diff leaves no trace in the protocol), and the
+crossed-book guard — the only loss signal `OrderOnly` has — fired.
+
+`ma-server/tests/trades_tape.rs` pins the whole episode: detection at the
+exact recorded prices, the one desync it cost, and prints still counted and
+surfaced while the book was untrusted, because a trade is the venue's fact
+about its own matches rather than a claim about our book. The runbook row for
+`crossed book` used to describe a hypothetical; it now cites a recording.
+
 ---
 
 ## 9. Operating it

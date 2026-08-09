@@ -198,6 +198,17 @@ live run.
    for" clock reset on every one — on the single venue whose guarantee is
    strongest, and only there.
 
+**From the v5 trades tape — a find, not a bug:**
+
+8. Two minutes of live traffic was enough to record **Bitstamp's diff stream
+   producing a genuinely crossed book** — a lost or reordered diff upstream of
+   our socket, on the venue where a dropped message leaves no trace in the
+   protocol. The crossed-book guard (Bitstamp's only loss signal) fired at the
+   recorded prices, and reconstructing the book from the tape's diffs alone
+   proves the trade frames sharing the socket had nothing to do with it. The
+   runbook row for `crossed book` used to describe a hypothetical; it now
+   cites a recording, and `trades_tape.rs` pins the whole episode offline.
+
 A fixture author writes the messages they are thinking about. A policy author
 picks the units they are thinking in. Both are why
 [`just record`](justfile) and [`just audit-probe`](justfile) exist.

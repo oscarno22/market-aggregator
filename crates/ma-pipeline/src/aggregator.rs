@@ -1676,4 +1676,59 @@ mod tests {
         let stream = StreamId::new(VenueId::Coinbase, symbol());
         assert_eq!(metrics.stream(&stream).unwrap().snapshot().trades, 1);
     }
+
+    #[test]
+    fn the_windows_see_the_prints_the_counters_count() {
+        // The counter and observe_trade are fed from one match arm, and this
+        // is the test that keeps it that way: a window reading zero over a
+        // stream whose counter climbed would mean the two had been split into
+        // separate code paths — the class of divergence this project keeps
+        // refusing. On a TestClock, because the tape replays full-speed under
+        // the system clock where window reads are documented as meaningless
+        // (see the replay binary on ScaledClock).
+        let clock = Arc::new(TestClock::new());
+        let stream = StreamId::new(VenueId::Coinbase, symbol());
+        let metrics = Arc::new(Metrics::new(vec![stream.clone()]));
+        let mut agg = Aggregator::new(
+            vec![spec_for(VenueId::Coinbase, &symbol()).expect("spec")],
+            Arc::clone(&clock) as Arc<dyn ma_core::Clock>,
+            &metrics,
+        );
+
+        let at = ma_core::Clock::now(&*clock);
+        let stamped = |json: &str| {
+            IngestMessage::Frame(RawFrame::new(stream.clone(), json.as_bytes().to_vec(), at))
+        };
+        agg.apply(stamped(
+            r#"{"channel":"l2_data","sequence_num":0,"events":[{"type":"snapshot",
+               "product_id":"BTC-USD","updates":[
+                 {"side":"bid","price_level":"100","new_quantity":"1"},
+                 {"side":"offer","price_level":"101","new_quantity":"1"}]}]}"#,
+        ));
+        agg.apply(stamped(
+            r#"{"channel":"market_trades","sequence_num":1,"events":[{"type":"update",
+               "trades":[{"trade_id":"1","product_id":"BTC-USD","price":"100.50",
+                          "size":"0.25","side":"SELL","time":"2026-08-09T00:00:00Z"}]}]}"#,
+        ));
+
+        // Let the print's bucket complete, then read.
+        clock.advance(Duration::from_millis(600));
+        let v = view(&agg.snapshot(empty_channel()), VenueId::Coinbase);
+
+        assert_eq!(v.counters.trades, 1);
+        let shortest = v.windows.iter().min_by_key(|w| w.span_ms).expect("windows");
+        assert_eq!(
+            shortest.trades, 1,
+            "the counter saw a print the windows did not: {shortest:?}"
+        );
+        assert_eq!(
+            shortest.volume.as_ref().map(ToString::to_string),
+            Some("0.25".to_owned())
+        );
+        assert_eq!(
+            shortest.vwap.as_ref().map(ToString::to_string),
+            Some("100.50".to_owned()),
+            "one print's vwap is that print's price"
+        );
+    }
 }
