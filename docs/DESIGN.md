@@ -829,6 +829,20 @@ That is the deliberate floor, not an oversight: the alternative is fsyncing per
 event, which would put the durability layer on the ingest hot path — the exact
 coupling the bounded channel exists to prevent.
 
+**Restarting into the same hour used to lose the previous run's parts**, and
+deserves its own paragraph because nothing above catches it: part numbers
+lived only in process memory, so a restarted writer began again at
+`part-00000.parquet` and `put` silently replaced the file the previous run had
+just flushed. Every mitigation above made the loss *smaller* — `SIGTERM`
+handling and `max_open` dutifully wrote files for the next process to
+overwrite. The fix is that the first time a writer touches an hour directory
+it lists what is already there and resumes after the highest existing part
+(numbering is per-hour now, so a directory's names also say how many parts the
+hour holds). A *failed* listing fails the write rather than guessing a name:
+the caller already warns, counts it against `ma_archive_write_failures_total`,
+and retries the listing on the next append — a transient outage costs a
+bounded, counted gap, exactly like a failed upload.
+
 ---
 
 ## 10. What v2 left unproven

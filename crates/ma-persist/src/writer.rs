@@ -134,9 +134,15 @@ pub struct EventWriter {
     event_seq: i64,
     /// One open file per symbol. See the module docs for what that costs.
     open: BTreeMap<String, OpenFile>,
-    /// Next part number per symbol, so `part-NNNNN` counts up within a
-    /// partition instead of jumping wherever another symbol's rolls left it.
-    /// Kept beyond the file's life, which is why it is not on [`OpenFile`].
+    /// Next part number per *directory* — one `symbol=…/date=…/hour=…/` — not
+    /// per symbol for the writer's lifetime. Keyed this way for two reasons.
+    /// Within a run, numbering restarts at each hour, so a directory's part
+    /// numbers say how many parts that hour holds. Across runs, the first
+    /// touch of a directory lists what is already in it and resumes after the
+    /// highest existing part — which is the fix for a real bug: a writer keyed
+    /// by symbol alone started every process at `part-00000`, so a restart
+    /// inside the same hour silently overwrote the previous run's file. The
+    /// archive lost data on every same-hour redeploy and nothing reported it.
     parts: BTreeMap<String, u64>,
     /// The one set of tallies for this writer. Shared with `/metrics` when the
     /// caller passes its own `Arc` via [`EventWriter::with_counters`]; a fresh
@@ -267,8 +273,9 @@ impl EventWriter {
             self.roll(&partition).await?;
         }
         if !self.open.contains_key(&partition) {
-            let file =
-                self.start_file(&partition, window, event.ingest_ts.wall(), event.ingest_ts)?;
+            let file = self
+                .start_file(&partition, window, event.ingest_ts.wall(), event.ingest_ts)
+                .await?;
             self.open.insert(partition.clone(), file);
             self.counters.set_open_files(self.open.len() as u64);
         }
@@ -323,7 +330,7 @@ impl EventWriter {
         i64::try_from(secs / per).unwrap_or(i64::MAX)
     }
 
-    fn start_file(
+    async fn start_file(
         &mut self,
         partition: &str,
         window: i64,
@@ -337,9 +344,25 @@ impl EventWriter {
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
             .build();
         let writer = ArrowWriter::try_new(Vec::new(), EVENT_SCHEMA.clone(), Some(props))?;
-        let part = *self.parts.entry(partition.to_owned()).or_insert(0);
-        let key = self.key_for(partition, at, part);
-        self.parts.insert(partition.to_owned(), part + 1);
+
+        let dir = self.dir_for(partition, at);
+        let part = match self.parts.get(&dir) {
+            Some(next) => *next,
+            // First touch of this directory in this process: ask the store
+            // what is already there and resume after it. This is what makes a
+            // restart inside the same hour add `part-00001` instead of
+            // overwriting `part-00000`.
+            //
+            // A failed listing fails the write, deliberately. The fallback
+            // that avoids an overwrite would be a name outside the readable
+            // `part-NNNNN` scheme, and the caller already has the right shape
+            // for a failed write: warn, count it, drop the event — the next
+            // append retries the listing. A transient outage costs a bounded,
+            // counted gap, exactly like a failed upload.
+            None => next_part(&self.store.list(&dir).await?),
+        };
+        self.parts.insert(dir.clone(), part + 1);
+        let key = format!("{dir}part-{part:05}.parquet");
         debug!(%key, window, "opening a new parquet file");
         Ok(OpenFile {
             window,
@@ -367,10 +390,10 @@ impl EventWriter {
     /// recover it, `ParquetRecordBatchReader` reading a single file does not —
     /// so dropping the column would make a file's own contents unidentifiable
     /// when read outside its directory.
-    fn key_for(&self, partition: &str, at: SystemTime, part: u64) -> String {
+    fn dir_for(&self, partition: &str, at: SystemTime) -> String {
         let (date, hour) = date_hour(at);
         format!(
-            "{}/symbol={partition}/date={date}/hour={hour:02}/part-{part:05}.parquet",
+            "{}/symbol={partition}/date={date}/hour={hour:02}/",
             self.prefix
         )
     }
@@ -416,6 +439,28 @@ impl EventWriter {
 
 fn into_prefix(raw: String) -> String {
     raw.trim_matches('/').to_owned()
+}
+
+/// The part number to write next, given what a directory already holds.
+///
+/// Tolerant on purpose: only keys shaped `…/part-NNNNN.parquet` count, and
+/// anything else in the directory — a stray file, a future layout — is
+/// ignored rather than an error. The one job here is to never re-issue a
+/// number that exists, so the answer is max + 1 over what parses, and 0 for
+/// an empty or unrecognisable listing.
+fn next_part(existing: &[String]) -> u64 {
+    existing
+        .iter()
+        .filter_map(|key| {
+            key.rsplit('/')
+                .next()?
+                .strip_prefix("part-")?
+                .strip_suffix(".parquet")?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .map_or(0, |max| max.saturating_add(1))
 }
 
 /// A symbol as a path component.
@@ -1133,10 +1178,10 @@ mod tests {
 
     #[tokio::test]
     async fn part_numbers_count_up_within_a_partition() {
-        // Per-symbol counters. A shared counter would leave each partition's
-        // parts numbered wherever the other symbol's rolls happened to land —
-        // readable, but it makes "how many parts does this hour have?"
-        // unanswerable from the names.
+        // Per-directory counters. A counter shared across symbols would leave
+        // each partition's parts numbered wherever the other symbol's rolls
+        // happened to land — readable, but it makes "how many parts does this
+        // hour have?" unanswerable from the names.
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::store::LocalStore::new(dir.path()));
         let mut writer = EventWriter::new(store.clone(), "events").with_config(WriterConfig {
@@ -1176,6 +1221,183 @@ mod tests {
                 "{symbol} part numbers are not contiguous"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_restart_in_the_same_hour_resumes_instead_of_overwriting() {
+        // The bug this layout had from v4 until now: part numbers lived only
+        // in process memory, so a second writer over the same store — i.e. a
+        // restart, i.e. any same-hour redeploy — started back at part-00000
+        // and silently replaced the previous run's file. The archive lost
+        // data on every deploy and nothing reported it.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::LocalStore::new(dir.path()));
+
+        let mut first = EventWriter::new(store.clone(), "events");
+        first
+            .append(&event(
+                EventKind::Heartbeat { counter: Some(1) },
+                at(1_786_247_000),
+            ))
+            .await
+            .unwrap();
+        first.close().await.unwrap();
+
+        let mut second = EventWriter::new(store.clone(), "events");
+        second
+            .append(&event(
+                EventKind::Heartbeat { counter: Some(2) },
+                at(1_786_247_100),
+            ))
+            .await
+            .unwrap();
+        second.close().await.unwrap();
+
+        let keys = crate::store::ObjectStore::list(&*store, "events/")
+            .await
+            .unwrap();
+        assert_eq!(
+            keys.len(),
+            2,
+            "the second run overwrote the first's file: {keys:?}"
+        );
+        assert!(keys[0].ends_with("part-00000.parquet"), "{keys:?}");
+        assert!(
+            keys[1].ends_with("part-00001.parquet"),
+            "the restart did not resume after the existing part: {keys:?}"
+        );
+        // Both files are whole: each run's row survived, not just its name.
+        for key in &keys {
+            let bytes = crate::store::ObjectStore::get(&*store, key).await.unwrap();
+            assert!(!bytes.is_empty(), "{key} is empty");
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_ignores_keys_that_are_not_parts() {
+        // The listing is advisory input, not a schema: a stray file in the
+        // hour directory (a README, a checksum sidecar, some future layout)
+        // must not break the writer or perturb the numbering.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::LocalStore::new(dir.path()));
+        let (date, hour) = date_hour(at(1_786_247_000).wall());
+        let hour_dir = format!("events/symbol=BTC-USD/date={date}/hour={hour:02}");
+        for stray in [
+            format!("{hour_dir}/README.txt"),
+            format!("{hour_dir}/part-abc.parquet"),
+            format!("{hour_dir}/part-00003.parquet"),
+        ] {
+            crate::store::ObjectStore::put(&*store, &stray, vec![1])
+                .await
+                .unwrap();
+        }
+
+        let mut writer = EventWriter::new(store.clone(), "events");
+        writer
+            .append(&event(
+                EventKind::Heartbeat { counter: None },
+                at(1_786_247_000),
+            ))
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let keys = crate::store::ObjectStore::list(&*store, "events/")
+            .await
+            .unwrap();
+        assert!(
+            keys.iter().any(|k| k.ends_with("part-00004.parquet")),
+            "resume did not continue past the highest parseable part: {keys:?}"
+        );
+        assert!(
+            !keys.iter().any(|k| k.ends_with("part-00000.parquet")),
+            "a stray key reset the numbering: {keys:?}"
+        );
+    }
+
+    /// A store whose listings fail — a bucket with `PutObject` but a broken
+    /// `ListBucket` condition, which the S3 scope probe cannot rule out for
+    /// sub-prefixes.
+    #[derive(Debug)]
+    struct ListFailsStore;
+
+    impl crate::store::ObjectStore for ListFailsStore {
+        fn describe(&self) -> String {
+            "list-fails".to_owned()
+        }
+
+        fn put(
+            &self,
+            _key: &str,
+            _bytes: Vec<u8>,
+        ) -> TestFuture<'_, Result<(), crate::store::StoreError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn get(&self, key: &str) -> TestFuture<'_, Result<Vec<u8>, crate::store::StoreError>> {
+            let key = key.to_owned();
+            Box::pin(async move {
+                Err(crate::store::StoreError::Rejected {
+                    key,
+                    message: "no reads".to_owned(),
+                })
+            })
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+        ) -> TestFuture<'_, Result<Vec<String>, crate::store::StoreError>> {
+            let prefix = prefix.to_owned();
+            Box::pin(async move {
+                Err(crate::store::StoreError::Rejected {
+                    key: prefix,
+                    message: "listing refused".to_owned(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_fails_the_write_instead_of_guessing() {
+        // The fallback that avoids an overwrite without a listing is a name
+        // outside the readable part-NNNNN scheme — so there is no fallback.
+        // The failure takes the same shape as a failed upload: the caller
+        // warns, counts it, drops the event, and the next append retries.
+        let counters = Arc::new(ArchiveCounters::default());
+        let writer = EventWriter::new(Arc::new(ListFailsStore), "events")
+            .with_counters(Arc::clone(&counters));
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(event(
+            EventKind::Heartbeat { counter: None },
+            at(1_786_247_000),
+        ))
+        .unwrap();
+        drop(tx);
+        let writer = run(rx, writer).await;
+
+        assert_eq!(writer.files_written(), 0);
+        assert_eq!(
+            counters.write_failures(),
+            1,
+            "the refused listing was not counted as a failed write"
+        );
+    }
+
+    #[test]
+    fn next_part_resumes_after_the_highest_existing_number() {
+        assert_eq!(next_part(&[]), 0);
+        assert_eq!(next_part(&["events/x/part-00000.parquet".to_owned()]), 1);
+        assert_eq!(
+            next_part(&[
+                "events/x/part-00002.parquet".to_owned(),
+                "events/x/part-00000.parquet".to_owned(),
+                "events/x/README.txt".to_owned(),
+                "events/x/part-junk.parquet".to_owned(),
+            ]),
+            3
+        );
     }
 
     #[test]

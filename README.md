@@ -289,7 +289,11 @@ Deliberately unfinished, and stated rather than hidden:
   now `events/symbol=X/date=D/hour=H/part-N.parquet`, so a query for one symbol
   prunes to one subtree. That broke an assumption the reader had never written
   down — key order stopped being time order — so it now merges one cursor per
-  partition. Archives written under the old layout still read.
+  partition. Archives written under the old layout still read. A second bug
+  hid in the same layout for a while: part numbers lived only in process
+  memory, so a restart inside the same hour re-issued `part-00000` and
+  silently overwrote the previous run's file. The writer now lists an hour
+  directory on first touch and resumes after what is already there.
 
 - ~~A cluster registry backed by S3 is not implemented.~~ **Done**, and run
   live: two nodes sharding six streams through `s3://…/events/cluster`, a
