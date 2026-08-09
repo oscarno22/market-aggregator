@@ -75,6 +75,28 @@ pub enum DesyncReason {
     SnapshotGap,
 }
 
+impl DesyncReason {
+    /// Whether repairing this needs a **new stream** from the venue.
+    ///
+    /// Every venue here recovers by receiving a fresh snapshot, and only sends
+    /// one on a new subscription — so most reasons here mean "reconnect".
+    /// Two do not, and getting that wrong costs a connection every time:
+    ///
+    /// - [`Self::AwaitingSnapshot`] is Bitstamp's *normal* opening state, not
+    ///   a fault. The socket is fine and a REST fetch is already in flight.
+    ///   Treating it as a failure reconnects on every single startup —
+    ///   observed doing exactly that against the live venue — throwing away a
+    ///   healthy connection and restarting a handshake that was going to
+    ///   succeed, against a venue that can rate-limit for it.
+    /// - [`Self::ConnectionLost`] already means a reconnect is underway.
+    ///   Asking for another would mean one request per reconnect.
+    ///
+    /// The distinction is "is anyone already fixing this?", not "is this bad?"
+    pub const fn needs_fresh_stream(&self) -> bool {
+        !matches!(self, Self::AwaitingSnapshot | Self::ConnectionLost)
+    }
+}
+
 /// Whether the book can be believed, and how much.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BookState {

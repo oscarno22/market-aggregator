@@ -370,12 +370,13 @@ impl Aggregator {
                             // request another; that case is handled in the
                             // SessionEnded arm, which deliberately does not
                             // ask.
-                            if matches!(after, BookState::Desynced { .. })
+                            if let BookState::Desynced { reason, .. } = after
                                 && !matches!(before, BookState::Desynced { .. })
+                                && reason.needs_fresh_stream()
                             {
                                 let heard = self.resync.request(venue);
                                 warn!(
-                                    %venue, heard,
+                                    %venue, ?reason, heard,
                                     "requesting a resync; the book cannot repair \
                                      itself without a fresh snapshot"
                                 );
@@ -803,6 +804,69 @@ mod tests {
             requests.requested(VenueId::Coinbase),
             1,
             "a sequence gap must ask for a resync"
+        );
+    }
+
+    #[test]
+    fn bitstamps_normal_startup_does_not_trigger_a_reconnect() {
+        // Caught against the live venue, not in a test: Bitstamp opens in
+        // Desynced{AwaitingSnapshot} on every connection, because it sends no
+        // snapshot over the socket and the REST fetch is still in flight. That
+        // is the protocol working, not a fault. Treating it as one reconnected
+        // on every single startup — discarding a healthy socket and restarting
+        // a handshake that was about to succeed, against a venue that can
+        // rate-limit for it.
+        let requests = ResyncRequests::new([VenueId::Bitstamp]);
+        let metrics = Arc::new(Metrics::new([VenueId::Bitstamp]));
+        let mut agg = Aggregator::new(
+            symbol(),
+            vec![spec_for(VenueId::Bitstamp, &symbol()).unwrap()],
+            Arc::new(SystemClock),
+            &metrics,
+        )
+        .requesting_resync_through(requests.clone());
+
+        agg.apply(frame(
+            VenueId::Bitstamp,
+            r#"{"event":"data","channel":"diff_order_book_btcusd","data":{"microtimestamp":"1700000000000001","bids":[["100","1"]],"asks":[]}}"#,
+        ));
+
+        let v = view(&agg.snapshot(empty_channel()), VenueId::Bitstamp);
+        assert_eq!(v.status, BookStatus::Desynced, "should await a snapshot");
+        assert_eq!(
+            requests.requested(VenueId::Bitstamp),
+            0,
+            "awaiting a REST snapshot means recovery is already in flight"
+        );
+
+        // ...but a genuine ordering fault, after the splice, still asks.
+        //
+        // The regressing timestamp has to sit *above* the splice point and
+        // below the last applied diff. Anything at or below the splice point
+        // is data the snapshot already contains, which is ignored rather than
+        // called a regression — see BitstampSync's `spliced_at`.
+        agg.apply(IngestMessage::Frame(RawFrame::rest_snapshot(
+            VenueId::Bitstamp,
+            br#"{"microtimestamp":"1700000000000000","bids":[["100","1"]],"asks":[["101","1"]]}"#
+                .to_vec(),
+            SystemClock.now(),
+        )));
+        assert_eq!(
+            view(&agg.snapshot(empty_channel()), VenueId::Bitstamp).status,
+            BookStatus::Live
+        );
+        agg.apply(frame(
+            VenueId::Bitstamp,
+            r#"{"event":"data","channel":"diff_order_book_btcusd","data":{"microtimestamp":"1700000000000020","bids":[["100","2"]],"asks":[]}}"#,
+        ));
+        agg.apply(frame(
+            VenueId::Bitstamp,
+            r#"{"event":"data","channel":"diff_order_book_btcusd","data":{"microtimestamp":"1700000000000010","bids":[["100","3"]],"asks":[]}}"#,
+        ));
+        assert_eq!(
+            requests.requested(VenueId::Bitstamp),
+            1,
+            "a timestamp regression is a real fault and must ask"
         );
     }
 
