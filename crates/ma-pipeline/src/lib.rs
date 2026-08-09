@@ -8,6 +8,7 @@ pub mod channel;
 pub mod ingest;
 pub mod metrics;
 pub mod net;
+pub mod resync;
 pub mod tape;
 
 pub use aggregator::{Aggregator, BookStatus, Snapshot, VenueView};
@@ -16,4 +17,5 @@ pub use channel::{ChannelMetrics, Receiver, SendOutcome, Sender, bounded};
 pub use ingest::{Ingest, IngestMessage, SessionEnd, Shutdown, ShutdownTrigger, shutdown};
 pub use metrics::{Metrics, Rates, VenueCounters, VenueCountersSnapshot};
 pub use net::{LiveNetwork, NetError, Network, Transport};
+pub use resync::{ResyncRequests, ResyncSignal};
 pub use tape::{Pacing, ReplayStats, TapeError, TapeReader, TapeWriter, TapedFrame, replay};

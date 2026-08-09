@@ -19,6 +19,7 @@ use ma_pipeline::channel::{Receiver, Sender, bounded};
 use ma_pipeline::ingest::{Ingest, IngestMessage, Shutdown, ShutdownTrigger, shutdown};
 use ma_pipeline::metrics::Metrics;
 use ma_pipeline::net::LiveNetwork;
+use ma_pipeline::resync::ResyncRequests;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::info;
@@ -67,6 +68,9 @@ pub struct Pipeline {
     clock: Arc<dyn Clock>,
     tick: Duration,
     metrics: Arc<Metrics>,
+    /// Lets the aggregator ask an ingest task to reconnect after a desync
+    /// that a healthy socket cannot repair on its own.
+    resync: ResyncRequests,
     tx: Sender<IngestMessage>,
     /// Taken by [`Self::spawn_aggregator`]. There is exactly one receiver, and
     /// moving it out is what makes "the aggregator is the single owner of
@@ -89,6 +93,7 @@ impl Pipeline {
         let (trigger, shutdown) = shutdown();
         Ok(Self {
             metrics: Arc::new(Metrics::new(venues.iter().copied())),
+            resync: ResyncRequests::new(venues.iter().copied()),
             symbol,
             venues,
             clock: Arc::new(SystemClock),
@@ -153,7 +158,8 @@ impl Pipeline {
             Arc::clone(&self.clock),
             &self.metrics,
         )
-        .with_tick(self.tick);
+        .with_tick(self.tick)
+        .requesting_resync_through(self.resync.clone());
 
         let handle = PipelineHandle {
             snapshots: aggregator.publisher(),
@@ -192,6 +198,9 @@ impl Pipeline {
             );
             if let Some(tape) = tape.clone() {
                 ingest = ingest.recording_to(tape);
+            }
+            if let Some(signal) = self.resync.subscribe(*venue) {
+                ingest = ingest.listening_for_resync(signal);
             }
             tasks.push(tokio::spawn(ingest.run()));
         }

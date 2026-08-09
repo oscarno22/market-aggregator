@@ -48,6 +48,7 @@ use crate::backoff::{Backoff, BackoffPolicy, EqualJitter};
 use crate::channel::{SendOutcome, Sender};
 use crate::metrics::VenueCounters;
 use crate::net::{Network, Transport};
+use crate::resync::ResyncSignal;
 
 /// Cooperative stop signal, shared by every ingest task in the process.
 ///
@@ -113,6 +114,10 @@ pub enum SessionEnd {
     Errored,
     /// Open but silent past the venue's idle timeout.
     Idle,
+    /// The aggregator asked for a resync: the book desynced from bad data
+    /// rather than a dead socket, and a fresh snapshot only arrives on a new
+    /// subscription. See [`crate::resync`].
+    ResyncRequested,
     /// The aggregator's channel closed — nothing downstream is listening, so
     /// there is no reason to keep reading.
     Downstream,
@@ -175,6 +180,7 @@ pub struct Ingest<N: Network> {
     policy: BackoffPolicy,
     tape: Option<mpsc::UnboundedSender<IngestMessage>>,
     shutdown: Shutdown,
+    resync: Option<ResyncSignal>,
 }
 
 // Hand-written because `Sender<RawFrame>` and `Arc<dyn Clock>` do not derive
@@ -207,7 +213,20 @@ impl<N: Network> Ingest<N> {
             policy: BackoffPolicy::DEFAULT,
             tape: None,
             shutdown,
+            resync: None,
         }
+    }
+
+    /// Listen for resync requests from the aggregator.
+    ///
+    /// Without this the task recovers from dead sockets and nothing else: a
+    /// book desynced by a sequence gap or a checksum mismatch sits broken on a
+    /// perfectly healthy connection, because the snapshot that would repair it
+    /// only arrives on a new subscription. See [`crate::resync`].
+    #[must_use]
+    pub fn listening_for_resync(mut self, signal: ResyncSignal) -> Self {
+        self.resync = Some(signal);
+        self
     }
 
     #[must_use]
@@ -247,10 +266,15 @@ impl<N: Network> Ingest<N> {
     pub async fn run(mut self) {
         let mut backoff = Backoff::new(self.policy, EqualJitter::from_entropy());
         let venue = self.venue();
+        // Taken out of `self` so a session can hold it mutably while still
+        // borrowing the rest of `self` immutably. Requests that arrive between
+        // sessions are not lost: the underlying watch remembers the counter,
+        // not the wakeup.
+        let mut resync = self.resync.take();
 
         while !self.shutdown.is_set() {
             let started = self.clock.now();
-            let end = self.session().await;
+            let end = self.session(resync.as_mut()).await;
             let lasted = self.clock.now().since(started);
 
             if !end.should_retry() {
@@ -287,7 +311,7 @@ impl<N: Network> Ingest<N> {
     }
 
     /// One connection attempt, from `connect` to whatever ends it.
-    async fn session(&self) -> SessionEnd {
+    async fn session(&self, mut resync: Option<&mut ResyncSignal>) -> SessionEnd {
         let venue = self.venue();
 
         let mut socket = match self.net.connect(&self.endpoint.ws_url).await {
@@ -333,6 +357,17 @@ impl<N: Network> Ingest<N> {
                 biased;
 
                 () = shutdown.wait() => return SessionEnd::Stopped,
+
+                () = async {
+                    match resync.as_deref_mut() {
+                        Some(signal) => signal.requested().await,
+                        // Nothing wired one up (replay, or a test); never fires.
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    warn!(%venue, "aggregator requested a resync; dropping the connection");
+                    return SessionEnd::ResyncRequested;
+                }
 
                 () = &mut rest, if rest_pending => {
                     rest_pending = false;
@@ -730,6 +765,88 @@ mod tests {
         assert_eq!(s.frames, 20, "ingest stalled on a full channel");
         assert_eq!(s.dropped, 18, "capacity 2, so all but the last two go");
         assert_eq!(rx.metrics().len, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resync_request_drops_the_connection_and_resubscribes() {
+        // The other half of the recovery loop. The socket here is perfectly
+        // healthy and will never close on its own — `Hang` means it stays open
+        // and silent — so reading the second session's frame is only possible
+        // if the resync request tore the first one down.
+        let net = Arc::new(FakeNetwork::new([
+            serving(&["{\"first\":1}"], FakeEnd::Hang),
+            serving(&["{\"second\":1}"], FakeEnd::Hang),
+        ]));
+        let (tx, rx) = bounded::<IngestMessage>(64);
+        let counters = Arc::new(VenueCounters::default());
+        let (trigger, shut) = shutdown();
+        let requests = crate::resync::ResyncRequests::new([VenueId::Coinbase]);
+        let probe = Arc::clone(&net);
+
+        let handle = tokio::spawn(
+            Ingest::new(
+                net,
+                endpoint(VenueId::Coinbase),
+                tx,
+                Arc::new(SystemClock),
+                Arc::clone(&counters),
+                shut,
+            )
+            .with_backoff(fast_policy())
+            .listening_for_resync(requests.subscribe(VenueId::Coinbase).expect("registered"))
+            .run(),
+        );
+
+        let first = rx.recv().await.expect("first frame");
+        assert!(matches!(first, IngestMessage::Frame(_)));
+
+        assert!(
+            requests.request(VenueId::Coinbase),
+            "the ingest task should be listening"
+        );
+
+        // A session boundary, then a frame from a brand new connection.
+        let mut saw_boundary = false;
+        let mut saw_second = false;
+        for _ in 0..4 {
+            match rx.recv().await.expect("message") {
+                IngestMessage::SessionEnded { end, .. } => {
+                    assert_eq!(end, SessionEnd::ResyncRequested);
+                    saw_boundary = true;
+                }
+                IngestMessage::Frame(frame) => {
+                    if frame.payload == b"{\"second\":1}" {
+                        saw_second = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_boundary,
+            "the aggregator was never told the stream restarted"
+        );
+        assert!(saw_second, "the connection was not actually re-established");
+        assert_eq!(counters.snapshot().connects, 2);
+        assert_eq!(probe.attempts().len(), 2);
+
+        trigger.stop();
+        let _ = handle.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_a_resync_signal_a_healthy_socket_is_never_dropped() {
+        // The signal is opt-in. A task with none (replay, or a venue whose
+        // recovery is handled elsewhere) must not reconnect spontaneously.
+        let net = FakeNetwork::new([serving(&["{\"a\":1}"], FakeEnd::Hang)]);
+        let h = Harness::start(VenueId::Coinbase, net);
+        h.next_payload().await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        let s = h.counters.snapshot();
+        assert_eq!(s.connects, 1);
+        assert_eq!(s.idle_timeouts, 0, "coinbase idle timeout is 15s");
+        h.finish().await;
     }
 
     #[tokio::test(start_paused = true)]

@@ -46,6 +46,7 @@ use tracing::{debug, info, warn};
 use crate::channel::{ChannelMetrics, Receiver};
 use crate::ingest::{IngestMessage, Shutdown};
 use crate::metrics::{Metrics, Rates, VenueCounters, VenueCountersSnapshot};
+use crate::resync::ResyncRequests;
 
 /// How often the aggregator publishes, when not told otherwise.
 ///
@@ -204,6 +205,7 @@ pub struct Aggregator {
     tick: Duration,
     seq: u64,
     tx: broadcast::Sender<Arc<Snapshot>>,
+    resync: ResyncRequests,
 }
 
 impl Aggregator {
@@ -246,7 +248,22 @@ impl Aggregator {
             tick: DEFAULT_TICK,
             seq: 0,
             tx: broadcast::channel(BROADCAST_CAPACITY).0,
+            resync: ResyncRequests::default(),
         }
+    }
+
+    /// Wire up the channel that asks an ingest task to reconnect.
+    ///
+    /// Without it the aggregator can *detect* a desync and do nothing about
+    /// it. Every venue here recovers by getting a fresh snapshot, and every
+    /// venue only sends one on a new subscription, so a book broken by bad
+    /// data rather than a dead socket stays broken: the connection is healthy,
+    /// the idle watchdog never fires, and updates keep arriving that the book
+    /// correctly refuses to apply. See [`crate::resync`].
+    #[must_use]
+    pub fn requesting_resync_through(mut self, resync: ResyncRequests) -> Self {
+        self.resync = resync;
+        self
     }
 
     #[must_use]
@@ -343,6 +360,26 @@ impl Aggregator {
                         if before != after {
                             state.note_transition(before, after, frame.ingest_ts);
                             log_transition(venue, before, after);
+
+                            // A desync caused by the *data* — a gap, a failed
+                            // checksum, a crossed book — needs a new
+                            // subscription to repair, and only the ingest task
+                            // can get one. A desync caused by our own reset
+                            // after a disconnect must not land here, or the
+                            // reconnect that just happened would immediately
+                            // request another; that case is handled in the
+                            // SessionEnded arm, which deliberately does not
+                            // ask.
+                            if matches!(after, BookState::Desynced { .. })
+                                && !matches!(before, BookState::Desynced { .. })
+                            {
+                                let heard = self.resync.request(venue);
+                                warn!(
+                                    %venue, heard,
+                                    "requesting a resync; the book cannot repair \
+                                     itself without a fresh snapshot"
+                                );
+                            }
                         }
                         for outcome in outcomes {
                             if let Outcome::Event(event) = outcome
@@ -495,6 +532,7 @@ mod tests {
     use super::*;
     use crate::channel::bounded;
     use crate::ingest::SessionEnd;
+    use crate::resync::ResyncRequests;
     use ma_core::{SystemClock, TestClock};
     use ma_venues::{RawFrame, spec_for};
 
@@ -739,6 +777,87 @@ mod tests {
 
         let snap = agg.snapshot(empty_channel());
         assert_eq!(snap.weakest_integrity, Some(Integrity::OrderOnly));
+    }
+
+    #[test]
+    fn a_data_caused_desync_asks_the_ingest_task_to_reconnect() {
+        // Detection without recovery is the failure this closes. A sequence
+        // gap leaves a healthy socket delivering updates the book correctly
+        // refuses to apply; nothing else in the system would ever ask for the
+        // snapshot that repairs it.
+        let requests = ResyncRequests::new([VenueId::Coinbase]);
+        let metrics = Arc::new(Metrics::new([VenueId::Coinbase]));
+        let mut agg = Aggregator::new(
+            symbol(),
+            vec![spec_for(VenueId::Coinbase, &symbol()).unwrap()],
+            Arc::new(SystemClock),
+            &metrics,
+        )
+        .requesting_resync_through(requests.clone());
+
+        agg.apply(coinbase(0, "snapshot", "100", "101"));
+        assert_eq!(requests.requested(VenueId::Coinbase), 0, "healthy book");
+
+        agg.apply(coinbase(9, "update", "100", "101")); // expected 1
+        assert_eq!(
+            requests.requested(VenueId::Coinbase),
+            1,
+            "a sequence gap must ask for a resync"
+        );
+    }
+
+    #[test]
+    fn our_own_reset_after_a_disconnect_does_not_ask_for_another_reconnect() {
+        // SessionEnded already means the ingest task is reconnecting. Treating
+        // the Desynced state it produces as a fresh problem would have the
+        // aggregator request a reconnect for every reconnect — a self-inflicted
+        // storm against a venue that may already be rate-limiting us.
+        let requests = ResyncRequests::new([VenueId::Coinbase]);
+        let metrics = Arc::new(Metrics::new([VenueId::Coinbase]));
+        let mut agg = Aggregator::new(
+            symbol(),
+            vec![spec_for(VenueId::Coinbase, &symbol()).unwrap()],
+            Arc::new(SystemClock),
+            &metrics,
+        )
+        .requesting_resync_through(requests.clone());
+
+        agg.apply(coinbase(0, "snapshot", "100", "101"));
+        agg.apply(IngestMessage::SessionEnded {
+            venue: VenueId::Coinbase,
+            at: SystemClock.now(),
+            end: SessionEnd::Errored,
+        });
+
+        assert_eq!(requests.requested(VenueId::Coinbase), 0);
+    }
+
+    #[test]
+    fn a_book_already_desynced_does_not_re_request_on_every_frame() {
+        // A venue sending a hundred updates a second into a desynced book must
+        // not produce a hundred reconnect requests. The transition is what is
+        // interesting, not the state.
+        let requests = ResyncRequests::new([VenueId::Coinbase]);
+        let metrics = Arc::new(Metrics::new([VenueId::Coinbase]));
+        let mut agg = Aggregator::new(
+            symbol(),
+            vec![spec_for(VenueId::Coinbase, &symbol()).unwrap()],
+            Arc::new(SystemClock),
+            &metrics,
+        )
+        .requesting_resync_through(requests.clone());
+
+        agg.apply(coinbase(0, "snapshot", "100", "101"));
+        agg.apply(coinbase(9, "update", "100", "101")); // gap -> 1 request
+        for seq in 10..40 {
+            agg.apply(coinbase(seq, "update", "100", "101"));
+        }
+
+        assert_eq!(
+            requests.requested(VenueId::Coinbase),
+            1,
+            "only the transition into Desynced should ask"
+        );
     }
 
     #[test]

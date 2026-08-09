@@ -253,6 +253,58 @@ it — reporting it as a regression would desync a book that is exactly correct,
 intermittently, under network timing, on the venue whose guarantee is already
 the weakest.
 
+### Closing the loop: detection is in one task, recovery is in another
+
+The aggregator owns the books, so it is the only thing that can notice a
+sequence gap or a failed checksum. The ingest task owns the socket, so it is
+the only thing that can do anything about it. Every venue here recovers by
+getting a fresh snapshot, and every venue only sends one on a new
+subscription.
+
+Until those two were connected, only half the system worked. A book desynced
+by a **dead socket** recovered fine. A book desynced by **bad data** did not:
+the connection stays healthy so the idle watchdog never fires, the venue keeps
+sending updates the book correctly refuses to apply, and nothing ever asks for
+the snapshot that would repair it. That is the wrong way round — a gap is
+precisely the case the whole `Desynced` apparatus exists to catch.
+
+```mermaid
+sequenceDiagram
+  participant V as venue
+  participant I as ingest task
+  participant A as aggregator
+  V->>A: update, seq jumps 1 → 9
+  A->>A: Desynced{SequenceGap}
+  A->>I: resync requested
+  Note over I: socket is perfectly healthy;<br/>drop it anyway
+  I->>A: SessionEnded{ResyncRequested}
+  A->>A: sync.reset(), book stays Desynced
+  I->>V: reconnect + resubscribe
+  V->>I: fresh snapshot
+  I->>A: frame
+  A->>A: Live again
+```
+
+Two things stop this from becoming a self-inflicted reconnect storm:
+
+- Only the **transition into** `Desynced` requests a resync, not the state. A
+  venue sending a hundred updates a second into a broken book produces one
+  request, not a hundred.
+- The `SessionEnded` path deliberately does **not** request one. It already
+  means a reconnect is underway, and the `Desynced` state it produces is our
+  own doing — treating it as a fresh problem would mean requesting a reconnect
+  for every reconnect, against a venue that may already be rate-limiting us.
+
+The request is a monotonically increasing counter on a `watch`, not a flag or
+a queue: a request that arrives while the task is already mid-reconnect is not
+lost, and several during one outage coalesce into one reconnect.
+
+For Bitstamp a lighter recovery is possible in principle — re-fetch the REST
+snapshot without dropping the websocket — and is deliberately not implemented.
+A full reconnect gets a fresh socket *and* a fresh snapshot, which is the
+stronger resync, and the lighter path is better designed alongside v2's
+periodic re-snapshot audit than bolted on here.
+
 ### Backoff
 
 Exponential, capped, with **equal jitter** — a random point in
