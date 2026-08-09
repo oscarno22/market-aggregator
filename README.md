@@ -54,7 +54,10 @@ just gateway
 
 The gateway is the only place two things are visible: a consolidated touch over
 *every* venue rather than over the venues one node happens to own, and a stream
-two nodes both claim.
+two nodes both claim. Its page shows both — a node table with each node's lag
+and merge state, and a red banner naming any doubly-owned stream — and it is
+the *same* page a node serves: the panel renders exactly when the payload
+carries a `nodes` field, so the data decides, not a build flag.
 
 Endpoints: `/` the page, `/events` SSE, `/metrics` Prometheus text,
 `/api/snapshot` one JSON reading, `/health`.

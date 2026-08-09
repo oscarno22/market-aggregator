@@ -91,6 +91,22 @@
   table.windows tr.partial td.cover { color: var(--desync); font-weight: 600; }
   table.windows td.cover { color: var(--muted); }
   .windows-note { font-size: 0.7rem; color: var(--desync); margin: 0.1rem 0 0.6rem; }
+  /* The cluster panel — gateway only; an empty div on a plain node. The
+     duplicate banner is the loudest thing the page can show, deliberately. */
+  .dup-banner { background: color-mix(in srgb, var(--desync) 12%, var(--bg));
+    border: 1px solid var(--desync); border-radius: 6px; padding: 0.6rem 0.8rem;
+    margin: 0 0 0.8rem; font-size: 0.82rem; }
+  .cluster-panel { border: 1px solid var(--line); border-radius: 6px;
+    background: var(--card); padding: 0.6rem 0.8rem; margin: 0 0 1rem; }
+  .cluster-panel h2 { margin: 0 0 0.2rem; font-size: 0.9rem; }
+  table.nodes { width: 100%; font-size: 0.75rem; margin-top: 0.4rem; border-collapse: collapse; }
+  table.nodes th { color: var(--muted); font-weight: 400; text-align: left; padding: 0.15rem 0.6rem 0.15rem 0; }
+  table.nodes td { padding: 0.15rem 0.6rem 0.15rem 0; }
+  table.nodes tr.excluded td { color: var(--muted); }
+  .node-why { color: var(--desync); font-size: 0.72rem; }
+  .node-err { color: var(--muted); font-size: 0.7rem; max-width: 18rem;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
   /* The most recent print. Colored by taker side, aged like everything else. */
   .last-trade { font-size: 0.78rem; margin: 0.3rem 0; color: var(--muted); }
   .last-trade .num { color: var(--fg); }
@@ -120,6 +136,15 @@
   <h1>market-aggregator</h1>
   <span class="sub"><span id="streams">—</span> · <span id="conn">connecting…</span></span>
 </header>
+
+<!--
+  The cluster, when there is one. Empty on a plain node: a node's SSE payload
+  has no `nodes` field, so this renders nothing and the same page serves both.
+  On a gateway it is the one view that can show a doubly-owned stream — the
+  failure the whole coordination layer exists to prevent — which is why the
+  duplicate banner outranks everything else on the page.
+-->
+<div id="cluster"></div>
 
 <!--
   One section per symbol, each with its own integrity banner. The grouping is
@@ -190,6 +215,8 @@ function render(snap) {
     `${snap.symbols.map((g) => g.symbol).join(", ")} · ${streams} stream(s)`;
   $("conn").textContent = `live · seq ${snap.seq}`;
 
+  $("cluster").innerHTML = clusterPanel(snap);
+
   // The chart plots one symbol — the first — because overlaying BTC and ETH on
   // one price axis would compress both into flat lines. Which one is charted is
   // said out loud rather than left to be inferred from the numbers.
@@ -213,6 +240,57 @@ function render(snap) {
     if (s.length > HISTORY) s.shift();
   }
   draw();
+}
+
+// The cluster panel, rendered only when the snapshot carries a `nodes` field —
+// i.e. only when this page is being served by a gateway. A plain node's
+// payload has no such field, which is the entire mechanism keeping one page
+// serving both: the data decides, not a build flag.
+function clusterPanel(snap) {
+  if (!snap.nodes) return "";
+
+  const dup = (snap.duplicated ?? []).length
+    ? `<div class="dup-banner"><strong>${snap.duplicated.length} stream(s) owned by more than
+       one node.</strong> The one property the coordination layer exists to guarantee is
+       violated: duplicate subscriptions against venues that ban for them, and doubled
+       metrics under identical labels. ${snap.duplicated.map((d) =>
+         `<code>${escapeHtml(d.venue)}:${escapeHtml(d.symbol)}</code> on
+          ${d.nodes.map(escapeHtml).join(" and ")}`).join("; ")}.
+       Check every node was started with the same <code>--symbols</code>/<code>--venues</code>
+       and that no two share a <code>--node-id</code>.</div>`
+    : "";
+
+  const rows = snap.nodes.map((n) => {
+    const state = n.included
+      ? `<span class="badge live">merged</span>`
+      : `<span class="badge desynced">excluded</span>`;
+    const why = n.excluded_because ? ` <span class="node-why">${escapeHtml(n.excluded_because)}</span>` : "";
+    return `
+      <tr class="${n.included ? "" : "excluded"}">
+        <td><code>${escapeHtml(n.node)}</code></td>
+        <td>${state}${why}</td>
+        <td class="num">${ms(n.lag_ms)}</td>
+        <td class="num">${n.streams}</td>
+        <td class="num">${n.seq ?? "—"}</td>
+        <td class="num">${n.connects} / ${n.failures}</td>
+        <td class="node-err">${n.last_error ? escapeHtml(n.last_error) : ""}</td>
+      </tr>`;
+  }).join("");
+
+  return `${dup}
+    <div class="cluster-panel">
+      <h2>Cluster · ${snap.nodes.length} node(s), ${snap.nodes.filter((n) => n.included).length} merged</h2>
+      <div class="sub">This page is served by a gateway following every node's SSE. Each lag
+        below is added to every age from that node — a book is as stale as the hop that
+        delivered it, and a node that stops talking greys out instead of looking fresh forever.</div>
+      <table class="nodes">
+        <thead><tr>
+          <th>node</th><th>state</th><th>lag</th><th>streams</th><th>seq</th>
+          <th>connects / failures</th><th>last error</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
 }
 
 // One symbol: its own integrity banner, then a card per venue.

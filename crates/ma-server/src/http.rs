@@ -880,6 +880,30 @@ mod tests {
     }
 
     #[test]
+    fn the_cluster_panel_is_data_gated_not_build_gated() {
+        // One page serves a node and a gateway, and the cluster panel must
+        // appear exactly when the payload carries `nodes` — the contract
+        // `gateway.rs`'s integration test pins from the data side. These are
+        // string-level pins on the page itself, the same style as
+        // `the_page_is_self_contained`.
+        assert!(
+            INDEX.contains(r#"<div id="cluster">"#),
+            "the cluster panel's mount point is gone"
+        );
+        assert!(
+            INDEX.contains("if (!snap.nodes) return \"\";"),
+            "the panel is no longer gated on the payload's nodes field — a \
+             plain node would render an empty cluster or a gateway none"
+        );
+        assert!(
+            INDEX.contains("dup-banner"),
+            "the duplicated-streams banner is gone; a doubly-owned stream is \
+             only visible from the gateway, and this was the one place it \
+             was shown to a person"
+        );
+    }
+
+    #[test]
     fn the_page_is_self_contained() {
         // The demo has to work with the network unplugged — the same property
         // replay gives the pipeline. One CDN <script> would quietly undo it,

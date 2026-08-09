@@ -375,3 +375,50 @@ async fn a_node_that_is_not_listening_is_reported_rather_than_hidden() {
 
     drop(trigger);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_gateway_payload_carries_the_nodes_field() {
+    // The contract the page's cluster panel gates on. One index.html serves
+    // both a node and a gateway, and the thing that decides whether the
+    // panel renders is the presence of `nodes` in the payload — not a build
+    // flag, not a URL. So the contract has two halves and both must hold: a
+    // gateway's serialised snapshot carries `nodes` and `duplicated`, and a
+    // plain node's must never grow them, or every node would draw a cluster
+    // panel over data it does not have.
+    let (trigger, stop) = shutdown();
+    let a = node(vec![VenueId::Kraken], stop.clone()).await;
+    let merged = merged_over(&[&a], stop.clone()).await;
+
+    let gateway_json = serde_json::to_value(&merged).expect("serialise the merged snapshot");
+    assert!(
+        gateway_json.get("nodes").is_some(),
+        "a gateway payload lost its nodes field; the page can no longer \
+         render the cluster it merges"
+    );
+    assert!(gateway_json.get("duplicated").is_some());
+    assert!(
+        gateway_json.get("symbols").is_some(),
+        "flattening broke: the node-shaped fields must sit beside nodes, \
+         not under a wrapper, or the page's card rendering stops working \
+         on a gateway"
+    );
+
+    let client = feed::client(Duration::from_secs(2)).expect("client");
+    let body = client
+        .get(format!("http://{}/api/snapshot", a.addr))
+        .send()
+        .await
+        .expect("node snapshot")
+        .text()
+        .await
+        .expect("body");
+    let node_json: serde_json::Value = serde_json::from_str(&body).expect("node JSON");
+    assert!(
+        node_json.get("nodes").is_none(),
+        "a plain node's payload grew a nodes field — every node would now \
+         draw a cluster panel"
+    );
+    assert!(node_json.get("symbols").is_some());
+
+    drop(trigger);
+}
