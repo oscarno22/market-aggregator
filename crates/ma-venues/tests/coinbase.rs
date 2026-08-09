@@ -276,3 +276,97 @@ fn the_venue_clock_is_reported_but_never_used_for_ordering() {
         "the venue clock must not have become the ingest clock"
     );
 }
+
+#[test]
+fn a_trade_forwards_without_touching_the_book() {
+    // The fixture is pre-tape: hand-authored against the documented wire
+    // shape, and this project's own history (docs/DESIGN.md §8) says at
+    // least one field in a hand-authored fixture is usually wrong. The
+    // trades tape test in ma-server is the authority; this pins the
+    // *contract* — a print is forwarded and the book is untouched.
+    let mut vb = book();
+    vb.feed(&frame(fixture!("snapshot.json"))).unwrap();
+    let bids_before = levels(vb.book(), Side::Bid);
+    let asks_before = levels(vb.book(), Side::Ask);
+
+    let outcomes = vb
+        .feed(&frame(fixture!("market_trades_update.json")))
+        .unwrap();
+
+    let trades: Vec<(String, String, Option<Side>)> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            Outcome::Event(e) => match &e.kind {
+                EventKind::Trade {
+                    price,
+                    qty,
+                    taker_side,
+                } => Some((price.to_string(), qty.to_string(), *taker_side)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        trades,
+        [(
+            "60005.00".to_owned(),
+            "0.12500000".to_owned(),
+            Some(Side::Bid)
+        )],
+        "exactly our product's print, exact digits, BUY read as the taker bid"
+    );
+
+    // The ETH-USD print in the same frame is another product's, not ours.
+    // And the book itself is exactly what it was: a print never applies.
+    assert_eq!(levels(vb.book(), Side::Bid), bids_before);
+    assert_eq!(levels(vb.book(), Side::Ask), asks_before);
+    assert!(vb.book().state().is_live());
+}
+
+#[test]
+fn the_trade_snapshot_burst_is_history_and_is_ignored() {
+    // A new subscription answers with a `snapshot` of recent trades, and a
+    // resync is a new subscription: forwarding the burst would replay the
+    // same prints into every window and the archive on every reconnect.
+    let mut vb = book();
+    vb.feed(&frame(fixture!("snapshot.json"))).unwrap();
+
+    let outcomes = vb
+        .feed(&frame(fixture!("market_trades_snapshot.json")))
+        .unwrap();
+    assert!(
+        !outcomes.iter().any(|o| matches!(
+            o,
+            Outcome::Event(e) if matches!(e.kind, EventKind::Trade { .. })
+        )),
+        "the recent-trades burst was forwarded as live prints: {outcomes:?}"
+    );
+    assert!(vb.book().state().is_live());
+}
+
+#[test]
+fn a_trade_frame_advances_the_connection_scoped_sequence() {
+    // The counter is per connection, not per channel — the lesson the first
+    // live tape taught about heartbeats, re-pinned here for the third
+    // channel. After snapshot(0) and a trade frame(1), a book update
+    // claiming sequence 3 is a real gap: something on this connection was
+    // lost, and the trade frame must have counted for the check to know it.
+    let mut vb = book();
+    vb.feed(&frame(fixture!("snapshot.json"))).unwrap();
+    vb.feed(&frame(fixture!("market_trades_update.json")))
+        .unwrap();
+    vb.feed(&frame(fixture!("update_gap.json"))).unwrap();
+
+    match vb.book().state() {
+        BookState::Desynced {
+            reason:
+                DesyncReason::SequenceGap {
+                    expected: 2,
+                    got: 3,
+                },
+            ..
+        } => {}
+        other => panic!("expected a sequence gap desync, got {other:?}"),
+    }
+}

@@ -9,7 +9,7 @@
 //!
 //! Reference: <https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-channels>
 
-use ma_core::{DesyncReason, EventKind, Integrity, Level, VenueId};
+use ma_core::{DesyncReason, EventKind, Integrity, Level, Side, VenueId};
 use serde::Deserialize;
 
 use crate::sync::{Ingested, RecoveryStrategy, RestSnapshot, SyncAction, VenueError, VenueSync};
@@ -75,6 +75,52 @@ struct L2Update {
 #[derive(Deserialize)]
 struct HeartbeatEvent {
     heartbeat_counter: u64,
+}
+
+/// One `market_trades` event: a batch of prints, labelled `snapshot` for the
+/// recent-history burst a new subscription opens with, `update` for live ones.
+#[derive(Deserialize)]
+struct TradesEvent {
+    #[serde(rename = "type")]
+    kind: L2Kind,
+    #[serde(default)]
+    trades: Vec<WireTrade>,
+}
+
+#[derive(Deserialize)]
+struct WireTrade {
+    product_id: String,
+    price: String,
+    size: String,
+    #[serde(default)]
+    side: Option<TradeSide>,
+}
+
+/// The documentation shows `BUY`/`SELL` in upper case where the book channel
+/// uses lower; both are accepted, for the same reason [`CbSide`] accepts
+/// `offer` — casing is precisely the kind of detail this venue's docs have
+/// been wrong about before, and the tape is the authority.
+///
+/// Mapped to [`Side`] as the **taker**'s side: `Buy` means an aggressor
+/// lifted the ask. The docs do not say whose side this names; taker is the
+/// convention every downstream display assumes, nothing *decides* on it, and
+/// the field is `Option` so a mistaken reading here corrupts a label, never
+/// a book.
+#[derive(Deserialize)]
+enum TradeSide {
+    #[serde(alias = "BUY", alias = "buy")]
+    Buy,
+    #[serde(alias = "SELL", alias = "sell")]
+    Sell,
+}
+
+impl From<TradeSide> for Side {
+    fn from(side: TradeSide) -> Self {
+        match side {
+            TradeSide::Buy => Side::Bid,
+            TradeSide::Sell => Side::Ask,
+        }
+    }
 }
 
 /// `GET /api/v3/brokerage/market/product_book`. Public, unauthenticated, and
@@ -277,6 +323,41 @@ impl VenueSync for CoinbaseSync {
                     actions.push(SyncAction::Forward(EventKind::Heartbeat {
                         counter: Some(hb.heartbeat_counter),
                     }));
+                }
+                actions
+            }
+
+            "market_trades" => {
+                let mut actions = Vec::new();
+                for raw in envelope.events {
+                    let event: TradesEvent = serde_json::from_value(raw)
+                        .map_err(|e| VenueError::Malformed(e.to_string()))?;
+
+                    // A new subscription opens with a `snapshot` of recent
+                    // trades — history, not prints happening now. Forwarding
+                    // it would replay the same trades into every window and
+                    // the archive on every reconnect, and a resync *is* a
+                    // reconnect. Dropped rather than deduplicated: dedup by
+                    // trade_id adds state whose correctness nothing offline
+                    // can prove, to recover history the archive already has.
+                    if matches!(event.kind, L2Kind::Snapshot) {
+                        actions.push(SyncAction::Ignore);
+                        continue;
+                    }
+
+                    for trade in event.trades {
+                        // Same rule as l2_data: another product's prints are
+                        // not wrong, just not ours.
+                        if trade.product_id != self.product_id {
+                            continue;
+                        }
+                        let level = common::level_from_str_pair(&trade.price, &trade.size)?;
+                        actions.push(SyncAction::Forward(EventKind::Trade {
+                            price: level.price,
+                            qty: level.qty,
+                            taker_side: trade.side.map(Side::from),
+                        }));
+                    }
                 }
                 actions
             }

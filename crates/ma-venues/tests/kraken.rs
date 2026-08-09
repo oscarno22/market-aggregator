@@ -183,3 +183,66 @@ fn venue_ts_of(outcomes: &[Outcome]) -> Option<std::time::SystemTime> {
         Outcome::StateChanged { .. } => None,
     })
 }
+
+#[test]
+fn a_trade_forwards_and_the_next_book_update_still_verifies() {
+    // The property that makes a second channel safe on this venue: only the
+    // "book" arm can touch checksum state, so an interleaved print provably
+    // cannot corrupt verification. The assertion that matters is the last
+    // one — a book update *after* the trade still matches Kraken's CRC.
+    let mut vb = book();
+    vb.feed(&frame(fixture!("snapshot.json"))).unwrap();
+
+    let outcomes = vb.feed(&frame(fixture!("trade_update.json"))).unwrap();
+    let trades: Vec<(String, String, Option<Side>)> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            Outcome::Event(e) => match &e.kind {
+                ma_core::EventKind::Trade {
+                    price,
+                    qty,
+                    taker_side,
+                } => Some((price.to_string(), qty.to_string(), *taker_side)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        trades,
+        [(
+            "60005.10".to_owned(),
+            "0.12500000".to_owned(),
+            Some(Side::Bid)
+        )],
+        "exactly our pair's print, with the digits Kraken sent — trailing \
+         zeros included, which is what exact_decimal exists for"
+    );
+
+    vb.feed(&frame(fixture!("update.json"))).unwrap();
+    match vb.book().state() {
+        BookState::Live {
+            integrity: Integrity::Verified,
+            last_verified: Some(_),
+            ..
+        } => {}
+        other => panic!("the update after an interleaved trade did not verify: {other:?}"),
+    }
+}
+
+#[test]
+fn the_trade_snapshot_burst_is_history_and_is_ignored() {
+    // Same rule as Coinbase's market_trades snapshot: the subscribe answer
+    // is recent history, and a resync is a new subscribe.
+    let mut vb = book();
+    vb.feed(&frame(fixture!("snapshot.json"))).unwrap();
+
+    let outcomes = vb.feed(&frame(fixture!("trade_snapshot.json"))).unwrap();
+    assert!(
+        !outcomes.iter().any(|o| matches!(
+            o,
+            Outcome::Event(e) if matches!(e.kind, ma_core::EventKind::Trade { .. })
+        )),
+        "the recent-trades burst was forwarded as live prints: {outcomes:?}"
+    );
+}

@@ -94,6 +94,26 @@ struct WireLevel {
     qty: Decimal,
 }
 
+/// One print on the `trade` channel. Same exact-digits discipline as the
+/// book: price and qty arrive as bare JSON numbers, and although nothing
+/// checksums a trade, letting `f64` near one field of this venue and not
+/// another is how a discipline stops being one.
+#[derive(Deserialize)]
+struct TradeData {
+    symbol: String,
+    #[serde(deserialize_with = "exact_decimal")]
+    price: Decimal,
+    #[serde(deserialize_with = "exact_decimal")]
+    qty: Decimal,
+    /// `buy` or `sell` — the taker's direction, per the v2 docs. Untyped
+    /// until matched so an unexpected spelling degrades to "side unknown"
+    /// instead of failing the frame that carries the print.
+    #[serde(default)]
+    side: Option<String>,
+    #[serde(default)]
+    timestamp: Option<String>,
+}
+
 fn to_levels(wire: &[WireLevel]) -> Result<Vec<Level>, VenueError> {
     wire.iter()
         .map(|w| {
@@ -240,6 +260,63 @@ impl VenueSync for KrakenSync {
                     if let Some(checksum) = entry.checksum {
                         actions.push(SyncAction::Verify { checksum });
                     }
+                }
+                Ok(Ingested::untimed(actions).at(venue_ts))
+            }
+
+            "trade" => {
+                let Some(kind) = envelope.kind.as_deref() else {
+                    return Err(VenueError::Malformed(
+                        "trade message carried no \"type\"".to_owned(),
+                    ));
+                };
+
+                // A new subscription opens with a `snapshot` of recent
+                // trades. History, not prints happening now — forwarding it
+                // would replay the same trades on every reconnect. Same rule
+                // as Coinbase's market_trades snapshot, for the same reason.
+                if kind == "snapshot" {
+                    return Ok(Ingested::untimed(vec![SyncAction::Ignore]));
+                }
+
+                let entries: Vec<TradeData> = match &envelope.data {
+                    Some(raw) => serde_json::from_str(raw.get())
+                        .map_err(|e| VenueError::Malformed(e.to_string()))?,
+                    None => {
+                        return Err(VenueError::Malformed(
+                            "trade message carried no \"data\"".to_owned(),
+                        ));
+                    }
+                };
+
+                // Only `Forward` actions come out of this arm, which is what
+                // keeps trades provably unable to disturb the book: the CRC
+                // is computed fresh from book state in the "book" arm alone,
+                // and there is no sequence counter anywhere in this protocol
+                // for an interleaved message to advance.
+                let mut actions = Vec::new();
+                let mut venue_ts = None;
+                for entry in entries {
+                    if entry.symbol != self.symbol {
+                        continue;
+                    }
+                    venue_ts = entry
+                        .timestamp
+                        .as_deref()
+                        .and_then(common::parse_rfc3339)
+                        .or(venue_ts);
+
+                    let qty = Qty::from_decimal(entry.qty)
+                        .map_err(|e| VenueError::Malformed(e.to_string()))?;
+                    actions.push(SyncAction::Forward(ma_core::EventKind::Trade {
+                        price: Price::from_decimal(entry.price),
+                        qty,
+                        taker_side: match entry.side.as_deref() {
+                            Some("buy") => Some(Side::Bid),
+                            Some("sell") => Some(Side::Ask),
+                            _ => None,
+                        },
+                    }));
                 }
                 Ok(Ingested::untimed(actions).at(venue_ts))
             }

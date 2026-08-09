@@ -20,7 +20,7 @@
 //! REST snapshot body; making the actual HTTP request is the ingest task's
 //! job in `ma-pipeline`; nothing here performs I/O.
 
-use ma_core::{DesyncReason, Integrity, Level, VenueId};
+use ma_core::{DesyncReason, EventKind, Integrity, Level, Side, VenueId};
 use serde::Deserialize;
 
 use crate::sync::{
@@ -50,6 +50,24 @@ struct DiffData {
     bids: Vec<[String; 2]>,
     #[serde(default)]
     asks: Vec<[String; 2]>,
+}
+
+/// One print on the `live_trades_{pair}` channel.
+///
+/// Only the `_str` twins are read. Bitstamp also sends `price` and `amount`
+/// as JSON floats, and touching those would undo the exact-digits discipline
+/// every other number in this project follows — the floats exist on the wire,
+/// and this struct's job is to make them unrepresentable here.
+#[derive(Deserialize)]
+struct TradeData {
+    microtimestamp: String,
+    price_str: String,
+    amount_str: String,
+    /// `0` is a buy, `1` is a sell — the taker's direction, per the docs.
+    /// Anything else degrades to "side unknown" rather than failing the
+    /// frame that carries the print.
+    #[serde(rename = "type", default)]
+    direction: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -134,18 +152,24 @@ enum Mode {
 
 /// Sync discipline for one Bitstamp pair (e.g. `btcusd`).
 ///
-/// `channel` is Bitstamp's full channel name (`diff_order_book_btcusd`), not
-/// just the pair, since that's the literal string the wire envelope carries.
+/// Holds both full channel names (`diff_order_book_btcusd`,
+/// `live_trades_btcusd`) rather than the bare pair, since those are the
+/// literal strings the wire envelopes carry and string comparison against
+/// the wire is the whole job.
 #[derive(Debug)]
 pub struct BitstampSync {
     channel: String,
+    trades_channel: String,
     mode: Mode,
 }
 
 impl BitstampSync {
-    pub fn new(channel: impl Into<String>) -> Self {
+    /// `pair` is Bitstamp's native spelling, e.g. `btcusd`.
+    pub fn new(pair: impl AsRef<str>) -> Self {
+        let pair = pair.as_ref();
         Self {
-            channel: channel.into(),
+            channel: format!("diff_order_book_{pair}"),
+            trades_channel: format!("live_trades_{pair}"),
             mode: Mode::AwaitingSnapshot {
                 pending: Vec::new(),
             },
@@ -179,6 +203,36 @@ impl VenueSync for BitstampSync {
     fn ingest(&mut self, frame: &RawFrame) -> Result<Ingested, VenueError> {
         let envelope: Envelope = serde_json::from_slice(&frame.payload)
             .map_err(|e| VenueError::Malformed(e.to_string()))?;
+
+        // Prints are handled before the book path and never touch it. In
+        // particular a trade's microtimestamp is **not** fed to
+        // `check_order`: trades and diffs are separate channels whose
+        // timestamps interleave arbitrarily, so a print stamped older than
+        // the last diff is normal delivery, and running it through the
+        // ordering check would fabricate a `TimestampRegression` against a
+        // book that is perfectly correct.
+        if envelope.event == "trade" {
+            if envelope.channel != self.trades_channel {
+                return Err(VenueError::Malformed(format!(
+                    "trade for channel {:?}, expected {:?}",
+                    envelope.channel, self.trades_channel
+                )));
+            }
+            let data: TradeData = serde_json::from_value(envelope.data)
+                .map_err(|e| VenueError::Malformed(e.to_string()))?;
+            let micros = parse_micros(&data.microtimestamp)?;
+            let level = common::level_from_str_pair(&data.price_str, &data.amount_str)?;
+            let actions = vec![SyncAction::Forward(EventKind::Trade {
+                price: level.price,
+                qty: level.qty,
+                taker_side: match data.direction {
+                    Some(0) => Some(Side::Bid),
+                    Some(1) => Some(Side::Ask),
+                    _ => None,
+                },
+            })];
+            return Ok(Ingested::untimed(actions).at(Some(common::system_time_from_micros(micros))));
+        }
 
         if envelope.event != "data" {
             // bts:subscription_succeeded, bts:error, and the rest carry no

@@ -128,6 +128,18 @@ three: a checksum over the book you actually built validates the **resulting
 state** rather than the path taken to it. A sequence number proves you received
 every message; it says nothing about whether you applied them correctly.
 
+Each stream also subscribes to its venue's trades channel on the same socket
+(`market_trades`, `trade`, `live_trades_*`), and the interleaving is where the
+care went: Coinbase's connection-scoped sequence check runs before channel
+dispatch so a third channel is counted rather than read as a gap; Kraken's CRC
+is computed only in the book arm, so a print provably cannot touch checksum
+state; and a Bitstamp trade's `microtimestamp` never reaches the book's
+ordering check, because the two channels interleave arbitrarily and a print
+older than the last diff is normal delivery, not a regression. Every venue
+opens a trade subscription with a burst of *recent history*, which is dropped:
+forwarding it would replay the same prints on every reconnect, and a resync is
+a reconnect.
+
 So a book is never just "up". It is one of three things, and the third is the
 one most systems miss:
 

@@ -182,6 +182,11 @@ pub fn spec_for(venue: VenueId, symbol: &Symbol) -> Result<VenueSpec, VenueError
                     // Subscribing to heartbeats keeps traffic flowing and
                     // gives the idle watchdog something to count.
                     subscribe_coinbase(&native, "heartbeats"),
+                    // Prints, on the same socket as the book. A stream owns
+                    // one connection; `sequence_num` is connection-scoped and
+                    // checked before channel dispatch, so a third channel is
+                    // already counted correctly — see `CoinbaseSync::ingest`.
+                    subscribe_coinbase(&native, "market_trades"),
                 ],
                 rest_snapshot_url: None,
                 // Heartbeats arrive every second, so 15s of total silence is
@@ -209,9 +214,18 @@ pub fn spec_for(venue: VenueId, symbol: &Symbol) -> Result<VenueSpec, VenueError
             endpoint: VenueEndpoint {
                 venue,
                 ws_url: "wss://ws.kraken.com/v2".to_owned(),
-                subscribe: vec![format!(
-                    r#"{{"method":"subscribe","params":{{"channel":"book","symbol":["{native}"],"depth":{KRAKEN_DEPTH}}}}}"#
-                )],
+                subscribe: vec![
+                    format!(
+                        r#"{{"method":"subscribe","params":{{"channel":"book","symbol":["{native}"],"depth":{KRAKEN_DEPTH}}}}}"#
+                    ),
+                    // Prints. Kraken has no sequence counter for a second
+                    // channel to perturb, and the CRC is computed only in the
+                    // book arm — see `KrakenSync::ingest` for why interleaved
+                    // trades provably cannot touch checksum state.
+                    format!(
+                        r#"{{"method":"subscribe","params":{{"channel":"trade","symbol":["{native}"]}}}}"#
+                    ),
+                ],
                 rest_snapshot_url: None,
                 // Kraken sends its own heartbeat channel roughly every second
                 // to any connection holding a subscription.
@@ -231,9 +245,19 @@ pub fn spec_for(venue: VenueId, symbol: &Symbol) -> Result<VenueSpec, VenueError
             endpoint: VenueEndpoint {
                 venue,
                 ws_url: "wss://ws.bitstamp.net".to_owned(),
-                subscribe: vec![format!(
-                    r#"{{"event":"bts:subscribe","data":{{"channel":"diff_order_book_{native}"}}}}"#
-                )],
+                subscribe: vec![
+                    format!(
+                        r#"{{"event":"bts:subscribe","data":{{"channel":"diff_order_book_{native}"}}}}"#
+                    ),
+                    // Prints. Delivered with `event: "trade"`, which the sync
+                    // routes before the book path — a trade's microtimestamp
+                    // never reaches the ordering check, because the two
+                    // channels interleave arbitrarily and a print older than
+                    // the last diff is normal delivery, not a regression.
+                    format!(
+                        r#"{{"event":"bts:subscribe","data":{{"channel":"live_trades_{native}"}}}}"#
+                    ),
+                ],
                 rest_snapshot_url: Some(format!(
                     "https://www.bitstamp.net/api/v2/order_book/{native}/"
                 )),
@@ -255,7 +279,7 @@ pub fn spec_for(venue: VenueId, symbol: &Symbol) -> Result<VenueSpec, VenueError
                     policy: ma_core::AuditPolicy::DEFAULT,
                 }),
             },
-            sync: Box::new(BitstampSync::new(format!("diff_order_book_{native}"))),
+            sync: Box::new(BitstampSync::new(&native)),
             symbol: symbol.clone(),
             max_depth: None,
         },
@@ -467,8 +491,14 @@ mod tests {
         //
         // Coinbase is the one that actually bites: you subscribe to "level2"
         // and the data comes back labelled "l2_data".
+        //
+        // Since v5 every venue subscribes to a trades channel on the same
+        // socket, so the same drift is possible twice per venue — each trade
+        // case below carries the channel name the trades subscription
+        // implies, as an update (the snapshot burst is deliberately ignored
+        // and would fail this test's "not all Ignore" bar).
         let now = SystemClock.now();
-        let cases: [(VenueId, &str); 3] = [
+        let cases: [(VenueId, &str); 6] = [
             (
                 VenueId::Coinbase,
                 r#"{"channel":"l2_data","sequence_num":0,"events":[{"type":"snapshot","product_id":"BTC-USD","updates":[{"side":"bid","price_level":"100","new_quantity":"1"}]}]}"#,
@@ -480,6 +510,18 @@ mod tests {
             (
                 VenueId::Bitstamp,
                 r#"{"event":"data","channel":"diff_order_book_btcusd","data":{"microtimestamp":"1","bids":[["100","1"]],"asks":[["101","1"]]}}"#,
+            ),
+            (
+                VenueId::Coinbase,
+                r#"{"channel":"market_trades","sequence_num":0,"events":[{"type":"update","trades":[{"trade_id":"1","product_id":"BTC-USD","price":"100.5","size":"0.25","side":"BUY","time":"2026-08-09T00:00:00Z"}]}]}"#,
+            ),
+            (
+                VenueId::Kraken,
+                r#"{"channel":"trade","type":"update","data":[{"symbol":"BTC/USD","side":"sell","price":100.10,"qty":0.50000000,"ord_type":"market","trade_id":1,"timestamp":"2026-08-09T00:00:00.000000Z"}]}"#,
+            ),
+            (
+                VenueId::Bitstamp,
+                r#"{"event":"trade","channel":"live_trades_btcusd","data":{"id":1,"timestamp":"1786320000","microtimestamp":"1786320000000000","amount":0.25,"amount_str":"0.25000000","price":100.5,"price_str":"100.5","type":0}}"#,
             ),
         ];
 

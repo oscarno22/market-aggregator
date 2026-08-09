@@ -1,0 +1,24 @@
+{
+  "channel": "trade",
+  "type": "update",
+  "data": [
+    {
+      "symbol": "BTC/USD",
+      "side": "buy",
+      "price": 60005.10,
+      "qty": 0.12500000,
+      "ord_type": "market",
+      "trade_id": 4665906,
+      "timestamp": "2026-08-08T12:00:01.123456Z"
+    },
+    {
+      "symbol": "ETH/USD",
+      "side": "sell",
+      "price": 3001.20,
+      "qty": 2.00000000,
+      "ord_type": "limit",
+      "trade_id": 4665907,
+      "timestamp": "2026-08-08T12:00:01.223456Z"
+    }
+  ]
+}

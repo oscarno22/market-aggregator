@@ -1,0 +1,15 @@
+{
+  "channel": "trade",
+  "type": "snapshot",
+  "data": [
+    {
+      "symbol": "BTC/USD",
+      "side": "sell",
+      "price": 59990.00,
+      "qty": 1.00000000,
+      "ord_type": "limit",
+      "trade_id": 4665800,
+      "timestamp": "2026-08-08T11:59:00.000000Z"
+    }
+  ]
+}

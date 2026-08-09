@@ -37,7 +37,7 @@ macro_rules! fixture {
 
 fn book() -> VenueBook {
     VenueBook::new(
-        Box::new(BitstampSync::new("diff_order_book_btcusd")),
+        Box::new(BitstampSync::new("btcusd")),
         Symbol::new("BTC-USD"),
     )
 }
@@ -354,4 +354,55 @@ fn the_ordering_field_and_the_venue_clock_are_the_same_number() {
         micros, 1_700_000_000_200_000,
         "the fixture's microtimestamp"
     );
+}
+
+#[test]
+fn a_trade_older_than_the_last_diff_forwards_without_desyncing() {
+    // Trades and diffs are separate channels whose timestamps interleave
+    // arbitrarily. This print is stamped ...180000 — older than the last
+    // applied diff (...200000). On the book channel that would be a
+    // regression; on the trades channel it is normal delivery, and feeding
+    // it through check_order would desync a book that is perfectly correct.
+    let mut vb = book();
+    vb.feed(&frame(fixture!("diff_before_snapshot.json")))
+        .unwrap();
+    let snapshot = parse_rest_snapshot(fixture!("rest_order_book.json")).unwrap();
+    vb.apply_rest_snapshot(snapshot, SystemClock.now());
+    vb.feed(&frame(fixture!("diff_after_snapshot.json")))
+        .unwrap(); // last_micros is now ...200000
+
+    let outcomes = vb.feed(&frame(fixture!("live_trade.json"))).unwrap();
+
+    let trades: Vec<(String, String, Option<Side>)> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            Outcome::Event(e) => match &e.kind {
+                ma_core::EventKind::Trade {
+                    price,
+                    qty,
+                    taker_side,
+                } => Some((price.to_string(), qty.to_string(), *taker_side)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        trades,
+        [(
+            "60001.50".to_owned(),
+            "0.12500000".to_owned(),
+            Some(Side::Bid)
+        )],
+        "the print must come from the _str fields — the float twins lose digits"
+    );
+
+    assert!(
+        !outcomes
+            .iter()
+            .any(|o| matches!(o, Outcome::StateChanged { .. })),
+        "an out-of-order *trade* timestamp changed book trust: {outcomes:?}"
+    );
+    assert!(vb.book().state().is_live());
+    assert_eq!(vb.book().state().integrity(), Some(Integrity::OrderOnly));
 }

@@ -755,10 +755,12 @@ mod tests {
         h.next_payload().await;
 
         // The fake records what it was sent per socket; asserting through the
-        // endpoint keeps this honest if the payload ever changes.
+        // endpoint keeps this honest if the payload ever changes. Two since
+        // v5: the diff channel and the trades channel, on one socket.
         let expected = &endpoint(VenueId::Bitstamp).subscribe;
-        assert_eq!(expected.len(), 1);
+        assert_eq!(expected.len(), 2);
         assert!(expected[0].contains("diff_order_book_btcusd"));
+        assert!(expected[1].contains("live_trades_btcusd"));
         h.finish().await;
     }
 
