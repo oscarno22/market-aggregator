@@ -6,9 +6,11 @@
 //! channel. The only difference is what fills the channel. Nothing downstream
 //! of [`Pipeline::channel`] can tell which it is.
 
+pub mod archive;
 pub mod http;
 pub mod pipeline;
 
+pub use archive::{ArchiveStats, replay_archive};
 pub use pipeline::{Pipeline, PipelineHandle};
 
 /// The venues a default run connects to.

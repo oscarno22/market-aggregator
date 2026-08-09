@@ -29,6 +29,18 @@ struct Args {
     /// Snapshot publish interval, in milliseconds.
     #[arg(long, default_value_t = 250)]
     tick_ms: u64,
+
+    /// Archive normalised events to Parquet, rolled hourly.
+    ///
+    /// A path writes locally; `s3://bucket/prefix` needs `--features s3` and,
+    /// per CLAUDE.md, an IAM user scoped to that one prefix. Omit to run with
+    /// no persistence at all, which is what every v1 run did.
+    #[arg(long)]
+    archive: Option<String>,
+
+    /// Key namespace inside the archive.
+    #[arg(long, default_value = ma_persist::DEFAULT_PREFIX)]
+    archive_prefix: String,
 }
 
 #[tokio::main]
@@ -45,6 +57,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let symbols = parse_symbols(&args.symbols)?;
     let mut pipeline =
         Pipeline::new(symbols, venues)?.with_tick(Duration::from_millis(args.tick_ms));
+
+    // Attached before the aggregator is spawned, because the aggregator is the
+    // only thing that can produce normalised events — see
+    // `Aggregator::publishing_events_to`.
+    let archive = match &args.archive {
+        Some(uri) => {
+            let store = ma_persist::store_from_uri(uri).await?;
+            tracing::info!(store = %store.describe(), prefix = %args.archive_prefix, "archiving");
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let writer = ma_persist::EventWriter::new(store, args.archive_prefix.clone());
+            pipeline = pipeline.recording_events_to(tx);
+            Some(tokio::spawn(ma_persist::run(rx, writer)))
+        }
+        None => None,
+    };
 
     let (handle, aggregator) = pipeline.spawn_aggregator()?;
     let ingest = pipeline.spawn_ingest(None)?;
@@ -74,6 +101,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     })
     .await;
+
+    // Waited on last and separately, with its own budget. The aggregator
+    // closing its sender is what ends the writer's loop, and the writer still
+    // has to finish and upload the open file — dropping that on the floor
+    // would lose the final partial hour on every clean shutdown, which is the
+    // one outage a graceful stop is supposed to avoid.
+    if let Some(archive) = archive {
+        match tokio::time::timeout(Duration::from_secs(30), archive).await {
+            Ok(Ok(writer)) => tracing::info!(
+                files = writer.files_written,
+                rows = writer.rows_written,
+                "archive flushed"
+            ),
+            Ok(Err(e)) => tracing::error!(error = %e, "the archive writer panicked"),
+            Err(_) => tracing::error!(
+                "the archive writer did not finish in 30s; the last file may be incomplete"
+            ),
+        }
+    }
 
     Ok(())
 }

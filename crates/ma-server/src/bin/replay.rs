@@ -21,9 +21,24 @@ use ma_server::{DEFAULT_VENUES, Pipeline, http, init_tracing, parse_symbols};
 #[derive(Parser, Debug)]
 #[command(about = "Replay a recorded tape through the full pipeline (no network)")]
 struct Args {
-    /// Tape to read, as written by `record`.
+    /// Raw-frame tape to read, as written by `record`.
+    ///
+    /// Mutually exclusive with `--archive`. The two are different replay
+    /// layers, not two ways of saying the same thing: a tape replays bytes
+    /// through the venue parsers and can reproduce a parser bug; an archive
+    /// replays normalised events and cannot, but covers hours instead of
+    /// minutes. See `ma_persist`'s crate docs.
+    #[arg(long, conflicts_with = "archive")]
+    tape: Option<PathBuf>,
+
+    /// Parquet archive to replay: a local path, or `s3://bucket/prefix` on a
+    /// build with `--features s3`.
     #[arg(long)]
-    tape: PathBuf,
+    archive: Option<String>,
+
+    /// Key namespace inside the archive.
+    #[arg(long, default_value = ma_persist::DEFAULT_PREFIX)]
+    archive_prefix: String,
 
     /// Symbol(s) to serve, comma-separated.
     ///
@@ -71,36 +86,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let clock = pipeline.clock();
     let shutdown = pipeline.shutdown();
 
+    let source = match (&args.tape, &args.archive) {
+        (Some(tape), None) => tape.display().to_string(),
+        (None, Some(archive)) => format!("archive {archive}"),
+        _ => return Err("give exactly one of --tape or --archive".into()),
+    };
+
     let server = args
         .serve
         .then(|| tokio::spawn(http::serve(args.addr, handle, shutdown)));
     if args.serve {
-        tracing::info!(
-            "open http://{} — replaying {}",
-            args.addr,
-            args.tape.display()
-        );
+        tracing::info!("open http://{} — replaying {source}", args.addr);
     }
 
-    let mut reader = TapeReader::open(&args.tape).await?;
     let pacing = Pacing::from_speed(args.speed);
-    let stats = replay(&mut reader, &tx, clock.as_ref(), pacing, &fallback).await?;
+    let stats = match (&args.tape, &args.archive) {
+        (Some(tape), _) => {
+            let mut reader = TapeReader::open(tape).await?;
+            let stats = replay(&mut reader, &tx, clock.as_ref(), pacing, &fallback).await?;
+            (stats.frames_sent, stats.dropped)
+        }
+        (_, Some(archive)) => {
+            let store = ma_persist::store_from_uri(archive).await?;
+            let stats =
+                ma_server::replay_archive(store, &args.archive_prefix, &tx, clock.as_ref(), pacing)
+                    .await?;
+            (stats.events_sent, stats.dropped)
+        }
+        _ => unreachable!("checked above"),
+    };
+    let (sent, dropped) = stats;
 
     tracing::info!(
-        tape = %args.tape.display(),
-        frames = stats.frames_sent,
-        dropped = stats.dropped,
+        source = %source,
+        sent,
+        dropped,
         ?pacing,
         "replay finished"
     );
-    if stats.dropped > 0 {
+    if dropped > 0 {
         // Not a replay bug: the consumer was slower than the requested pacing,
         // exactly as it would have been against a live venue, and the
         // drop-oldest policy did what it says. Worth saying out loud so it is
         // never mistaken for corruption.
         tracing::warn!(
-            dropped = stats.dropped,
-            "the consumer fell behind the tape's pacing; the drop-oldest policy applied"
+            dropped,
+            "the consumer fell behind the requested pacing; the drop-oldest policy applied"
         );
     }
 

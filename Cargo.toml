@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/ma-core",
     "crates/ma-venues",
+    "crates/ma-persist",
     "crates/ma-pipeline",
     "crates/ma-server",
 ]

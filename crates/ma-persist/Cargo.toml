@@ -1,0 +1,42 @@
+# Durable history: normalised events to Parquet, rolled hourly, behind an
+# object store.
+#
+# `arrow` and `parquet` live here and nowhere else. Keeping them out of
+# `ma-pipeline` is the same discipline that keeps `tokio` out of `ma-core`:
+# the pipeline should be buildable and testable without a columnar format
+# library, and this crate should be replaceable without touching it.
+#
+# The `s3` feature is OFF by default, on purpose. CLAUDE.md gates AWS behind an
+# IAM user scoped to one bucket prefix, so the default build neither compiles
+# nor links the AWS SDK — the offline suite cannot accidentally acquire a
+# dependency on credentials.
+[package]
+name = "ma-persist"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
+
+[dependencies]
+ma-core = { path = "../ma-core" }
+arrow = { version = "59", default-features = false }
+# `parquet`'s reader takes an `impl ChunkReader`; `Bytes` is the implementation
+# for an in-memory file, which is what an object store hands back.
+bytes = "1"
+parquet = { version = "59", default-features = false, features = ["arrow", "zstd"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros", "fs", "io-util"] }
+tracing = "0.1"
+thiserror = "2"
+aws-config = { version = "1", optional = true, default-features = false, features = ["behavior-version-latest", "rustls"] }
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["rt-tokio"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
