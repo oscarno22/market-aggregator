@@ -268,7 +268,8 @@ project for whatever comes next. One commit per item, each standalone-green:
 - [x] CI: GitHub Actions runs the three offline gates by invoking the
       justfile (`just check`, `just check-s3`, `just test`), pinned to the
       workspace's `rust-version` so a green badge is also an MSRV proof.
-      cargo-audit runs advisory, never blocking
+      cargo-audit runs advisory, never blocking — which took a correction
+      after v5 to be true in fact rather than only in intent, see below
 - [x] Archive observability: `ArchiveCounters` (the writer's one set of
       tallies — a control that exists twice will disagree with itself) and an
       `ma_archive_*` block on `/metrics`, present only when archiving. A
@@ -298,8 +299,9 @@ project for whatever comes next. One commit per item, each standalone-green:
 Snapshot as of the last session; update this when a milestone item lands or
 a design decision changes.
 
-**v1 through v5 are complete.** Seven-crate workspace, **368 tests
-passing (370 with `--features ma-server/s3`), clippy-clean (`-D warnings`)
+**v1 through v5 are complete**, plus three items closed after the stopping
+line (see "After the stopping line" below). Seven-crate workspace, **374 tests
+passing (376 with `--features ma-server/s3`), clippy-clean (`-D warnings`)
 with and without the s3 feature, `cargo fmt` clean, and CI proving all of it
 on every push**. The full suite runs offline;
 `just demo tapes/2026-08-09-btc-usd-live.jsonl.gz` plays a real recording
@@ -422,11 +424,43 @@ denied, and **any other error is also a refusal** — never read as proof of
 scoping. Run with `AWS_PROFILE=market-aggregator`; the ambient default is
 still a root login session.
 
-**Next up — deliberately nothing.** v5 was the stopping line: the remaining
-items in `docs/DESIGN.md` §15 (a second gateway and whatever elects it,
-assembling the per-node archives into one view, S3's far tail) are
-operational hardening around a solved core, and they are where the next
-milestone would start if one is ever cut.
+**After the stopping line.** v5 remains the stopping line — no v6 was cut.
+Three items from `docs/DESIGN.md` §15 were taken afterwards because each was
+cheap and closed a real gap rather than starting a new commitment:
+
+1. **The advisory audit was not advisory.** `continue-on-error` at the *job*
+   level masks a run's conclusion but not the job's, so `ci / audit` carried
+   a red check under a green badge — the two signals disagreeing, which is
+   what the job's own comment existed to prevent. The finding now goes to the
+   run summary and the step succeeds. RUSTSEC-2026-0235 (rkyv 0.7.46) is
+   ignored in `.cargo/audit.toml`, on the argument written out there: rkyv is
+   never compiled, reaching `Cargo.lock` only through `rust_decimal`'s
+   optional feature, and there is no release to upgrade to. That assumption
+   is enforced by a manifest test in the **blocking** suite, not by the
+   comment — enabling a feature is a change we make, and only that should be
+   able to fail a build.
+2. **Assembling an hour several nodes wrote.** `EventReader::open_many` takes
+   one prefix per node. The merge was free, as §15 predicted; the *timeline*
+   was not — `elapsed` restarts per writer run, so across nodes it jumps
+   backwards and every pacing gap saturates to zero. Same shape as v4's
+   partitioning bug. `replay_archive_many` rebuilds it from the wall clock,
+   which is answerable across machines here only because at most one node
+   runs a given stream, so the merge never orders one book's own input.
+   `just replay-cluster`.
+3. **Half of S3's far tail.** `list` always paginated; the evidence did not
+   exist. A stub transport now replays a truncated `ListObjectsV2` page and
+   its continuation, offline. The other half — file sizes this project does
+   not yet produce — is not stubbable honestly and stays unmade.
+
+**Still deliberately not built:** a gateway that is not a single point of
+failure. It would be `ma-coord`'s lease on a singleton key, so it adds no
+argument §13 does not already make, and its value is conditional on something
+alerting on the merged view. Nothing does.
+
+`docs/WRITEUP.md` is the narrative version of the project for a reader who
+will not clone it — pointer-led, and the only place the two replay-harness
+bugs are told, since the README's numbered list stops at the system under
+test.
 
 ## Non-goals
 

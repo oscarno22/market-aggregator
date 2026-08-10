@@ -1398,7 +1398,7 @@ comes next. What it added:
 
 | | Status |
 |---|---|
-| CI | Done — GitHub Actions runs the three offline gates by invoking the justfile (`check`, `check-s3`, `test`), pinned to the workspace's `rust-version`, so a green badge is also an MSRV proof. cargo-audit runs advisory, never blocking |
+| CI | Done — GitHub Actions runs the three offline gates by invoking the justfile (`check`, `check-s3`, `test`), pinned to the workspace's `rust-version`, so a green badge is also an MSRV proof. cargo-audit runs advisory, never blocking — true in fact since the correction below, not only in intent |
 | Archive observability | Done — `ArchiveCounters` replaces the writer's private tallies; a bucket rejecting every write now scrapes as `ma_archive_write_failures_total` climbing instead of as a healthy process. §9 |
 | Part-number resume | Done — a restart in the same hour lists the hour directory and appends `part-N+1` instead of silently overwriting `part-00000`, which every same-hour redeploy had been doing. §9 |
 | Trades ingestion | Done — all three venues subscribe to their trades channel on the book's own socket, verified against a live tape that also caught a genuine Bitstamp crossed book. §8 |
@@ -1407,6 +1407,54 @@ comes next. What it added:
 | The gateway page shows its cluster | Done — node table and duplicated-stream banner, gated on the payload's `nodes` field so one page still serves both vantage points. §14 |
 | The policy that gates S3 | Documented — `docs/iam-policy.md`, including why the `s3:prefix` condition on `ListBucket` must never be "fixed" |
 
+### Closed after the stopping line
+
+Three items, taken because each was cheap and closed a real gap rather than
+starting a new commitment.
+
+**The advisory audit was not advisory.** `continue-on-error` at the *job*
+level masks a workflow run's conclusion but not the job's, so `ci / audit`
+carried a failing check while the badge reported success — the two signals
+disagreeing, which is worse than either being wrong alone and is precisely
+what the job's own comment existed to prevent. The finding now goes to the
+run summary and the step succeeds.
+
+The finding itself is RUSTSEC-2026-0235 against rkyv 0.7.46, ignored in
+`.cargo/audit.toml` on three stated facts: rkyv is never compiled (it reaches
+`Cargo.lock` through `rust_decimal`'s *optional* feature, which nothing here
+enables, and the lockfile records optional dependencies whatever the feature
+resolution says); there is no version to upgrade to (rust_decimal's latest
+still declares 0.7.46, and 0.7 is unsupported upstream, so left unignored it
+is a permanently red job); and the vulnerability needs untrusted rkyv
+archives, of which this project has none. The first fact is the load-bearing
+one and the one that could quietly stop being true, so `ma-core`'s manifest
+test fails the *blocking* suite if any manifest ever enables the feature.
+Enabling a feature is a change we make; an advisory is one that lands on us,
+and only the first should be able to fail a build.
+
+**Assembling an hour several nodes wrote.** `EventReader::open_many` takes a
+prefix per node. The merge needed no new machinery, as predicted — keys come
+back store-relative, so two nodes' files differ above `date=` and
+`partition_of` already separates them. What the estimate missed is the
+timeline: `elapsed` counts from its own writer run's first event, so across
+nodes the offsets share no origin, jump backwards at the boundary, and every
+pacing gap saturates to zero — v4's partitioning bug exactly, a layout change
+presenting as a pacing bug, and silent because a burst looks like a fast
+machine. `replay_archive_many` rebuilds the timeline from the wall clock when
+given more than one prefix.
+
+That ordering looks like the comparison §7 and §14 refuse. It is answerable
+here because of the sharding invariant itself: at most one node runs a given
+stream, so every event for a `(venue, symbol)` came from one node and the
+merge only ever orders events belonging to *different books*. Same residue as
+the symbol-partition merge, one machine wider.
+
+**Half of S3's far tail.** `list` has always used `into_paginator`; what was
+missing was evidence, and it turned out not to need a month of archiving to
+produce. A stub transport replays a truncated `ListObjectsV2` page plus its
+continuation, so the paginator under test is the real one. Both directions
+are pinned — following a continuation, and terminating without one.
+
 ### Not built, and where the next milestone would start
 
 - **A gateway that is not a single point of failure.** It holds no state a
@@ -1414,10 +1462,13 @@ comes next. What it added:
   elects one, and two gateways behind a load balancer would serve two views
   that differ by a tick. That is fine for a page and not fine for anything
   that alerts.
-- **Backfilling the archive from the gateway.** Each node archives its own
-  share, so an hour of "everything" is a union of prefixes rather than a
-  file. Symbol partitioning makes that a directory listing rather than a
-  merge, which is most of the work already done.
-- **S3's far tail.** Listing pagination past the first page, and file sizes
-  this project does not yet produce. The code paths exist; the evidence for
-  them does not.
+
+  Considered and declined alongside the three above, for a reason worth
+  recording: it would be `ma-coord`'s existing lease taken on a singleton
+  key, so it adds no argument this document does not already make in §13,
+  and its value is conditional on something alerting on the merged view.
+  Nothing does. Revisit when the answer to "where does this run" changes.
+- **The rest of S3's far tail.** File sizes this project does not yet
+  produce. Unlike pagination this is not stubbable in any honest way — the
+  evidence is a long archiving run, and until there is one the claim stays
+  unmade.

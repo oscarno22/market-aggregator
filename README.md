@@ -15,6 +15,11 @@ So the whole system is organised around one question:
 
 > For every number we publish, can we say how much it should be believed?
 
+**[docs/WRITEUP.md](docs/WRITEUP.md)** is the narrative version — what building
+this actually taught, including the nine bugs live venues found that a green
+test suite did not, and the two that turned out to be in the measuring
+instrument rather than the thing being measured.
+
 ---
 
 ## Try it without a network
@@ -225,6 +230,13 @@ A fixture author writes the messages they are thinking about. A policy author
 picks the units they are thinking in. Both are why
 [`just record`](justfile) and [`just audit-probe`](justfile) exist.
 
+This list stops at the system under test. Two more were in the **replay
+harness** — the thing every offline claim above rests on — and both presented
+as bugs in the system it was measuring: a realtime replay that drifted a timer
+tick per frame, and a replay with no clock of its own. They are told in
+[docs/WRITEUP.md](docs/WRITEUP.md#the-two-that-were-in-the-ruler), with the
+procedure that came out of them.
+
 ---
 
 ## Things worth reading the code for
@@ -301,9 +313,12 @@ itself from (and that survives a same-hour restart without overwriting
 itself), rolling indicators that state their own coverage and carry
 volume/vwap, a cross-venue consolidated touch *and* consolidated windows,
 streams sharded across nodes by a lease coordinator, and a gateway that
-merges every node back into one view — cluster panel included.
+merges every node back into one view — cluster panel included. Since then an
+hour written by a *cluster* reads back as one session: `just replay-cluster`
+takes a prefix per node and merges them, rebuilding the timeline from the wall
+clock because `elapsed` restarts with every writer run.
 
-**368 tests (370 with `--features s3`), clippy-clean at `-D warnings`, and the whole suite runs offline** —
+**374 tests (376 with `--features s3`), clippy-clean at `-D warnings`, and the whole suite runs offline** —
 including the multi-node cluster simulation, which steps several coordinators
 through one registry and asserts that no two ever hold the same stream. CI
 runs exactly those gates — `just check`, `just check-s3`, `just test`, the
@@ -317,9 +332,11 @@ Deliberately unfinished, and stated rather than hidden:
   been exercised end to end: archived to S3, flushed on `SIGTERM`, and replayed
   back out into three live checksum-verified books. The scoping is now
   *verified* rather than asserted — `S3Store::connect` lists the bucket outside
-  its own prefix and refuses to start if that succeeds. What is still untested
-  is the far tail: listing pagination, and file sizes this project does not yet
-  produce.
+  its own prefix and refuses to start if that succeeds. Listing pagination is
+  now pinned offline too — a stub transport replays a truncated `ListObjectsV2`
+  page and its continuation, so the paginator under test is the real one. What
+  is still untested is the rest of the far tail: file sizes this project does
+  not yet produce, which nothing but a long archiving run can honestly close.
 - ~~No tape has been recorded across a real reconnect.~~ **Done.**
   `2026-08-09-btc-usd-reconnect.jsonl.gz` records three live venues dropping and
   resubscribing in turn, and `crates/ma-server/tests/reconnect.rs` replays it
