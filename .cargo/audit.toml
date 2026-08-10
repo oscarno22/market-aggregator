@@ -1,0 +1,39 @@
+# cargo-audit configuration.
+#
+# This file exists rather than an `--ignore` flag in the justfile so that a
+# developer who types bare `cargo audit` gets the same answer CI gets. An
+# exception that only one invocation knows about is an exception that will be
+# rediscovered as a surprise.
+
+[advisories]
+# RUSTSEC-2026-0235 — rkyv 0.7.46, "Insufficient archive validation can cause
+# out-of-bounds reads in archives containing Rc/Arc". Patched in >= 0.8.17.
+#
+# Ignored on 2026-08-09, on three facts rather than on a judgement call:
+#
+# 1. **rkyv is never compiled.** It reaches the lockfile through
+#    `rust_decimal`'s *optional* `rkyv` feature (`rkyv = ["dep:rkyv"]`), and
+#    all three crates that depend on rust_decimal declare it
+#    `default-features = false` with only `serde`/`std`. `cargo tree -i rkyv`
+#    prints nothing, on the host target and on `--target all`. The advisory
+#    fires because `cargo audit` reads Cargo.lock, and Cargo.lock records
+#    optional dependencies regardless of which features resolve.
+#
+# 2. **There is no version to upgrade to.** rust_decimal 1.42.1 is the latest
+#    release and still declares rkyv 0.7.46; the advisory itself states the 0.7
+#    series is no longer supported upstream. `cargo update` will never clear
+#    this, so leaving it unignored means a permanently red audit — which is the
+#    condition that teaches people to stop reading CI.
+#
+# 3. **The vulnerability needs untrusted rkyv archives.** This project
+#    deserialises JSON from venue sockets and Parquet from its own archive.
+#    There is no rkyv archive anywhere in it, trusted or otherwise.
+#
+# Fact 1 is the load-bearing one, and it is the one that could quietly stop
+# being true — so it is not left to this comment. `ma-core`'s manifest test
+# fails the *blocking* suite if any workspace manifest ever enables
+# rust_decimal's rkyv feature. Enabling a feature is a code change we make, not
+# an advisory that lands on us, and it belongs in the gate that can say no.
+#
+# Remove this entry when rust_decimal ships a release built on rkyv >= 0.8.17.
+ignore = ["RUSTSEC-2026-0235"]

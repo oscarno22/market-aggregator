@@ -2,9 +2,12 @@
 # justfile rather than restating the commands, so CI cannot drift from what a
 # developer runs before committing — if the gate changes, it changes once.
 #
-# Everything here passes in airplane mode by design (Tier 1 in the justfile's
+# Every gate here passes in airplane mode by design (Tier 1 in the justfile's
 # terms). The live-venue and AWS tiers are deliberately absent: CI proving a
 # claim about a live venue would be CI that flakes with the venue.
+#
+# `audit` is the exception on both counts — it reaches the network for the
+# advisory database, and it is not a gate. See the comment on the job.
 #
 # The toolchain is pinned to the workspace's `rust-version`, so a green run is
 # also a proof that the stated MSRV still compiles.
@@ -59,13 +62,43 @@ jobs:
   # Advisory only. A new RUSTSEC advisory against a dependency is worth
   # knowing about, but it must not turn a tree that was green yesterday red
   # today with no code change — that trains people to ignore CI.
+  #
+  # This job used to say that and not do it. `continue-on-error` at the *job*
+  # level masks the run conclusion but not the job's: the badge went green
+  # while the job reported failure and the commit carried a red check. A green
+  # badge over a red check is the noisiest possible arrangement, and it is
+  # exactly the outcome the paragraph above exists to prevent.
+  #
+  # So the finding goes to the run summary and the step is allowed to succeed.
+  # Advisory means read on purpose, not tripped over. Anything that should be
+  # able to say no belongs in `just test` instead — as the guard on the current
+  # exception in .cargo/audit.toml is.
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-audit
-      - run: cargo audit
+          tool: cargo-audit,just
+      - name: cargo audit (advisory)
+        run: |
+          set +e
+          just audit > audit.txt 2>&1
+          status=$?
+          {
+            echo '## cargo audit'
+            echo
+            if [ "$status" -eq 0 ]; then
+              echo 'No advisories against `Cargo.lock`.'
+            else
+              echo 'Advisories found. This does not fail the build.'
+              echo 'Exceptions and their reasoning live in `.cargo/audit.toml`.'
+            fi
+            echo
+            echo '```'
+            cat audit.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat audit.txt
+          exit 0

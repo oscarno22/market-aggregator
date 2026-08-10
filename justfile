@@ -27,6 +27,20 @@ check:
 check-s3:
     cargo clippy --workspace --all-targets --features ma-server/s3 -- -D warnings
 
+# Scan Cargo.lock against the RUSTSEC advisory database.
+#
+# The one recipe in this tier that needs a network — it fetches the advisory
+# db — and deliberately *not* a gate. A new advisory against a dependency is
+# worth knowing about, but it lands with no change on our side, and a gate that
+# goes red for something nobody did is a gate people learn to ignore. CI runs
+# this and reports it; it never fails the build.
+#
+# Exceptions live in .cargo/audit.toml with the argument for each written out,
+# so bare `cargo audit` agrees with this recipe. The assumption the current
+# exception rests on is enforced by `just test`, not by that file's comment.
+audit:
+    cargo audit
+
 fmt:
     cargo fmt --all
 
