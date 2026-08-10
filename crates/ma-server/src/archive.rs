@@ -63,27 +63,81 @@ pub async fn replay_archive<C>(
 where
     C: Clock + ?Sized,
 {
+    replay_archive_many(store, std::slice::from_ref(&prefix), tx, clock, pacing).await
+}
+
+/// Replay the union of several prefixes — one per node — into `tx`.
+///
+/// This is how an hour written by a sharded cluster replays as one session.
+/// [`EventReader::open_many`] does the merge; what this adds is the timeline,
+/// and that is the part that does not survive the union unexamined.
+///
+/// `StoredEvent::elapsed` counts from its own writer run's first event. Within
+/// one run that is exactly the right thing to pace on — it is monotonic and it
+/// is immune to a wall-clock step. Across two nodes it is meaningless: the
+/// offsets share no origin, so consecutive merged events hand back numbers
+/// that jump backwards, every gap saturates to zero, and the whole archive
+/// arrives in one burst. That is the same failure symbol partitioning caused
+/// in v4 — a layout change presenting as a pacing bug — and it is why this is
+/// handled here rather than discovered later.
+///
+/// So with more than one prefix the timeline is rebuilt from the wall clock,
+/// which is the only column comparable across writer runs and the one the
+/// reader already merges on. Offsets are taken from the first merged event and
+/// clamped monotonic. With a single prefix nothing changes: `elapsed` is used
+/// exactly as before, because there is no second origin to reconcile and the
+/// recorded offset is strictly better evidence than a timestamp.
+///
+/// # Errors
+/// If the store cannot be listed or a file cannot be decoded.
+pub async fn replay_archive_many<C>(
+    store: Arc<dyn ma_persist::ObjectStore>,
+    prefixes: &[&str],
+    tx: &Sender<IngestMessage>,
+    clock: &C,
+    pacing: Pacing,
+) -> Result<ArchiveStats, ReadError>
+where
+    C: Clock + ?Sized,
+{
     let base = clock.now();
-    let mut reader = EventReader::open(store, prefix).await?;
+    // One prefix keeps the recorded offsets; several have to share a timeline.
+    let from_wall = prefixes.len() > 1;
+    let mut reader = EventReader::open_many(store, prefixes).await?;
     let mut stats = ArchiveStats::default();
     let mut previous = Duration::ZERO;
+    let mut origin: Option<std::time::SystemTime> = None;
 
     while let Some(stored) = reader.next_event().await? {
+        let offset = if from_wall {
+            let wall = stored.event.ingest_ts.wall();
+            let start = *origin.get_or_insert(wall);
+            // Clamped rather than trusted: the merge orders by wall, so this
+            // is nondecreasing in every case a well-formed archive produces —
+            // but a clock step inside one node's run can still hand back an
+            // earlier reading than its predecessor, and a replay is not the
+            // place to have an opinion about that beyond refusing to go
+            // backwards.
+            wall.duration_since(start).unwrap_or(Duration::ZERO)
+        } else {
+            stored.elapsed
+        };
+
         if let Pacing::Realtime { speed } = pacing {
-            let gap = stored.elapsed.saturating_sub(previous);
+            let gap = offset.saturating_sub(previous);
             let scaled = gap.div_f64(speed.max(f64::MIN_POSITIVE));
             if scaled > Duration::ZERO {
                 tokio::time::sleep(scaled).await;
             }
         }
-        previous = stored.elapsed;
+        previous = offset;
 
         // Rebuild the ingest timestamp against *this* process's clock, from
         // the recorded offset — the same reconstruction tape replay performs,
         // and for the same reason: an `Instant` from another process is
         // meaningless, but an elapsed duration is not.
         let mut event = stored.event;
-        event.ingest_ts = base.advanced_by(stored.elapsed);
+        event.ingest_ts = base.advanced_by(offset);
 
         let message = IngestMessage::Event {
             stream: stored.stream,

@@ -59,6 +59,25 @@ demo tape speed="1.0" symbols="BTC-USD":
 replay-archive archive symbols="BTC-USD":
     cargo run -p ma-server --bin replay -- --archive {{archive}} --symbols {{symbols}} --serve
 
+# Replay an hour a *cluster* wrote: one prefix per node, merged into one session.
+#
+# Under v3 sharding each node archives only the streams it owns, so an hour of
+# everything is a union of prefixes rather than a file. Two nodes' keys differ
+# above date=, so symbol partitioning already puts them on separate cursors and
+# the merge needs no new machinery — but the *timeline* does, because `elapsed`
+# restarts with every writer run and two nodes share no origin. With more than
+# one prefix it is rebuilt from the wall clock instead.
+#
+# Merging across machines is answerable here for a reason worth knowing: at
+# most one node ever runs a given stream, so this only ever orders events
+# belonging to different books. See ma_persist::reader's module docs.
+#
+# Overlapping prefixes are deduplicated rather than replayed twice — pass the
+# root and a subtree if you like.
+replay-cluster archive prefixes="node-a/events,node-b/events" symbols="BTC-USD":
+    cargo run -p ma-server --bin replay -- --archive {{archive}} \
+        --archive-prefix {{prefixes}} --symbols {{symbols}} --serve
+
 # ------------------------------------------------------- Tier 2: live venues
 #
 # Not part of `just test`. These open real sockets. Reconnect backoff is proven

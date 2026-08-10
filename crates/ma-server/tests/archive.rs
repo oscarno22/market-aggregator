@@ -270,3 +270,105 @@ async fn the_archive_is_partitioned_by_symbol_then_hour() {
     sorted.sort();
     assert_eq!(keys, sorted, "the store did not list keys in order");
 }
+
+/// Two nodes' shares, each written by its own writer under its own prefix, with
+/// node B's session starting a full minute after node A's.
+///
+/// Disjoint symbols, because that is the only arrangement v3 sharding produces:
+/// at most one node runs a given stream. The gap is what makes the two
+/// `elapsed` origins visibly incompatible.
+async fn two_node_archive(store: &Arc<dyn ObjectStore>) {
+    let origin = ma_core::IngestTime::new(
+        std::time::Instant::now(),
+        std::time::SystemTime::UNIX_EPOCH + Duration::from_nanos(1_786_247_000_000_000_000),
+    );
+
+    for (prefix, sym, start) in [
+        ("node-a/events", "BTC-USD", Duration::ZERO),
+        ("node-b/events", "ETH-USD", Duration::from_secs(60)),
+    ] {
+        let mut writer = EventWriter::new(Arc::clone(store), prefix);
+        for i in 0..5_u64 {
+            writer
+                .append(&ma_core::MarketEvent {
+                    venue: VenueId::Coinbase,
+                    symbol: Symbol::new(sym),
+                    venue_ts: None,
+                    ingest_ts: origin.advanced_by(start + Duration::from_secs(i)),
+                    kind: ma_core::EventKind::Heartbeat { counter: Some(i) },
+                })
+                .await
+                .expect("append");
+        }
+        writer.close().await.expect("close");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cluster_hour_replays_on_one_timeline_rather_than_two() {
+    // Archive assembly's one real hazard, and the reason `replay_archive_many`
+    // exists rather than `open_many` being enough on its own.
+    //
+    // `elapsed` counts from its own writer run's first event. Merged across
+    // nodes those offsets share no origin: node B restarts at zero a minute
+    // into the session, so pacing on differences between consecutive values
+    // saturates every gap to zero and the archive arrives in one burst. That
+    // is v4's partitioning bug — a layout change presenting as a pacing bug —
+    // and it is silent, because a burst looks exactly like a fast machine.
+    //
+    // So the timeline is rebuilt from the wall clock, the only column
+    // comparable across writer runs. This asserts the reconstruction, not the
+    // sleeps: Faithful pacing does not sleep at all, and the reconstructed
+    // `ingest_ts` is what every downstream duration is derived from.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalStore::new(dir.path()));
+    two_node_archive(&store).await;
+
+    let (tx, rx) = ma_pipeline::channel::bounded(1024);
+    let clock = ma_core::SystemClock;
+
+    let stats = ma_server::replay_archive_many(
+        store,
+        &["node-a/events", "node-b/events"],
+        &tx,
+        &clock,
+        Pacing::Faithful,
+    )
+    .await
+    .expect("archive replay");
+    assert_eq!(stats.events_sent, 10, "a node's share went missing");
+    drop(tx);
+
+    let mut walls = Vec::new();
+    while let Some(message) = rx.recv().await {
+        if let ma_pipeline::ingest::IngestMessage::Event { event, .. } = message {
+            walls.push(event.ingest_ts.wall());
+        }
+    }
+    assert_eq!(walls.len(), 10);
+
+    // Measured from the first replayed event, not from a clock reading taken
+    // here. `replay_archive_many` takes its own `now()` to rebuild timestamps
+    // against, and this test's reading and that one have no defined
+    // relationship — differencing against it made the first offset a
+    // microsecond instead of zero, intermittently. The spacing is the claim;
+    // the origin is not.
+    let offsets: Vec<Duration> = walls
+        .iter()
+        .map(|w| w.duration_since(walls[0]).unwrap_or(Duration::ZERO))
+        .collect();
+    assert!(
+        offsets.windows(2).all(|w| w[0] <= w[1]),
+        "the merged timeline went backwards at the node boundary: {offsets:?}"
+    );
+    // Node A spans 0–4s, node B 60–64s. The session is 64 seconds long; pacing
+    // on `elapsed` would have produced two four-second runs laid end to end.
+    assert_eq!(offsets[0], Duration::ZERO);
+    assert_eq!(offsets[4], Duration::from_secs(4));
+    assert_eq!(offsets[5], Duration::from_secs(60));
+    assert_eq!(
+        offsets[9],
+        Duration::from_secs(64),
+        "the second node's history was folded back onto the first's origin"
+    );
+}

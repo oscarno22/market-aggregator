@@ -493,3 +493,104 @@ async fn an_archive_written_before_symbol_partitioning_still_reads() {
         read.iter().map(|e| e.event.symbol.to_string()).collect();
     assert!(symbols.contains("BTC-USD") && symbols.contains("ETH-USD"));
 }
+
+/// Archive two nodes' shares under their own prefixes, each written by its own
+/// `EventWriter` so their `elapsed` origins are genuinely independent.
+///
+/// `later_by` is what makes this a cluster rather than two copies: node B's
+/// session starts well after node A's, so its offsets restart from zero at a
+/// point where node A is already far along.
+async fn two_node_archive(later_by: Duration) -> (Arc<dyn ObjectStore>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalStore::new(dir.path()));
+    let origin = base(1_786_247_000_000_000_000);
+
+    // Disjoint symbols, because that is the only arrangement v3 sharding can
+    // produce: at most one node runs a given stream, so no two nodes ever
+    // write events for the same book. See ma_persist::reader's module docs.
+    for (prefix, symbol, offset) in [
+        ("node-a/events", "BTC-USD", Duration::ZERO),
+        ("node-b/events", "ETH-USD", later_by),
+    ] {
+        let mut writer = EventWriter::new(Arc::clone(&store), prefix);
+        for i in 0..4_u64 {
+            writer
+                .append(&event(
+                    VenueId::Coinbase,
+                    symbol,
+                    EventKind::Heartbeat { counter: Some(i) },
+                    origin.advanced_by(offset + Duration::from_millis(i * 100)),
+                ))
+                .await
+                .unwrap();
+        }
+        writer.close().await.unwrap();
+    }
+
+    (store, dir)
+}
+
+#[tokio::test]
+async fn an_hour_two_nodes_wrote_reads_back_as_one_session() {
+    // v3 shards streams across nodes and each node archives only its own
+    // share, so an hour of *everything* is a union of prefixes. This is that
+    // union read back.
+    let (store, _dir) = two_node_archive(Duration::from_secs(1)).await;
+
+    let read = EventReader::open_many(Arc::clone(&store), &["node-a/events", "node-b/events"])
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(read.len(), 8, "a node's share went missing from the union");
+
+    // Ordered by wall clock, which is the only column comparable across two
+    // writer runs — so node A's whole session precedes node B's here.
+    let walls: Vec<SystemTime> = read.iter().map(|e| e.event.ingest_ts.wall()).collect();
+    assert!(
+        walls.windows(2).all(|w| w[0] <= w[1]),
+        "the union replayed out of wall order: {walls:?}"
+    );
+    let symbols: Vec<String> = read.iter().map(|e| e.event.symbol.to_string()).collect();
+    assert_eq!(
+        symbols,
+        ["BTC-USD"; 4]
+            .into_iter()
+            .chain(["ETH-USD"; 4])
+            .collect::<Vec<_>>()
+    );
+
+    // And the reason `replay_archive_many` cannot pace on `elapsed`: node B's
+    // offsets restart at zero a second into the merged session, so the
+    // sequence goes backwards. Asserted rather than described, because the
+    // failure it causes — every gap saturating to zero, the archive arriving
+    // in one burst — is silent, and looks exactly like a fast machine.
+    let offsets: Vec<Duration> = read.iter().map(|e| e.elapsed).collect();
+    assert!(
+        offsets.windows(2).any(|w| w[0] > w[1]),
+        "expected elapsed to restart across the node boundary, got {offsets:?}"
+    );
+}
+
+#[tokio::test]
+async fn overlapping_prefixes_read_each_file_once() {
+    // "The bucket root and the events prefix" is exactly the pair an operator
+    // reaches for, and the archive URI already has a documented footgun of
+    // this shape (see the justfile's archive-s3 comment). Duplicating events
+    // would replay a market with every trade counted twice.
+    let (store, _dir) = two_node_archive(Duration::from_secs(1)).await;
+
+    let read = EventReader::open_many(
+        Arc::clone(&store),
+        &["node-a/events", "node-a/events/symbol=BTC-USD", "node-a"],
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    assert_eq!(read.len(), 4, "an overlapping prefix replayed events twice");
+}

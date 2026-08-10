@@ -36,9 +36,14 @@ struct Args {
     #[arg(long)]
     archive: Option<String>,
 
-    /// Key namespace inside the archive.
-    #[arg(long, default_value = ma_persist::DEFAULT_PREFIX)]
-    archive_prefix: String,
+    /// Key namespace(s) inside the archive, comma-separated.
+    ///
+    /// More than one reads them as a single session, which is how an hour
+    /// written by a sharded cluster is replayed: each node archives only the
+    /// streams it owns, so "everything" is a union of prefixes rather than a
+    /// file. Overlapping prefixes are deduplicated, not replayed twice.
+    #[arg(long, default_value = ma_persist::DEFAULT_PREFIX, value_delimiter = ',')]
+    archive_prefix: Vec<String>,
 
     /// Symbol(s) to serve, comma-separated.
     ///
@@ -122,8 +127,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         (_, Some(archive)) => {
             let store = ma_persist::store_from_uri(archive).await?;
+            let prefixes: Vec<&str> = args.archive_prefix.iter().map(String::as_str).collect();
             let stats =
-                ma_server::replay_archive(store, &args.archive_prefix, &tx, clock.as_ref(), pacing)
+                ma_server::replay_archive_many(store, &prefixes, &tx, clock.as_ref(), pacing)
                     .await?;
             (stats.events_sent, stats.dropped)
         }

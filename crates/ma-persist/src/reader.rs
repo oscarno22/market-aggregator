@@ -62,6 +62,32 @@
 //! symbols relative to each other. That is visible to nothing: it cannot
 //! reorder a book's own input, which is the only ordering any consumer here
 //! depends on.
+//!
+//! # An hour that several nodes wrote
+//!
+//! Under v3 sharding each node archives only the streams it owns, so an hour
+//! of *everything* is a union of prefixes rather than a file.
+//! [`EventReader::open_many`] merges them, and it needs no new machinery: keys
+//! come back store-relative, so two nodes' files differ above `date=` and
+//! [`partition_of`] already puts them on separate cursors. Node A's
+//! `part-00000` and node B's `part-00000` are two sequences, and they stay two
+//! sequences.
+//!
+//! The ordering question this raises looks like the one `docs/DESIGN.md` §7
+//! and §14 refuse — comparing two machines' wall clocks — and the reason it is
+//! answerable here is the sharding invariant itself. **At most one node runs a
+//! given stream**, so every event for a given `(venue, symbol)` was written by
+//! exactly one node. Cross-node ordering therefore only ever orders events
+//! that belong to *different books*, and no book's own input is touched by it.
+//! It is the same residue as the paragraph above, one machine wider: skew
+//! between nodes can shuffle independent symbols against each other, and
+//! nothing downstream can observe that.
+//!
+//! What does *not* survive the union is `elapsed`. It counts from each writer
+//! run's first event, so two nodes' offsets share no origin and are not
+//! comparable — which is why [`crate::replay_archive`] rebuilds its timeline
+//! from the wall clock when it is given more than one prefix, rather than
+//! pacing on differences between numbers that restart independently.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -137,23 +163,53 @@ impl EventReader {
     /// # Errors
     /// If the store cannot be listed.
     pub async fn open(store: Arc<dyn ObjectStore>, prefix: &str) -> Result<Self, ReadError> {
-        let mut by_partition: std::collections::BTreeMap<String, VecDeque<String>> =
-            std::collections::BTreeMap::new();
-        for key in store.list(prefix).await? {
-            if !key.ends_with(".parquet") {
-                continue;
+        Self::open_many(store, std::slice::from_ref(&prefix)).await
+    }
+
+    /// Open every file under each of `prefixes`, merged into one stream.
+    ///
+    /// This is how an hour written by a sharded cluster is read back: give it
+    /// one prefix per node. See the module docs for why merging across nodes
+    /// is answerable when §7 refuses to compare two machines' clocks — the
+    /// short version is that at most one node ever runs a given stream, so the
+    /// merge only ever orders events belonging to different books.
+    ///
+    /// Overlapping prefixes are safe. Keys are deduplicated, so passing both a
+    /// root and something beneath it reads each file once rather than
+    /// replaying the overlap twice — worth having, because "the bucket root
+    /// and the events prefix" is exactly the pair an operator reaches for.
+    ///
+    /// # Errors
+    /// If the store cannot be listed.
+    pub async fn open_many(
+        store: Arc<dyn ObjectStore>,
+        prefixes: &[&str],
+    ) -> Result<Self, ReadError> {
+        // BTreeSet rather than VecDeque: it deduplicates overlapping prefixes
+        // and keeps key order, which within a partition is chronological by
+        // construction. `list` already sorts, but two lists concatenated are
+        // not sorted, and this is the merge that has to be.
+        let mut by_partition: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeSet<String>,
+        > = std::collections::BTreeMap::new();
+        for prefix in prefixes {
+            for key in store.list(prefix).await? {
+                if !key.ends_with(".parquet") {
+                    continue;
+                }
+                by_partition
+                    .entry(partition_of(&key).to_owned())
+                    .or_default()
+                    .insert(key);
             }
-            by_partition
-                .entry(partition_of(&key).to_owned())
-                .or_default()
-                .push_back(key);
         }
         Ok(Self {
             store,
             cursors: by_partition
                 .into_values()
                 .map(|keys| Cursor {
-                    keys,
+                    keys: keys.into_iter().collect(),
                     pending: VecDeque::new(),
                 })
                 .collect(),

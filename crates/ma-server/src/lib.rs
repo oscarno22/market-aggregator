@@ -12,7 +12,7 @@ pub mod gateway;
 pub mod http;
 pub mod pipeline;
 
-pub use archive::{ArchiveStats, replay_archive};
+pub use archive::{ArchiveStats, replay_archive, replay_archive_many};
 pub use pipeline::{Pipeline, PipelineHandle};
 
 /// The venues a default run connects to.
