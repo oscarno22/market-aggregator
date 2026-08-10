@@ -441,6 +441,124 @@ mod tests {
         DENIAL_SHAPES.iter().any(|n| rendered.contains(n))
     }
 
+    /// One `ListObjectsV2` response body. `truncated` carries the continuation
+    /// token that makes the SDK ask for another page.
+    fn listing_page(keys: &[&str], truncated: Option<&str>) -> String {
+        let contents: String = keys
+            .iter()
+            .map(|k| format!("<Contents><Key>{k}</Key><Size>1</Size></Contents>"))
+            .collect();
+        let more = match truncated {
+            Some(token) => format!(
+                "<IsTruncated>true</IsTruncated>\
+                 <NextContinuationToken>{token}</NextContinuationToken>"
+            ),
+            None => "<IsTruncated>false</IsTruncated>".to_owned(),
+        };
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+            <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+              <Name>bucket</Name>{more}{contents}
+            </ListBucketResult>"#
+        )
+    }
+
+    /// A `ScopedBucket` whose transport replays `pages` in order.
+    ///
+    /// Built by constructing the struct directly rather than through
+    /// `connect`, which resolves ambient credentials and runs the scope probe.
+    /// Both are proven elsewhere in this module, and neither is what this test
+    /// is about.
+    fn bucket_replaying(pages: Vec<String>) -> ScopedBucket {
+        use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
+        use aws_smithy_types::body::SdkBody;
+
+        let events = pages
+            .into_iter()
+            .map(|body| {
+                ReplayEvent::new(
+                    http::Request::builder()
+                        .uri("https://bucket.s3.us-east-1.amazonaws.com/?list-type=2")
+                        .body(SdkBody::empty())
+                        .unwrap(),
+                    http::Response::builder()
+                        .status(200)
+                        .body(SdkBody::from(body))
+                        .unwrap(),
+                )
+            })
+            .collect();
+
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .http_client(StaticReplayClient::new(events))
+            .build();
+
+        ScopedBucket {
+            client: Client::from_conf(config),
+            bucket: "bucket".to_owned(),
+            prefix: "events".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_truncated_listing_is_followed_to_the_last_page() {
+        // docs/DESIGN.md §15 listed S3's far tail as "the code paths exist; the
+        // evidence for them does not". This is the evidence for the half that
+        // does not need a month of archiving to produce.
+        //
+        // S3 caps a listing at 1000 keys and says so with IsTruncated plus a
+        // continuation token. A reader that stops at the first page does not
+        // error — it replays a partial session and reports success, which is
+        // this project's defining failure mode: silently wrong beats obviously
+        // down, in the wrong direction. An archive only crosses 1000 objects
+        // after days of hourly parts, so the first run to hit it would be a
+        // long-lived one, and the symptom would be missing history rather than
+        // a stack trace.
+        //
+        // The stub is at the transport, so the paginator under test is the
+        // real one and the XML is the shape S3 actually returns.
+        let bucket = bucket_replaying(vec![
+            listing_page(
+                &["events/symbol=BTC-USD/date=2026-08-09/hour=00/part-00000.parquet"],
+                Some("page-2"),
+            ),
+            listing_page(
+                &["events/symbol=BTC-USD/date=2026-08-09/hour=01/part-00000.parquet"],
+                None,
+            ),
+        ]);
+
+        let keys = bucket.list("symbol=BTC-USD").await.unwrap();
+
+        assert_eq!(
+            keys,
+            [
+                "symbol=BTC-USD/date=2026-08-09/hour=00/part-00000.parquet",
+                "symbol=BTC-USD/date=2026-08-09/hour=01/part-00000.parquet",
+            ],
+            "the listing stopped at the first page, or did not strip the prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_page_listing_does_not_ask_for_another() {
+        // The other half of the same claim. A paginator that kept asking would
+        // hang on the replay client running out of responses, so this pins
+        // termination as well as continuation.
+        let bucket = bucket_replaying(vec![listing_page(
+            &["events/symbol=ETH-USD/date=2026-08-09/hour=00/part-00000.parquet"],
+            None,
+        )]);
+
+        let keys = bucket.list("symbol=ETH-USD").await.unwrap();
+        assert_eq!(keys.len(), 1);
+    }
+
     #[test]
     fn s3_is_refused_until_the_operator_asserts_the_iam_scoping() {
         // The first of two gates: somebody decided to reach AWS at all. It

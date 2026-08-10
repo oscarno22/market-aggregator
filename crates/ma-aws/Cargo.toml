@@ -30,3 +30,8 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+# A stub transport, so the one behaviour that only shows up past a thousand
+# keys can be proven offline instead of waited for. See the pagination test.
+aws-smithy-runtime = { version = "1", features = ["client", "test-util"] }
+aws-smithy-types = "1"
+http = "1"
